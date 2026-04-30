@@ -191,26 +191,26 @@ async function fetchWithPinnedLookup(
           chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
         });
         response.on("end", () => {
-          signal.removeEventListener("abort", onAbort);
-          const headers = new Headers();
-          for (const [name, value] of Object.entries(response.headers)) {
-            if (Array.isArray(value)) {
-              for (const item of value) {
-                headers.append(name, item);
-              }
-              continue;
+          try {
+            signal.removeEventListener("abort", onAbort);
+            const headers = new Headers();
+            const rawHeaders = response.rawHeaders;
+            for (let i = 0; i < rawHeaders.length; i += 2) {
+              headers.append(rawHeaders[i], rawHeaders[i + 1]);
             }
-            if (typeof value === "string") {
-              headers.set(name, value);
-            }
-          }
 
-          resolve(
-            new Response(Buffer.concat(chunks), {
-              status: response.statusCode ?? 500,
-              headers,
-            }),
-          );
+            const rawStatus = response.statusCode ?? 500;
+            const status =
+              rawStatus >= 200 && rawStatus <= 599 ? rawStatus : 502;
+            resolve(
+              new Response(Buffer.concat(chunks), {
+                status,
+                headers,
+              }),
+            );
+          } catch (error) {
+            reject(error);
+          }
         });
       },
     );
@@ -337,7 +337,5 @@ export async function readResponseBody(
     chunks.push(value);
   }
 
-  return new TextDecoder().decode(
-    Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))),
-  );
+  return new TextDecoder().decode(Buffer.concat(chunks));
 }
