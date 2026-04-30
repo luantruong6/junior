@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { setConfigDefaults } from "@/chat/configuration/defaults";
 import { logException } from "@/chat/logging";
 import { setPluginPackages } from "@/chat/plugins/package-discovery";
 import { GET as diagnosticsGET } from "@/handlers/diagnostics";
@@ -11,6 +12,8 @@ import { POST as webhooksPOST } from "@/handlers/webhooks";
 import type { WaitUntilFn } from "@/handlers/types";
 
 export interface JuniorAppOptions {
+  /** Install-wide provider defaults (`provider.key` format). Channel overrides take precedence. */
+  configDefaults?: Record<string, unknown>;
   pluginPackages?: string[];
   waitUntil?: WaitUntilFn;
 }
@@ -55,6 +58,7 @@ export async function createApp(options?: JuniorAppOptions): Promise<Hono> {
   setPluginPackages(
     options?.pluginPackages ?? (await resolveBuildPluginPackages()),
   );
+  setConfigDefaults(options?.configDefaults);
 
   const waitUntil = options?.waitUntil ?? (await defaultWaitUntil());
 
