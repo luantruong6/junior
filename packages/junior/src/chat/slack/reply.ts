@@ -217,13 +217,13 @@ export async function postSlackApiReplyPosts(args: {
     let messageTs: string | undefined;
     try {
       if (post.text.trim().length > 0) {
+        const footer = index === lastTextPostIndex ? args.footer : undefined;
+        const blocks = buildSlackReplyBlocks(post.text, footer);
         const response = await postSlackMessage({
           channelId: args.channelId,
           threadTs: args.threadTs,
           text: post.text,
-          ...(index === lastTextPostIndex && args.footer
-            ? { blocks: buildSlackReplyBlocks(post.text, args.footer) }
-            : {}),
+          ...(blocks ? { blocks } : {}),
         });
         messageTs = response.ts;
         lastPostedMessageTs = response.ts;
