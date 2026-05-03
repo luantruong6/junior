@@ -7,6 +7,7 @@ import { logInfo, logWarn, setSpanAttributes } from "@/chat/logging";
 import { createGitHubAppBroker } from "./auth/github-app-broker";
 import { parsePluginManifest } from "./manifest";
 import { createOAuthBearerBroker } from "./auth/oauth-bearer-broker";
+import { createApiHeadersBroker } from "./auth/api-headers-broker";
 import { discoverInstalledPluginPackageContent } from "./package-discovery";
 import type {
   PluginBrokerDeps,
@@ -447,12 +448,16 @@ export function createPluginBroker(
   }
 
   const { credentials, name } = plugin.manifest;
-  if (!credentials) {
-    throw new Error(`Provider "${name}" has no credentials configured`);
+  if (!credentials && !plugin.manifest.apiHeaders) {
+    throw new Error(
+      `Provider "${name}" has no credentials or API headers configured`,
+    );
   }
   let broker: CredentialBroker;
 
-  if (credentials.type === "oauth-bearer") {
+  if (!credentials) {
+    broker = createApiHeadersBroker(plugin.manifest);
+  } else if (credentials.type === "oauth-bearer") {
     broker = createOAuthBearerBroker(plugin.manifest, credentials, deps);
   } else if (credentials.type === "github-app") {
     broker = createGitHubAppBroker(plugin.manifest, credentials);

@@ -20,6 +20,7 @@ const SHORT_CONFIG_KEY_RE = /^[a-z0-9]+(\.[a-z0-9-]+)*$/;
 const TARGET_FLAG_RE = /^-{1,2}[A-Za-z0-9][A-Za-z0-9-]*$/;
 const AUTH_TOKEN_ENV_RE = /^[A-Z][A-Z0-9_]*$/;
 const ENV_VAR_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
+const ENV_PLACEHOLDER_RE = /\$\{([A-Z_][A-Z0-9_]*)\}/g;
 const API_DOMAIN_RE =
   /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const RUNTIME_POSTINSTALL_CMD_RE = /^[A-Za-z0-9._/-]+$/;
@@ -133,7 +134,7 @@ const stringMapSchema = z
       result[key] = rawValue.trim();
     }
 
-    return Object.keys(result).length > 0 ? result : undefined;
+    return result;
   });
 
 const apiDomainsSchema = z
@@ -265,6 +266,8 @@ const manifestSourceSchema = z
         error: "must be an array when provided",
       })
       .optional(),
+    "api-domains": apiDomainsSchema.optional(),
+    "api-headers": stringMapSchema.optional(),
     credentials: z
       .record(z.string(), z.unknown(), {
         error: "must be an object when provided",
@@ -327,7 +330,12 @@ function normalizeStringMap(
     return undefined;
   }
 
-  for (const key of Object.keys(value)) {
+  const keys = Object.keys(value);
+  if (keys.length === 0) {
+    return undefined;
+  }
+
+  for (const key of keys) {
     const normalizedKey = key.toLowerCase();
     if (options.reservedKeys?.has(normalizedKey)) {
       throw new Error(`${prefix}.${key} is reserved by the runtime`);
@@ -338,6 +346,41 @@ function normalizeStringMap(
   }
 
   return value;
+}
+
+function assertDeclaredEnvReferences(
+  value: string,
+  envVars: Record<string, PluginEnvVarDeclaration>,
+  context: string,
+): void {
+  for (const match of value.matchAll(ENV_PLACEHOLDER_RE)) {
+    const name = match[1] as string;
+    if (!Object.prototype.hasOwnProperty.call(envVars, name)) {
+      throw new Error(
+        `${context} references env var ${name} which is not declared in env-vars`,
+      );
+    }
+    if (envVars[name]?.default !== undefined) {
+      throw new Error(
+        `${context} references env var ${name}, but API header env vars must not declare defaults`,
+      );
+    }
+  }
+}
+
+function normalizeRequiredApiHeaders(
+  value: Record<string, string>,
+  prefix: string,
+  envVars: Record<string, PluginEnvVarDeclaration>,
+): Record<string, string> {
+  const apiHeaders = normalizeStringMap(value, prefix);
+  if (!apiHeaders) {
+    throw new Error(`${prefix} must contain at least one header`);
+  }
+  for (const [key, headerValue] of Object.entries(apiHeaders)) {
+    assertDeclaredEnvReferences(headerValue, envVars, `${prefix}.${key}`);
+  }
+  return apiHeaders;
 }
 
 function normalizeCredentials(
@@ -363,18 +406,18 @@ function normalizeCredentials(
   }
 
   if (result.data.type === "oauth-bearer") {
+    const apiHeaders = result.data["api-headers"]
+      ? normalizeStringMap(
+          result.data["api-headers"],
+          `Plugin ${name} credentials.api-headers`,
+          { forbiddenKeys: FORBIDDEN_API_HEADER_NAMES },
+        )
+      : undefined;
+
     return {
       type: "oauth-bearer",
       apiDomains: result.data["api-domains"],
-      ...(result.data["api-headers"]
-        ? {
-            apiHeaders: normalizeStringMap(
-              result.data["api-headers"],
-              `Plugin ${name} credentials.api-headers`,
-              { forbiddenKeys: FORBIDDEN_API_HEADER_NAMES },
-            ),
-          }
-        : {}),
+      ...(apiHeaders ? { apiHeaders } : {}),
       authTokenEnv: result.data["auth-token-env"],
       ...(result.data["auth-token-placeholder"]
         ? { authTokenPlaceholder: result.data["auth-token-placeholder"] }
@@ -382,18 +425,18 @@ function normalizeCredentials(
     } satisfies OAuthBearerCredentials;
   }
 
+  const apiHeaders = result.data["api-headers"]
+    ? normalizeStringMap(
+        result.data["api-headers"],
+        `Plugin ${name} credentials.api-headers`,
+        { forbiddenKeys: FORBIDDEN_API_HEADER_NAMES },
+      )
+    : undefined;
+
   return {
     type: "github-app",
     apiDomains: result.data["api-domains"],
-    ...(result.data["api-headers"]
-      ? {
-          apiHeaders: normalizeStringMap(
-            result.data["api-headers"],
-            `Plugin ${name} credentials.api-headers`,
-            { forbiddenKeys: FORBIDDEN_API_HEADER_NAMES },
-          ),
-        }
-      : {}),
+    ...(apiHeaders ? { apiHeaders } : {}),
     authTokenEnv: result.data["auth-token-env"],
     ...(result.data["auth-token-placeholder"]
       ? { authTokenPlaceholder: result.data["auth-token-placeholder"] }
@@ -560,8 +603,6 @@ function normalizeRuntimePostinstall(
   return parsed.length > 0 ? parsed : undefined;
 }
 
-const ENV_PLACEHOLDER_RE = /\$\{([A-Z_][A-Z0-9_]*)\}/g;
-
 const envVarDeclarationSchema = z.preprocess(
   (value) => (value === null || value === undefined ? {} : value),
   z
@@ -652,18 +693,16 @@ function normalizeMcp(
     throw new Error(issueMessage(result.error, `Plugin ${name} mcp`));
   }
 
+  const headers = result.data.headers
+    ? normalizeStringMap(result.data.headers, `Plugin ${name} mcp.headers`, {
+        forbiddenKeys: FORBIDDEN_API_HEADER_NAMES,
+      })
+    : undefined;
+
   return {
     transport: "http",
     url: result.data.url,
-    ...(result.data.headers
-      ? {
-          headers: normalizeStringMap(
-            result.data.headers,
-            `Plugin ${name} mcp.headers`,
-            { forbiddenKeys: FORBIDDEN_API_HEADER_NAMES },
-          ),
-        }
-      : {}),
+    ...(headers ? { headers } : {}),
     ...(result.data["allowed-tools"]
       ? { allowedTools: result.data["allowed-tools"] }
       : {}),
@@ -708,6 +747,16 @@ export function parsePluginManifest(raw: string, dir: string): PluginManifest {
     if (path === "config-keys") {
       throw new Error(
         `Plugin ${(parsedYaml as { name?: string }).name ?? "unknown"} config-keys must be an array when provided`,
+      );
+    }
+    if (path === "api-domains") {
+      throw new Error(
+        `Plugin ${(parsedYaml as { name?: string }).name ?? "unknown"} api-domains must be a non-empty array of domains`,
+      );
+    }
+    if (path === "api-headers") {
+      throw new Error(
+        `Plugin ${(parsedYaml as { name?: string }).name ?? "unknown"} api-headers must be an object when provided`,
       );
     }
     if (path === "credentials") {
@@ -765,6 +814,23 @@ export function parsePluginManifest(raw: string, dir: string): PluginManifest {
     return `${data.name}.${key}`;
   });
 
+  const envVars = data["env-vars"]
+    ? normalizeEnvVars(data["env-vars"], data.name)
+    : {};
+  const apiHeaders = data["api-headers"]
+    ? normalizeRequiredApiHeaders(
+        data["api-headers"],
+        `Plugin ${data.name} api-headers`,
+        envVars,
+      )
+    : undefined;
+  if (apiHeaders && !data["api-domains"]) {
+    throw new Error(`Plugin ${data.name} api-headers requires api-domains`);
+  }
+  if (data["api-domains"] && !apiHeaders) {
+    throw new Error(`Plugin ${data.name} api-domains requires api-headers`);
+  }
+
   const credentials = data.credentials
     ? normalizeCredentials(data.credentials, data.name)
     : undefined;
@@ -774,9 +840,6 @@ export function parsePluginManifest(raw: string, dir: string): PluginManifest {
   const runtimePostinstall = data["runtime-postinstall"]
     ? normalizeRuntimePostinstall(data["runtime-postinstall"], data.name)
     : undefined;
-  const envVars = data["env-vars"]
-    ? normalizeEnvVars(data["env-vars"], data.name)
-    : {};
   const mcp = data.mcp ? normalizeMcp(data.mcp, envVars, data.name) : undefined;
 
   const manifest: PluginManifest = {
@@ -784,6 +847,8 @@ export function parsePluginManifest(raw: string, dir: string): PluginManifest {
     description: data.description,
     capabilities,
     configKeys,
+    ...(data["api-domains"] ? { apiDomains: data["api-domains"] } : {}),
+    ...(apiHeaders ? { apiHeaders } : {}),
     ...(Object.keys(envVars).length > 0 ? { envVars } : {}),
     ...(credentials ? { credentials } : {}),
     ...(runtimeDependencies ? { runtimeDependencies } : {}),

@@ -82,6 +82,8 @@ export interface PluginManifest {
   description: string;
   capabilities: string[];
   configKeys: string[];
+  apiDomains?: string[];
+  apiHeaders?: Record<string, string>;
   envVars?: Record<string, PluginEnvVarDeclaration>;
   credentials?: PluginCredentials;
   runtimeDependencies?: PluginRuntimeDependency[];

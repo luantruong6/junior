@@ -590,7 +590,7 @@ describe("plugin registry package discovery", () => {
           delete: async () => {},
         },
       }),
-    ).toThrow('Provider "demo" has no credentials configured');
+    ).toThrow('Provider "demo" has no credentials or API headers configured');
   });
 
   it("parses system URL runtime dependencies with required sha256", async () => {
@@ -840,7 +840,7 @@ describe("plugin registry package discovery", () => {
     });
   });
 
-  it("rejects Authorization in plugin api headers", async () => {
+  it("rejects Authorization in credential api headers", async () => {
     const tempRoot = await fs.mkdtemp(
       path.join(os.tmpdir(), "junior-plugin-package-"),
     );
