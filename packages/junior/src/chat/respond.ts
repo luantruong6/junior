@@ -1,4 +1,4 @@
-import { Agent, type AgentMessage } from "@mariozechner/pi-agent-core";
+import { Agent } from "@mariozechner/pi-agent-core";
 import type { FileUpload } from "chat";
 import { botConfig } from "@/chat/config";
 import {
@@ -14,7 +14,7 @@ import {
   type LogContext,
 } from "@/chat/logging";
 import { listReferenceFiles } from "@/chat/discovery";
-import { buildSystemPrompt } from "@/chat/prompt";
+import { buildSystemPrompt, buildTurnContextPrompt } from "@/chat/prompt";
 import {
   createSkillCapabilityRuntime,
   createUserTokenStore,
@@ -48,6 +48,7 @@ import {
   getPiGatewayApiKeyOverride,
   resolveGatewayModel,
 } from "@/chat/pi/client";
+import type { PiMessage } from "@/chat/pi/messages";
 import {
   createSandboxExecutor,
   type SandboxAcquiredState,
@@ -118,6 +119,8 @@ export interface ReplyRequestContext {
   artifactState?: ThreadArtifactsState;
   pendingAuth?: ConversationPendingAuthState;
   configuration?: Record<string, unknown>;
+  /** Durable Pi transcript for this conversation, excluding ephemeral turn context. */
+  piMessages?: PiMessage[];
   channelConfiguration?: ChannelConfigurationService;
   userAttachments?: Array<{
     data?: Buffer;
@@ -149,7 +152,7 @@ export interface ReplyRequestContext {
     params: Record<string, unknown>;
   }) => void;
   /**
-   * Known thread participants. Injected into the system prompt so the LLM can
+   * Known thread participants. Injected into per-turn context so the LLM can
    * produce correct <@USERID> mention syntax for people already in the conversation.
    */
   threadParticipants?: Array<{
@@ -294,6 +297,92 @@ function buildUserTurnInput(args: {
   return { routerBlocks, userContentParts };
 }
 
+function refreshCheckpointTurnContext(
+  messages: PiMessage[],
+  turnContextPrompt: string,
+): PiMessage[] {
+  // Resumes need fresh runtime facts without duplicating the original user turn.
+  const marker = getTurnContextMarker(turnContextPrompt);
+  for (let index = 0; index < messages.length; index += 1) {
+    const content = getUserMessageContent(messages[index]);
+    if (!content) {
+      continue;
+    }
+    const contextIndex = content.findIndex((part) =>
+      isTurnContextPart(part, marker),
+    );
+    if (contextIndex < 0) {
+      continue;
+    }
+
+    const updatedMessages = [...messages];
+    const updatedContent = [...content];
+    updatedContent[contextIndex] = {
+      ...(updatedContent[contextIndex] as object),
+      text: turnContextPrompt,
+    };
+    updatedMessages[index] = {
+      ...messages[index],
+      content: updatedContent,
+    } as PiMessage;
+    return updatedMessages;
+  }
+
+  return [
+    ...messages,
+    {
+      role: "user",
+      content: [{ type: "text", text: turnContextPrompt }],
+      timestamp: Date.now(),
+    } as PiMessage,
+  ];
+}
+
+function stripTurnContextFromMessages(
+  messages: PiMessage[],
+  turnContextPrompt: string,
+): PiMessage[] {
+  const marker = getTurnContextMarker(turnContextPrompt);
+  return messages.flatMap((message) => {
+    const content = getUserMessageContent(message);
+    if (!content) {
+      return [message];
+    }
+
+    const strippedContent = content.filter(
+      (part) => !isTurnContextPart(part, marker),
+    );
+    if (strippedContent.length === content.length) {
+      return [message];
+    }
+    if (strippedContent.length === 0) {
+      return [];
+    }
+    return [{ ...message, content: strippedContent } as PiMessage];
+  });
+}
+
+function getTurnContextMarker(turnContextPrompt: string): string {
+  return turnContextPrompt.split("\n", 1)[0];
+}
+
+function getUserMessageContent(message: PiMessage): unknown[] | undefined {
+  const record = message as { role?: unknown; content?: unknown };
+  return record.role === "user" && Array.isArray(record.content)
+    ? record.content
+    : undefined;
+}
+
+function isTurnContextPart(part: unknown, marker: string): boolean {
+  return (
+    part !== null &&
+    typeof part === "object" &&
+    (part as { type?: unknown }).type === "text" &&
+    typeof (part as { text?: unknown }).text === "string" &&
+    (part as { text: string }).text.startsWith(marker)
+  );
+}
+
 /** Run a full agent turn: discover skills, execute tools, and return the assistant reply. */
 export async function generateAssistantReply(
   messageText: string,
@@ -303,7 +392,7 @@ export async function generateAssistantReply(
   let timeoutResumeConversationId: string | undefined;
   let timeoutResumeSessionId: string | undefined;
   let timeoutResumeSliceId = 1;
-  let timeoutResumeMessages: AgentMessage[] = [];
+  let timeoutResumeMessages: PiMessage[] = [];
   let beforeMessageCount = 0;
   let lastKnownSandboxId: string | undefined = context.sandbox?.sandboxId;
   let lastKnownSandboxDependencyProfileHash: string | undefined =
@@ -534,9 +623,13 @@ export async function generateAssistantReply(
       }
     }
 
+    const promptConversationContext =
+      context.piMessages && context.piMessages.length > 0
+        ? undefined
+        : context.conversationContext;
     const userTurnText = buildUserTurnText(
       userInput,
-      context.conversationContext,
+      promptConversationContext,
       {
         sessionContext: { conversationId: sessionConversationId },
         turnContext: { traceId: getActiveTraceId() },
@@ -753,11 +846,12 @@ export async function generateAssistantReply(
     }
     syncResumeState();
 
-    // ── System prompt ────────────────────────────────────────────────
+    // ── Prompt context ───────────────────────────────────────────────
     const activeMcpCatalogs = toActiveMcpCatalogSummaries(
       turnMcpToolManager.getActiveToolCatalog(activeSkills),
     );
-    baseInstructions = buildSystemPrompt({
+    baseInstructions = buildSystemPrompt();
+    const turnContextPrompt = buildTurnContextPrompt({
       availableSkills,
       activeSkills,
       activeMcpCatalogs,
@@ -776,6 +870,10 @@ export async function generateAssistantReply(
       threadParticipants: context.threadParticipants,
       turnState: resumedFromCheckpoint ? "resumed" : "fresh",
     });
+    const promptContentParts: UserTurnContentPart[] = [
+      { type: "text", text: turnContextPrompt },
+      ...userContentParts,
+    ];
 
     const inputMessagesAttribute = serializeGenAiAttribute([
       {
@@ -784,7 +882,7 @@ export async function generateAssistantReply(
       },
       {
         role: "user",
-        content: userContentParts.map((part) => toObservablePromptPart(part)),
+        content: promptContentParts.map((part) => toObservablePromptPart(part)),
       },
     ]);
 
@@ -876,11 +974,16 @@ export async function generateAssistantReply(
       });
     });
 
-    let newMessages: AgentMessage[] = [];
+    let newMessages: PiMessage[] = [];
     beforeMessageCount = agent.state.messages.length;
     try {
       if (resumedFromCheckpoint) {
-        agent.state.messages = existingCheckpoint!.piMessages;
+        agent.state.messages = refreshCheckpointTurnContext(
+          existingCheckpoint!.piMessages,
+          turnContextPrompt,
+        );
+      } else if (context.piMessages && context.piMessages.length > 0) {
+        agent.state.messages = [...context.piMessages];
       }
       beforeMessageCount = agent.state.messages.length;
 
@@ -891,13 +994,10 @@ export async function generateAssistantReply(
         async () => {
           let promptResult: unknown;
           const promptPromise = resumedFromCheckpoint
-            ? // Checkpoint resumes continue from the persisted Pi message
-              // state. Any reconstructed replyContext only matters when the
-              // turn parked before the initial user prompt was recorded.
-              agent.continue()
+            ? agent.continue()
             : agent.prompt({
                 role: "user",
-                content: userContentParts,
+                content: promptContentParts,
                 timestamp: Date.now(),
               });
 
@@ -1013,6 +1113,10 @@ export async function generateAssistantReply(
     // ── Build turn result ────────────────────────────────────────────
     return buildTurnResult({
       newMessages,
+      piMessages: stripTurnContextFromMessages(
+        agent.state.messages,
+        turnContextPrompt,
+      ),
       userInput,
       replyFiles,
       artifactStatePatch,

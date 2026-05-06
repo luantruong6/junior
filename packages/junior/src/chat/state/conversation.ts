@@ -1,4 +1,5 @@
 import { isRecord, toOptionalNumber, toOptionalString } from "@/chat/coerce";
+import type { PiMessage } from "@/chat/pi/messages";
 import type { AuthorizationPauseKind } from "@/chat/services/auth-pause";
 
 type ConversationRole = "assistant" | "system" | "user";
@@ -77,6 +78,7 @@ export interface ThreadConversationState {
   backfill: ConversationBackfillState;
   compactions: ConversationCompaction[];
   messages: ConversationMessage[];
+  piMessages: PiMessage[];
   processing: ConversationProcessingState;
   schemaVersion: 1;
   stats: ConversationStats;
@@ -172,6 +174,7 @@ function defaultConversationState(): ThreadConversationState {
   return {
     schemaVersion: 1,
     messages: [],
+    piMessages: [],
     compactions: [],
     backfill: {},
     processing: {},
@@ -331,6 +334,9 @@ export function coerceThreadConversationState(
   return {
     schemaVersion: 1,
     messages,
+    piMessages: Array.isArray(rawConversation.piMessages)
+      ? (rawConversation.piMessages as PiMessage[])
+      : [],
     compactions,
     backfill,
     processing,
