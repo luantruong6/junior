@@ -1,7 +1,7 @@
 import type { Message, Thread } from "chat";
 import { getSubscribedReplyPreflightDecision } from "@/chat/services/subscribed-decision";
 import { isRetryableTurnError } from "@/chat/runtime/turn";
-import type { ErrorReference } from "@/chat/logging";
+import { buildTurnFailureResponse } from "@/chat/logging";
 import { getSlackErrorObservabilityAttributes } from "@/chat/runtime/thread-context";
 import type { SubscribedReplyDecision } from "@/chat/services/subscribed-reply-policy";
 
@@ -89,7 +89,6 @@ export interface SlackTurnRuntimeDependencies<TPreparedState> {
   ) => void;
   modelId: string;
   now: () => number;
-  getErrorReference: (eventId?: string) => ErrorReference | null;
   recordSkippedSubscribedMessage: (args: {
     completedAtMs: number;
     decision: SubscribedReplyDecision;
@@ -144,16 +143,6 @@ export interface SlackTurnRuntimeDependencies<TPreparedState> {
     context: Record<string, unknown>,
     callback: () => Promise<void>,
   ) => Promise<void>;
-}
-
-function buildFailureMessage(reference: ErrorReference | null): string {
-  if (!reference) {
-    return "I ran into an internal error while processing that. Please try again.";
-  }
-  if (reference.eventId) {
-    return `I ran into an internal error while processing that. Reference: \`event_id=${reference.eventId} trace_id=${reference.traceId}\`.`;
-  }
-  return `I ran into an internal error while processing that. Reference: \`trace_id=${reference.traceId}\`.`;
 }
 
 export interface SlackTurnRuntime<
@@ -215,14 +204,13 @@ export function createSlackTurnRuntime<
 
   const postFallbackErrorReplyWithLogging = async (args: {
     thread: Thread;
-    reference: ErrorReference | null;
     errorContext: RuntimeLogContext;
-    eventId?: string;
+    eventId: string;
     postFailureEventName: string;
     postFailureBody: string;
   }): Promise<void> => {
     try {
-      await args.thread.post(buildFailureMessage(args.reference));
+      await args.thread.post(buildTurnFailureResponse(args.eventId));
     } catch (postError) {
       deps.logException(
         postError,
@@ -230,9 +218,7 @@ export function createSlackTurnRuntime<
         args.errorContext,
         {
           "app.slack.reply_stage": "error_fallback_post",
-          ...(args.eventId
-            ? { "app.error.original_event_id": args.eventId }
-            : {}),
+          "app.error.original_event_id": args.eventId,
           ...getSlackErrorObservabilityAttributes(postError),
         },
         args.postFailureBody,
@@ -335,11 +321,14 @@ export function createSlackTurnRuntime<
           {},
           "onNewMention failed",
         );
+        if (!eventId) {
+          throw new Error(
+            "Sentry did not return an event ID for mention_handler_failed",
+          );
+        }
         await hooks?.beforeFirstResponsePost?.();
-        const reference = deps.getErrorReference(eventId);
         await postFallbackErrorReplyWithLogging({
           thread,
-          reference,
           errorContext,
           eventId,
           postFailureEventName: "mention_handler_failure_reply_post_failed",
@@ -491,11 +480,14 @@ export function createSlackTurnRuntime<
           {},
           "onSubscribedMessage failed",
         );
+        if (!eventId) {
+          throw new Error(
+            "Sentry did not return an event ID for subscribed_message_handler_failed",
+          );
+        }
         await hooks?.beforeFirstResponsePost?.();
-        const reference = deps.getErrorReference(eventId);
         await postFallbackErrorReplyWithLogging({
           thread,
-          reference,
           errorContext,
           eventId,
           postFailureEventName:

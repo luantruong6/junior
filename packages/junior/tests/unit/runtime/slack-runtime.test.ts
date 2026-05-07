@@ -37,7 +37,6 @@ describe("createSlackTurnRuntime", () => {
       assistantUserName: "junior",
       decideSubscribedReply,
       getChannelId: () => "C123",
-      getErrorReference: () => null,
       getPreparedConversationContext: () => "prior thread context",
       getRunId: () => "run_123",
       getThreadId: () => "thread_123",

@@ -22,13 +22,12 @@ function createMockDeps(
     assistantUserName: "test-bot",
     modelId: "test-model",
     now: () => 1700000000000,
-    getErrorReference: () => null,
     getChannelId: (_thread, message) => message.threadId?.split(":")[1],
     getThreadId: (_thread, message) => message.threadId,
     getRunId: () => undefined,
     initializeAssistantThread: vi.fn().mockResolvedValue(undefined),
     refreshAssistantThreadContext: vi.fn().mockResolvedValue(undefined),
-    logException: vi.fn(),
+    logException: vi.fn(() => "evt_test"),
     logWarn: vi.fn(),
     onSubscribedMessageSkipped: vi.fn().mockResolvedValue(undefined),
     recordSkippedSubscribedMessage: vi.fn().mockResolvedValue(undefined),
@@ -77,7 +76,7 @@ describe("createSlackTurnRuntime", () => {
       await runtime.handleNewMention(thread, message);
 
       expect(thread.posts).toContain(
-        "I ran into an internal error while processing that. Please try again.",
+        "I ran into an internal error while processing that. Reference: `event_id=evt_test`.",
       );
     });
 
@@ -97,7 +96,7 @@ describe("createSlackTurnRuntime", () => {
       await runtime.handleNewMention(thread, message);
 
       expect(thread.posts).toContain(
-        "I ran into an internal error while processing that. Please try again.",
+        "I ran into an internal error while processing that. Reference: `event_id=evt_test`.",
       );
     });
 
@@ -107,10 +106,6 @@ describe("createSlackTurnRuntime", () => {
         replyToThread: vi.fn().mockRejectedValue(replyError),
         withSpan: vi.fn(async (_n, _o, _c, cb) => cb()),
         logException: vi.fn(() => "evt_123"),
-        getErrorReference: () => ({
-          eventId: "evt_123",
-          traceId: "trace_ignored",
-        }),
       });
       const runtime = createSlackTurnRuntime<TestState>(deps);
       const thread = createTestThread({});
@@ -119,27 +114,25 @@ describe("createSlackTurnRuntime", () => {
       await runtime.handleNewMention(thread, message);
 
       expect(thread.posts).toContain(
-        "I ran into an internal error while processing that. Reference: `event_id=evt_123 trace_id=trace_ignored`.",
+        "I ran into an internal error while processing that. Reference: `event_id=evt_123`.",
       );
     });
 
-    it("falls back to trace id when sentry event id is unavailable", async () => {
+    it("fails closed when sentry capture returns no event id", async () => {
       const replyError = new Error("reply failed");
       const deps = createMockDeps({
         replyToThread: vi.fn().mockRejectedValue(replyError),
         withSpan: vi.fn(async (_n, _o, _c, cb) => cb()),
         logException: vi.fn(() => undefined),
-        getErrorReference: () => ({ traceId: "trace_123" }),
       });
       const runtime = createSlackTurnRuntime<TestState>(deps);
       const thread = createTestThread({});
       const message = createTestMessage({});
 
-      await runtime.handleNewMention(thread, message);
-
-      expect(thread.posts).toContain(
-        "I ran into an internal error while processing that. Reference: `trace_id=trace_123`.",
+      await expect(runtime.handleNewMention(thread, message)).rejects.toThrow(
+        "Sentry did not return an event ID for mention_handler_failed",
       );
+      expect(thread.posts).toHaveLength(0);
     });
   });
 
@@ -384,7 +377,7 @@ describe("createSlackTurnRuntime", () => {
       await runtime.handleSubscribedMessage(thread, message);
 
       expect(thread.posts).toContain(
-        "I ran into an internal error while processing that. Please try again.",
+        "I ran into an internal error while processing that. Reference: `event_id=evt_test`.",
       );
     });
   });

@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RetryableTurnError } from "@/chat/runtime/turn";
 import { disconnectStateAdapter, getStateAdapter } from "@/chat/state/adapter";
 
-const { postMessageMock, setStatusMock } = vi.hoisted(() => ({
+const { logExceptionMock, postMessageMock, setStatusMock } = vi.hoisted(() => ({
+  logExceptionMock: vi.fn(),
   postMessageMock: vi.fn(),
   setStatusMock: vi.fn(),
 }));
@@ -44,11 +45,21 @@ vi.mock("@/chat/slack/client", () => ({
   }),
 }));
 
+vi.mock("@/chat/logging", async (importOriginal) => {
+  const original = await importOriginal<typeof import("@/chat/logging")>();
+  return {
+    ...original,
+    logException: logExceptionMock,
+  };
+});
+
 import { resumeAuthorizedRequest, resumeSlackTurn } from "@/chat/slack/resume";
 
 describe("resumeAuthorizedRequest", () => {
   beforeEach(async () => {
     vi.useFakeTimers();
+    logExceptionMock.mockReset();
+    logExceptionMock.mockReturnValue("evt_test");
     postMessageMock.mockReset();
     setStatusMock.mockReset();
     postMessageMock.mockResolvedValue({ ts: "1700000000.100" });
@@ -69,7 +80,6 @@ describe("resumeAuthorizedRequest", () => {
       channelId: "C-test",
       threadTs: "1700000000.0001",
       connectedText: "connected",
-      failureText: "resume failed",
       replyContext: {
         requester: { userId: "U-test" },
       },
@@ -82,6 +92,55 @@ describe("resumeAuthorizedRequest", () => {
     await resumePromise;
 
     expect(onFailure).toHaveBeenCalledTimes(1);
+    expect(postMessageMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        channel: "C-test",
+        thread_ts: "1700000000.0001",
+        text: expect.stringContaining(
+          "I ran into an internal error while processing that. Reference: `event_id=",
+        ),
+      }),
+    );
+  });
+
+  it("persists failure state before requiring a Sentry event ID", async () => {
+    const onFailure = vi.fn(async () => undefined);
+    logExceptionMock.mockReturnValueOnce(undefined);
+
+    await expect(
+      resumeAuthorizedRequest({
+        messageText: "tell me the saved deadline",
+        channelId: "C-test",
+        threadTs: "1700000000.0004",
+        connectedText: "connected",
+        replyContext: {
+          requester: { userId: "U-test" },
+        },
+        generateReply: async () => {
+          throw new Error("resume failed");
+        },
+        onFailure,
+      }),
+    ).rejects.toThrow(
+      "Sentry did not return an event ID for slack_resume_turn_failed",
+    );
+
+    expect(onFailure).toHaveBeenCalledTimes(1);
+    expect(postMessageMock).toHaveBeenCalledTimes(1);
+    expect(postMessageMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        channel: "C-test",
+        thread_ts: "1700000000.0004",
+        text: "connected",
+      }),
+    );
+    expect(postMessageMock).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        channel: "C-test",
+        thread_ts: "1700000000.0004",
+        text: expect.stringContaining("event_id=unknown"),
+      }),
+    );
   });
 
   it("releases the thread lock before scheduling another timeout slice", async () => {
@@ -119,14 +178,13 @@ describe("resumeAuthorizedRequest", () => {
     expect(onTimeoutPause).toHaveBeenCalledTimes(1);
   });
 
-  it("falls back to normal failure handling when timeout pause handling throws", async () => {
+  it("posts the canonical failure response when timeout pause handling throws", async () => {
     const onFailure = vi.fn(async () => undefined);
 
     await resumeSlackTurn({
       messageText: "continue this turn",
       channelId: "C-test",
       threadTs: "1700000000.0003",
-      failureText: "resume failed",
       replyContext: {
         requester: { userId: "U-test" },
       },
@@ -145,5 +203,14 @@ describe("resumeAuthorizedRequest", () => {
     });
 
     expect(onFailure).toHaveBeenCalledTimes(1);
+    expect(postMessageMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        channel: "C-test",
+        thread_ts: "1700000000.0003",
+        text: expect.stringContaining(
+          "I ran into an internal error while processing that. Reference: `event_id=",
+        ),
+      }),
+    );
   });
 });

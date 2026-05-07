@@ -1413,11 +1413,6 @@ export function setSentryScopeContext(
 // High-level observability API (spans, error capture, convenience loggers)
 // ---------------------------------------------------------------------------
 
-export interface ErrorReference {
-  traceId: string;
-  eventId?: string;
-}
-
 type SpanAttributePrimitive = string | number | boolean;
 type SpanAttributeValue = SpanAttributePrimitive | string[];
 
@@ -1657,21 +1652,12 @@ export function getActiveTraceId(): string | undefined {
   }
 }
 
-/** Build a trace + event ID reference for error correlation. */
-export function resolveErrorReference(eventId?: string): ErrorReference | null {
-  const traceId = getActiveTraceId();
-  if (!eventId && !traceId) {
-    return null;
-  }
+const TURN_FAILURE_RESPONSE_TEMPLATE =
+  "I ran into an internal error while processing that. Reference: `event_id={eventId}`.";
 
-  if (!traceId) {
-    return null;
-  }
-
-  return {
-    traceId,
-    ...(eventId ? { eventId } : {}),
-  };
+/** Build the static user-facing response for a failed turn. */
+export function buildTurnFailureResponse(eventId: string): string {
+  return TURN_FAILURE_RESPONSE_TEMPLATE.replace("{eventId}", eventId);
 }
 
 // ---------------------------------------------------------------------------

@@ -14,7 +14,6 @@ import { isExplicitChannelPostIntent } from "@/chat/services/channel-intent";
 import { enforceAttachmentClaimTruth } from "@/chat/services/attachment-claims";
 import type { ThreadArtifactsState } from "@/chat/state/artifacts";
 import {
-  buildExecutionFailureMessage,
   extractAssistantText,
   getTerminalAssistantMessages,
   isAssistantMessage,
@@ -198,16 +197,13 @@ export function buildTurnResult(input: TurnResultInput): AssistantReply {
     : sideEffectOnlySuccess
       ? "success"
       : "execution_failure";
-  const fallbackText = buildExecutionFailureMessage(toolErrorCount);
   const suppressReactionOnlyText =
     reactionPerformed &&
     !channelPostPerformed &&
     replyFiles.length === 0 &&
     Boolean(primaryText) &&
     isReactionOnlyIntent(userInput);
-  const rawResponseText = suppressReactionOnlyText
-    ? ""
-    : primaryText || (sideEffectOnlySuccess ? "" : fallbackText);
+  const rawResponseText = suppressReactionOnlyText ? "" : primaryText;
   const responseText =
     canvasCreated && isVerbosePostCanvasReply(rawResponseText)
       ? buildBriefPostCanvasReply(artifactStatePatch)
@@ -217,22 +213,22 @@ export function buildTurnResult(input: TurnResultInput): AssistantReply {
     (isExecutionEscapeResponse(primaryText) ||
       isRawToolPayloadResponse(primaryText));
   const resolvedText = escapedOrRawPayload
-    ? fallbackText
+    ? ""
     : enforceAttachmentClaimTruth(responseText, replyFiles.length > 0);
+  const resolvedOutcome: AgentTurnDiagnostics["outcome"] = escapedOrRawPayload
+    ? "execution_failure"
+    : outcome;
   const deliveryPlan =
-    reactionPerformed &&
+    resolvedOutcome === "success" &&
     !resolvedText &&
     replyFiles.length === 0 &&
-    !channelPostPerformed
+    (reactionPerformed || channelPostPerformed)
       ? {
           ...baseDeliveryPlan,
           postThreadText: false,
         }
       : baseDeliveryPlan;
   const deliveryMode: "thread" | "channel_only" = deliveryPlan.mode;
-  const resolvedOutcome: AgentTurnDiagnostics["outcome"] = escapedOrRawPayload
-    ? "execution_failure"
-    : outcome;
 
   if (shouldTrace) {
     logInfo(

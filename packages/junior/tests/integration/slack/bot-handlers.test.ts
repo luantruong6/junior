@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { JuniorRuntimeServiceOverrides } from "@/chat/app/services";
 import { makeAssistantStatus } from "@/chat/slack/assistant-thread/status";
+import { getSlackInterruptionMarker } from "@/chat/slack/output";
 import { RetryableTurnError } from "@/chat/runtime/turn";
 import {
   FakeSlackAdapter,
@@ -484,12 +485,13 @@ describe("bot handlers (integration)", () => {
     );
 
     expect(thread.posts).toHaveLength(1);
-    expect(thread.posts[0]).toEqual(
-      expect.objectContaining({
-        markdown:
-          "Partial output...\n\n[Response interrupted before completion]",
-      }),
-    );
+    const postText =
+      typeof thread.posts[0] === "string"
+        ? thread.posts[0]
+        : ((thread.posts[0] as { markdown?: string }).markdown ?? "");
+    expect(postText).toContain("I ran into an internal error");
+    expect(postText).toContain("event_id=");
+    expect(postText).not.toContain(getSlackInterruptionMarker().trim());
   });
 
   it("emits assistant status updates in shared channel threads", async () => {
