@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { cpSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -9,6 +10,15 @@ const originalCwd = process.cwd();
 const repoRoot = path.resolve(import.meta.dirname, "../../../..");
 const exampleRoot = path.join(repoRoot, "apps/example");
 const exampleEntry = path.join(exampleRoot, "server.ts");
+const exampleRequire = createRequire(exampleEntry);
+
+function isSamePath(left: string, right: string): boolean {
+  try {
+    return realpathSync(left) === realpathSync(right);
+  } catch {
+    return false;
+  }
+}
 
 function getExamplePluginPackages(): string[] {
   const pkg = JSON.parse(
@@ -37,15 +47,20 @@ function buildJuniorPackage(): void {
     stdio: "pipe",
   });
 
-  // Re-sync pnpm store so the example app's node_modules/@sentry/junior
-  // points to the freshly built dist, not a stale hardlink. The relink does
-  // not need workspace prepare hooks, which would rebuild @sentry/junior and
-  // make the full suite timeout-prone.
-  execFileSync("pnpm", ["install", "--ignore-scripts"], {
-    cwd: repoRoot,
-    env,
-    stdio: "pipe",
+  const installedPackageRoot = path.dirname(
+    path.dirname(exampleRequire.resolve("@sentry/junior")),
+  );
+  const sourceDist = path.join(repoRoot, "packages/junior/dist");
+  const installedDist = path.join(installedPackageRoot, "dist");
+  if (isSamePath(installedDist, sourceDist)) {
+    return;
+  }
+
+  rmSync(installedDist, {
+    force: true,
+    recursive: true,
   });
+  cpSync(sourceDist, installedDist, { recursive: true });
 }
 
 async function importExampleApp() {
