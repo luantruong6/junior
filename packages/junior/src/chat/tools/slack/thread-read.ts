@@ -11,11 +11,14 @@ import {
 } from "@/chat/tools/slack/slack-message-url";
 import type { SlackThreadReply } from "@/chat/slack/channel";
 import type { ToolRuntimeContext } from "@/chat/tools/types";
+import { renderSlackLegacyAttachmentText } from "@/chat/slack/legacy-attachments";
 
 const MAX_THREAD_READ_CHARS = 40_000;
 
 /** Project a thread reply to safe output fields (strips url_private etc). */
 function sanitizeMessage(msg: SlackThreadReply) {
+  const attachmentText = renderSlackLegacyAttachmentText(msg.attachments);
+
   return {
     ts: msg.ts,
     user: msg.user,
@@ -24,6 +27,7 @@ function sanitizeMessage(msg: SlackThreadReply) {
     subtype: msg.subtype,
     bot_id: msg.bot_id,
     type: msg.type,
+    ...(attachmentText ? { attachment_text: attachmentText } : {}),
     ...(msg.files?.length
       ? {
           files: msg.files.map((f) => ({
@@ -51,7 +55,8 @@ function truncateMessages(
   const kept: SanitizedMessage[] = [];
 
   for (const msg of messages) {
-    const textLen = msg.text?.length ?? 0;
+    const textLen =
+      (msg.text?.length ?? 0) + (msg.attachment_text?.length ?? 0);
     if (kept.length > 0 && chars + textLen > maxChars) {
       break;
     }
