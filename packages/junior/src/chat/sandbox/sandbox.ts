@@ -1,5 +1,4 @@
 import fs from "node:fs/promises";
-import type { Sandbox } from "@vercel/sandbox";
 import {
   logInfo,
   setSpanAttributes,
@@ -11,7 +10,10 @@ import {
   buildSandboxEgressNetworkPolicy,
   resolveSandboxCommandEnvironment,
 } from "@/chat/sandbox/egress-policy";
-import { upsertSandboxEgressSession } from "@/chat/sandbox/egress-session";
+import {
+  clearSandboxEgressSession,
+  upsertSandboxEgressSession,
+} from "@/chat/sandbox/egress-session";
 import { throwSandboxOperationError } from "@/chat/sandbox/errors";
 import { SANDBOX_WORKSPACE_ROOT } from "@/chat/sandbox/paths";
 import { createSandboxSessionManager } from "@/chat/sandbox/session";
@@ -20,7 +22,7 @@ import {
   resolveHostDataPath,
   resolveHostSkillPath,
 } from "@/chat/sandbox/skill-sync";
-import type { SandboxWorkspace } from "@/chat/sandbox/workspace";
+import type { SandboxInstance } from "@/chat/sandbox/workspace";
 import type { SkillMetadata } from "@/chat/skills";
 import { editFile } from "@/chat/tools/sandbox/edit-file";
 import { findFiles } from "@/chat/tools/sandbox/find-files";
@@ -64,7 +66,7 @@ export interface SandboxExecutor {
   getSandboxId(): string | undefined;
   getDependencyProfileHash(): string | undefined;
   canExecute(toolName: string): boolean;
-  createSandbox(): Promise<SandboxWorkspace>;
+  createSandbox(): Promise<SandboxInstance>;
   execute<T>(
     params: SandboxExecutionInput,
   ): Promise<SandboxExecutionEnvelope<T>>;
@@ -91,19 +93,6 @@ function parseEnv(raw: unknown): Record<string, string> | undefined {
       .filter(([, value]) => typeof value === "string")
       .map(([key, value]) => [key, value as string]),
   );
-}
-
-function createSandboxWorkspace(sandbox: Sandbox): SandboxWorkspace {
-  const sandboxId = sandbox.name;
-  return {
-    sandboxId,
-    readFileToBuffer(input) {
-      return sandbox.readFileToBuffer(input);
-    },
-    runCommand(input) {
-      return sandbox.runCommand(input);
-    },
-  };
 }
 
 /** Create one sandbox-backed tool executor facade for the current turn. */
@@ -133,6 +122,11 @@ export function createSandboxExecutor(options?: {
         });
       }
     : undefined;
+  const clearSandboxEgressSessionForCommand = credentialEgress
+    ? async (sandboxId: string): Promise<void> => {
+        await clearSandboxEgressSession(sandboxId);
+      }
+    : undefined;
   const sessionManager = createSandboxSessionManager({
     sandboxId: options?.sandboxId,
     sandboxDependencyProfileHash: options?.sandboxDependencyProfileHash,
@@ -145,8 +139,8 @@ export function createSandboxExecutor(options?: {
       ? buildSandboxEgressNetworkPolicy
       : undefined,
     beforeCommand: syncSandboxEgressSession,
+    afterCommand: clearSandboxEgressSessionForCommand,
     onSandboxAcquired: async (sandbox) => {
-      await syncSandboxEgressSession?.(sandbox.sandboxId);
       await options?.onSandboxAcquired?.(sandbox);
     },
   });
@@ -557,7 +551,7 @@ export function createSandboxExecutor(options?: {
       return SANDBOX_TOOL_NAMES.has(toolName);
     },
     async createSandbox() {
-      return createSandboxWorkspace(await sessionManager.createSandbox());
+      return await sessionManager.createSandbox();
     },
     execute,
     async dispose() {
