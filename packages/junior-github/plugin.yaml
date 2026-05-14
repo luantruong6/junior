@@ -15,15 +15,26 @@ config-keys:
   - org
   - repo
 
+env-vars:
+  GITHUB_APP_BOT_NAME:
+  GITHUB_APP_BOT_EMAIL:
+
 credentials:
   type: github-app
-  api-domains:
+  domains:
     - api.github.com
+    - github.com
   auth-token-env: GITHUB_TOKEN
   auth-token-placeholder: ghp_host_managed_credential
   app-id-env: GITHUB_APP_ID
   private-key-env: GITHUB_APP_PRIVATE_KEY
   installation-id-env: GITHUB_INSTALLATION_ID
+
+command-env:
+  GIT_AUTHOR_NAME: ${GITHUB_APP_BOT_NAME}
+  GIT_AUTHOR_EMAIL: ${GITHUB_APP_BOT_EMAIL}
+  GIT_COMMITTER_NAME: ${GITHUB_APP_BOT_NAME}
+  GIT_COMMITTER_EMAIL: ${GITHUB_APP_BOT_EMAIL}
 
 target:
   type: repo

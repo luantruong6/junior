@@ -38,14 +38,21 @@ Set these values in the host environment:
 | `GITHUB_APP_ID`          | Yes      | GitHub App identity.                            |
 | `GITHUB_APP_PRIVATE_KEY` | Yes      | GitHub App signing key.                         |
 | `GITHUB_INSTALLATION_ID` | Yes      | Repository or organization installation target. |
+| `GITHUB_APP_BOT_NAME`    | Yes      | Git author name, for example `<app-slug>[bot]`. |
+| `GITHUB_APP_BOT_EMAIL`   | Yes      | Git author noreply email for the App bot user.  |
 
 `GITHUB_INSTALLATION_ID` selects the GitHub App installation for the deployment.
+`GITHUB_APP_BOT_EMAIL` uses the GitHub noreply format
+`<bot-user-id>+<app-slug>[bot]@users.noreply.github.com`. Get the bot user id
+from `https://api.github.com/users/<app-slug>%5Bbot%5D`.
 
 Vercel example:
 
 ```bash
 vercel env add GITHUB_APP_ID production
 vercel env add GITHUB_INSTALLATION_ID production
+vercel env add GITHUB_APP_BOT_NAME production
+vercel env add GITHUB_APP_BOT_EMAIL production
 vercel env add GITHUB_APP_PRIVATE_KEY production --sensitive < ./github-app-private-key.pem
 ```
 
@@ -62,7 +69,7 @@ Create and install a GitHub App before you verify GitHub workflows:
    - Pull requests: Read and write
    - Metadata: Read
 4. Install the app on the repository or organization Junior should access.
-5. Copy the App ID and installation ID into your deployment environment.
+5. Copy the App ID, installation ID, bot name, and bot noreply email into your deployment environment.
 
 If your team works across multiple repositories, have users include `owner/repo` in their GitHub request whenever the target is not obvious from the conversation.
 That only helps when those repositories are covered by the same GitHub App installation ID.
@@ -85,9 +92,9 @@ Then confirm:
 ## Security model
 
 - Junior mints GitHub App installation tokens on the host, not in the sandbox.
-- When the GitHub skill runs authenticated `gh` or `git` commands, the runtime automatically injects the narrowest repo-scoped credential it can infer for that command.
-- Repo-aware credential requests narrow tokens to the target repository when `owner/repo` is known.
-- The injected lease is turn-scoped; it is not exposed as reusable long-lived auth inside the sandbox.
+- When the GitHub skill runs authenticated `gh` or `git` commands, sandbox traffic to `api.github.com` and `github.com` is forwarded through Junior for host-side auth.
+- The GitHub App installation determines which repositories are reachable. Repo context guides command flags; it does not narrow the installation token.
+- The host-side lease is bounded by the sandbox session and token expiry. It is not exposed as reusable long-lived auth inside the sandbox.
 - Capability scoping is mainly an accident-prevention layer: it keeps routine issue, contents, and pull-request workflows from minting broader write access than they need.
 - It is not a full containment boundary. The agent can still request broader GitHub capabilities when a task genuinely needs them, so operators should treat GitHub App installation scope as the real trust boundary.
 

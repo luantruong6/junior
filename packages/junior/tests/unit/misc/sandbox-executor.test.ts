@@ -53,29 +53,29 @@ vi.mock("@/chat/sandbox/runtime-dependency-snapshots", () => ({
 }));
 
 import { createSandboxExecutor } from "@/chat/sandbox/sandbox";
+import { createSandboxSessionManager } from "@/chat/sandbox/session";
 import { createBashTool } from "bash-tool";
 
 interface MockSandbox {
-  sandboxId: string;
+  name: string;
   mkDir: ReturnType<typeof vi.fn>;
   writeFiles: ReturnType<typeof vi.fn>;
   readFileToBuffer: ReturnType<typeof vi.fn>;
   runCommand: ReturnType<typeof vi.fn>;
-  updateNetworkPolicy: ReturnType<typeof vi.fn>;
   stop: ReturnType<typeof vi.fn>;
   extendTimeout: ReturnType<typeof vi.fn>;
-  networkPolicy?: unknown;
+  update: ReturnType<typeof vi.fn>;
 }
 
 function makeSandbox(
-  sandboxId: string,
+  name: string,
   options: {
     mkDirError?: unknown;
     writeFilesError?: unknown;
   } = {},
 ): MockSandbox {
   return {
-    sandboxId,
+    name,
     mkDir: vi.fn(async () => {
       if (options.mkDirError) {
         throw options.mkDirError;
@@ -92,10 +92,9 @@ function makeSandbox(
       stdout: async () => "",
       stderr: async () => "",
     })),
-    updateNetworkPolicy: vi.fn(async () => {}),
     stop: vi.fn(async () => {}),
     extendTimeout: vi.fn(async () => {}),
-    networkPolicy: "allow-all",
+    update: vi.fn(async () => {}),
   };
 }
 
@@ -128,7 +127,7 @@ async function expectWorkspaceToDelegate(
   workspace: SandboxWorkspace,
   sandbox: MockSandbox,
 ): Promise<void> {
-  expect(workspace.sandboxId).toBe(sandbox.sandboxId);
+  expect(workspace.sandboxId).toBe(sandbox.name);
   const fileBuffer = Buffer.from("workspace file");
   const commandResult = {
     exitCode: 0,
@@ -198,7 +197,10 @@ describe("createSandboxExecutor", () => {
     const sandbox = await executor.createSandbox();
 
     await expectWorkspaceToDelegate(sandbox, freshSandbox);
-    expect(sandboxGetMock).toHaveBeenCalledWith({ sandboxId: "sbx_stopped" });
+    expect(sandboxGetMock).toHaveBeenCalledWith({
+      name: "sbx_stopped",
+      resume: true,
+    });
     expect(sandboxCreateMock).toHaveBeenCalledTimes(1);
     expect(stoppedSandbox.mkDir).toHaveBeenCalled();
     expect(freshSandbox.mkDir).toHaveBeenCalled();
@@ -243,6 +245,118 @@ describe("createSandboxExecutor", () => {
     });
   });
 
+  it("refreshes network policy when restoring from a sandbox id hint", async () => {
+    const restoredSandbox = makeSandbox("sbx_restored");
+    const networkPolicy = {
+      allow: {
+        "*": [],
+        "api.example.com": [
+          {
+            forwardURL: "https://junior.example.com/api/internal/proxy",
+          },
+        ],
+      },
+    };
+    sandboxGetMock.mockResolvedValue(restoredSandbox);
+
+    const manager = createSandboxSessionManager({
+      sandboxId: "sbx_restored",
+      createNetworkPolicy: vi.fn(() => networkPolicy),
+    });
+    manager.configureSkills([]);
+
+    await manager.createSandbox();
+
+    expect(restoredSandbox.update).toHaveBeenCalledWith({ networkPolicy });
+  });
+
+  it("keeps restored sandbox policy tracking tied to the applied policy", async () => {
+    const restoredSandbox = makeSandbox("sbx_restored_policy");
+    const firstPolicy = {
+      allow: {
+        "*": [],
+        "api.first.example": [
+          {
+            forwardURL: "https://junior.example.com/api/internal/proxy",
+          },
+        ],
+      },
+    };
+    const secondPolicy = {
+      allow: {
+        "*": [],
+        "api.second.example": [
+          {
+            forwardURL: "https://junior.example.com/api/internal/proxy",
+          },
+        ],
+      },
+    };
+    const createNetworkPolicy = vi
+      .fn()
+      .mockReturnValueOnce(firstPolicy)
+      .mockReturnValueOnce(secondPolicy);
+    sandboxGetMock.mockResolvedValue(restoredSandbox);
+
+    const manager = createSandboxSessionManager({
+      sandboxId: "sbx_restored_policy",
+      createNetworkPolicy,
+    });
+    manager.configureSkills([]);
+
+    await manager.createSandbox();
+    await manager.createSandbox();
+
+    expect(restoredSandbox.update).toHaveBeenNthCalledWith(1, {
+      networkPolicy: firstPolicy,
+    });
+    expect(restoredSandbox.update).toHaveBeenNthCalledWith(2, {
+      networkPolicy: secondPolicy,
+    });
+    expect(createNetworkPolicy).toHaveBeenCalledTimes(2);
+  });
+
+  it("refreshes changed network policy when reusing a cached sandbox", async () => {
+    const sandbox = makeSandbox("sbx_cached_policy");
+    sandboxCreateMock.mockResolvedValue(sandbox);
+    let providerDomain = "api.first.example";
+    const createNetworkPolicy = vi.fn((sandboxId: string) => ({
+      allow: {
+        "*": [],
+        [providerDomain]: [
+          {
+            forwardURL: `https://junior.example.com/api/internal/sandbox-egress/${sandboxId}`,
+          },
+        ],
+      },
+    }));
+
+    const manager = createSandboxSessionManager({ createNetworkPolicy });
+    manager.configureSkills([]);
+
+    await manager.createSandbox();
+    await manager.createSandbox();
+    expect(sandbox.update).not.toHaveBeenCalled();
+
+    providerDomain = "api.second.example";
+    await manager.createSandbox();
+
+    expect(sandbox.update).toHaveBeenCalledTimes(1);
+    expect(sandbox.update).toHaveBeenCalledWith({
+      networkPolicy: {
+        allow: {
+          "*": [],
+          "api.second.example": [
+            {
+              forwardURL:
+                "https://junior.example.com/api/internal/sandbox-egress/sbx_cached_policy",
+            },
+          ],
+        },
+      },
+    });
+  });
+
   it("passes token-based Vercel Sandbox credentials to the sandbox SDK", async () => {
     process.env.VERCEL_TOKEN = "sandbox-token";
     process.env.VERCEL_TEAM_ID = "team_123";
@@ -267,7 +381,8 @@ describe("createSandboxExecutor", () => {
     await executor.createSandbox();
 
     expect(sandboxGetMock).toHaveBeenCalledWith({
-      sandboxId: "sbx_stopped",
+      name: "sbx_stopped",
+      resume: true,
       token: "sandbox-token",
       teamId: "team_123",
       projectId: "prj_123",
@@ -339,8 +454,8 @@ describe("createSandboxExecutor", () => {
     });
   });
 
-  it("applies and restores header transforms for bash commands", async () => {
-    const sandbox = makeSandbox("sbx_headers");
+  it("runs bash commands through a noninteractive shell", async () => {
+    const sandbox = makeSandbox("sbx_bash");
     sandboxGetMock.mockResolvedValue(sandbox);
     vi.mocked(createBashTool).mockResolvedValue({
       tools: {
@@ -349,40 +464,16 @@ describe("createSandboxExecutor", () => {
       },
     } as never);
 
-    const executor = createSandboxExecutor({ sandboxId: "sbx_headers" });
+    const executor = createSandboxExecutor({ sandboxId: "sbx_bash" });
     executor.configureSkills([]);
 
     await executor.execute({
       toolName: "bash",
       input: {
         command: "echo ok",
-        headerTransforms: [
-          {
-            domain: "api.github.com",
-            headers: {
-              Authorization: "Bearer token-1",
-            },
-          },
-        ],
       },
     });
 
-    expect(sandbox.updateNetworkPolicy).toHaveBeenNthCalledWith(1, {
-      allow: {
-        "*": [],
-        "api.github.com": [
-          {
-            transform: [
-              {
-                headers: {
-                  Authorization: "Bearer token-1",
-                },
-              },
-            ],
-          },
-        ],
-      },
-    });
     const invocation = sandbox.runCommand.mock.calls[0]?.[0];
     expect(invocation).toMatchObject({
       cmd: "bash",
@@ -398,16 +489,10 @@ describe("createSandboxExecutor", () => {
     expect(invocation.args?.[1]).toContain("export GIT_TERMINAL_PROMPT='0'");
     expect(invocation.args?.[1]).toContain("exec </dev/null");
     expect(invocation.args?.[1]).toContain("echo ok");
-    expect(sandbox.updateNetworkPolicy).toHaveBeenNthCalledWith(2, "allow-all");
   });
 
-  it("merges header transforms into existing network policy allow rules", async () => {
-    const sandbox = makeSandbox("sbx_policy_merge");
-    sandbox.networkPolicy = {
-      allow: {
-        "example.com": [{ transform: [{ headers: { "X-Existing": "1" } }] }],
-      },
-    };
+  it("resolves sandbox command environment for each bash command", async () => {
+    const sandbox = makeSandbox("sbx_dynamic_env");
     sandboxGetMock.mockResolvedValue(sandbox);
     vi.mocked(createBashTool).mockResolvedValue({
       tools: {
@@ -415,141 +500,31 @@ describe("createSandboxExecutor", () => {
         writeFile: { execute: vi.fn(async () => ({ success: true })) },
       },
     } as never);
+    const commandEnv = vi
+      .fn<() => Promise<Record<string, string>>>()
+      .mockResolvedValueOnce({
+        GIT_AUTHOR_NAME: "first-bot",
+      })
+      .mockResolvedValueOnce({
+        GIT_AUTHOR_NAME: "second-bot",
+      });
 
-    const executor = createSandboxExecutor({ sandboxId: "sbx_policy_merge" });
-    executor.configureSkills([]);
-
-    await executor.execute({
-      toolName: "bash",
-      input: {
-        command: "echo ok",
-        headerTransforms: [
-          {
-            domain: "api.github.com",
-            headers: {
-              Authorization: "Bearer token-1",
-            },
-          },
-        ],
-      },
+    const manager = createSandboxSessionManager({
+      sandboxId: "sbx_dynamic_env",
+      commandEnv,
     });
+    const bash = (await manager.ensureToolExecutors()).bash;
 
-    expect(sandbox.updateNetworkPolicy).toHaveBeenNthCalledWith(1, {
-      allow: {
-        "example.com": [{ transform: [{ headers: { "X-Existing": "1" } }] }],
-        "api.github.com": [
-          {
-            transform: [
-              {
-                headers: {
-                  Authorization: "Bearer token-1",
-                },
-              },
-            ],
-          },
-        ],
-      },
-    });
-    expect(sandbox.updateNetworkPolicy).toHaveBeenNthCalledWith(
-      2,
-      sandbox.networkPolicy,
+    await bash({ command: "git commit --allow-empty -m first" });
+    await bash({ command: "git commit --allow-empty -m second" });
+
+    expect(commandEnv).toHaveBeenCalledTimes(2);
+    expect(sandbox.runCommand.mock.calls[0]?.[0].args?.[1]).toContain(
+      "export GIT_AUTHOR_NAME='first-bot'",
     );
-  });
-
-  it("preserves command errors when network policy restore fails", async () => {
-    const sandbox = makeSandbox("sbx_restore_failure");
-    sandbox.runCommand.mockRejectedValueOnce(new Error("command failed"));
-    sandbox.updateNetworkPolicy
-      .mockImplementationOnce(async () => {})
-      .mockImplementationOnce(async () => {
-        throw new Error("restore failed");
-      });
-    sandboxGetMock.mockResolvedValue(sandbox);
-    vi.mocked(createBashTool).mockResolvedValue({
-      tools: {
-        readFile: { execute: vi.fn(async () => ({ content: "" })) },
-        writeFile: { execute: vi.fn(async () => ({ success: true })) },
-      },
-    } as never);
-
-    const executor = createSandboxExecutor({
-      sandboxId: "sbx_restore_failure",
-    });
-    executor.configureSkills([]);
-
-    await expect(
-      executor.execute({
-        toolName: "bash",
-        input: {
-          command: "echo ok",
-          headerTransforms: [
-            {
-              domain: "api.github.com",
-              headers: {
-                Authorization: "Bearer token-1",
-              },
-            },
-          ],
-        },
-      }),
-    ).rejects.toThrow("command failed");
-    expect(sandbox.updateNetworkPolicy).toHaveBeenCalledTimes(2);
-  });
-
-  it("discards the sandbox when network policy restore fails after a successful command", async () => {
-    const firstSandbox = makeSandbox("sbx_restore_failure_first");
-    firstSandbox.updateNetworkPolicy
-      .mockImplementationOnce(async () => {})
-      .mockImplementationOnce(async () => {
-        throw new Error("restore failed");
-      });
-    const secondSandbox = makeSandbox("sbx_restore_failure_second");
-    sandboxCreateMock
-      .mockResolvedValueOnce(firstSandbox)
-      .mockResolvedValueOnce(secondSandbox);
-    vi.mocked(createBashTool).mockResolvedValue({
-      tools: {
-        readFile: { execute: vi.fn(async () => ({ content: "" })) },
-        writeFile: { execute: vi.fn(async () => ({ success: true })) },
-      },
-    } as never);
-
-    const executor = createSandboxExecutor();
-    executor.configureSkills([]);
-
-    await expect(
-      executor.execute({
-        toolName: "bash",
-        input: {
-          command: "echo ok",
-          headerTransforms: [
-            {
-              domain: "api.github.com",
-              headers: {
-                Authorization: "Bearer token-1",
-              },
-            },
-          ],
-        },
-      }),
-    ).rejects.toThrow("restore failed");
-
-    await executor.execute({
-      toolName: "bash",
-      input: {
-        command: "echo second",
-      },
-    });
-
-    expect(firstSandbox.stop).toHaveBeenCalledTimes(1);
-    expect(sandboxCreateMock).toHaveBeenCalledTimes(2);
-    const invocation = secondSandbox.runCommand.mock.calls[0]?.[0];
-    expect(invocation).toMatchObject({
-      cmd: "bash",
-      cwd: "/vercel/sandbox",
-    });
-    expect(invocation.args?.[1]).toContain("exec </dev/null");
-    expect(invocation.args?.[1]).toContain("echo second");
+    expect(sandbox.runCommand.mock.calls[1]?.[0].args?.[1]).toContain(
+      "export GIT_AUTHOR_NAME='second-bot'",
+    );
   });
 
   it("routes matching bash commands through custom command handler", async () => {
@@ -883,7 +858,10 @@ describe("createSandboxExecutor", () => {
       total_lines: 1,
       truncated: false,
     });
-    expect(sandboxGetMock).toHaveBeenCalledWith({ sandboxId: "sbx_existing" });
+    expect(sandboxGetMock).toHaveBeenCalledWith({
+      name: "sbx_existing",
+      resume: true,
+    });
   });
 
   it("installs the eval gh shim when test credentials are enabled", async () => {
@@ -1032,6 +1010,65 @@ describe("createSandboxExecutor", () => {
       source: {
         type: "snapshot",
         snapshotId: "snap_retry",
+      },
+    });
+  });
+
+  it("uses a fresh sandbox name when retrying snapshot boot with network policy", async () => {
+    const snapshotSandbox = makeSandbox("sbx_snapshot_policy_ready");
+    resolveRuntimeDependencySnapshotMock.mockResolvedValue({
+      snapshotId: "snap_policy_retry",
+      profileHash: "hash_policy_retry",
+      dependencyCount: 2,
+      cacheHit: true,
+      resolveOutcome: "cache_hit",
+    });
+    const snapshottingError = createApiError(
+      422,
+      "Unprocessable Entity",
+      "sandbox_snapshotting",
+      "Sandbox is creating a snapshot and will be stopped shortly.",
+    );
+    sandboxCreateMock
+      .mockRejectedValueOnce(snapshottingError)
+      .mockResolvedValueOnce(snapshotSandbox);
+    const createNetworkPolicy = vi.fn((sandboxId: string) => ({
+      allow: {
+        "*": [],
+        "api.example.com": [
+          {
+            forwardURL: `https://junior.example.com/api/internal/sandbox-egress/${sandboxId}`,
+          },
+        ],
+      },
+    }));
+
+    const manager = createSandboxSessionManager({ createNetworkPolicy });
+    manager.configureSkills([]);
+
+    await manager.createSandbox();
+
+    const firstCreate = sandboxCreateMock.mock.calls[0]?.[0] as {
+      name?: string;
+      networkPolicy?: unknown;
+    };
+    const secondCreate = sandboxCreateMock.mock.calls[1]?.[0] as {
+      name?: string;
+      networkPolicy?: unknown;
+    };
+    expect(firstCreate.name).toMatch(/^junior-/);
+    expect(secondCreate.name).toMatch(/^junior-/);
+    expect(secondCreate.name).not.toBe(firstCreate.name);
+    expect(createNetworkPolicy).toHaveBeenNthCalledWith(1, firstCreate.name);
+    expect(createNetworkPolicy).toHaveBeenNthCalledWith(2, secondCreate.name);
+    expect(secondCreate.networkPolicy).toEqual({
+      allow: {
+        "*": [],
+        "api.example.com": [
+          {
+            forwardURL: `https://junior.example.com/api/internal/sandbox-egress/${secondCreate.name}`,
+          },
+        ],
       },
     });
   });

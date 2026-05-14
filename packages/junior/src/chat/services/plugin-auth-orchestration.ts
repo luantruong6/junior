@@ -1,5 +1,4 @@
 import type { ChannelConfigurationService } from "@/chat/configuration/types";
-import { CredentialUnavailableError } from "@/chat/credentials/broker";
 import { unlinkProvider } from "@/chat/credentials/unlink-provider";
 import type { UserTokenStore } from "@/chat/credentials/user-token-store";
 import { formatProviderLabel, startOAuthFlow } from "@/chat/oauth-flow";
@@ -8,6 +7,7 @@ import { AuthorizationPauseError } from "@/chat/services/auth-pause";
 import type { ConversationPendingAuthState } from "@/chat/state/conversation";
 import {
   getPluginDefinition,
+  getPluginProviders,
   getPluginOAuthConfig,
 } from "@/chat/plugins/registry";
 import type { Skill } from "@/chat/skills";
@@ -37,10 +37,6 @@ export interface PluginAuthOrchestrationDeps {
 }
 
 export interface PluginAuthOrchestration {
-  handleCredentialUnavailable: (input: {
-    activeSkill: Skill | null;
-    error: CredentialUnavailableError;
-  }) => Promise<never>;
   handleCommandFailure: (input: {
     activeSkill: Skill | null;
     command: string;
@@ -74,6 +70,7 @@ function isCommandAuthFailure(details: unknown): details is {
   }
 
   return [
+    /\bjunior-auth-required\b/,
     /\b401\b/,
     /\bunauthorized\b/,
     /\bbad credentials\b/,
@@ -87,13 +84,42 @@ function isCommandAuthFailure(details: unknown): details is {
   ].some((pattern) => pattern.test(text));
 }
 
+function commandText(details: unknown): string {
+  if (!details || typeof details !== "object") {
+    return "";
+  }
+  const result = details as {
+    stdout?: unknown;
+    stderr?: unknown;
+  };
+  return `${typeof result.stdout === "string" ? result.stdout : ""}\n${typeof result.stderr === "string" ? result.stderr : ""}`;
+}
+
+function explicitAuthRequiredProvider(details: unknown): string | undefined {
+  const match = /\bjunior-auth-required\s+provider=([a-z0-9-]+)\b/.exec(
+    commandText(details).toLowerCase(),
+  );
+  return match?.[1];
+}
+
+function registeredProviderNames(): string[] {
+  const providers = new Set<string>();
+  for (const plugin of getPluginProviders()) {
+    const domains = [
+      ...(plugin.manifest.credentials?.domains ?? []),
+      ...(plugin.manifest.domains ?? []),
+    ];
+    if (domains.length > 0) {
+      providers.add(plugin.manifest.name);
+    }
+  }
+  return [...providers].sort((left, right) => left.localeCompare(right));
+}
+
 function commandTargetsProvider(
   provider: string,
   command: string,
-  details: {
-    stdout?: string;
-    stderr?: string;
-  },
+  details: unknown,
 ): boolean {
   const normalizedCommand = command.trim().toLowerCase();
   if (!normalizedCommand) {
@@ -110,15 +136,15 @@ function commandTargetsProvider(
   const credentials = manifest?.credentials;
   if (credentials) {
     candidates.add(credentials.authTokenEnv.toLowerCase());
-    for (const domain of credentials.apiDomains) {
+    for (const domain of credentials.domains) {
       candidates.add(domain.toLowerCase());
     }
   }
-  for (const domain of manifest?.apiDomains ?? []) {
+  for (const domain of manifest?.domains ?? []) {
     candidates.add(domain.toLowerCase());
   }
 
-  const combinedText = `${normalizedCommand}\n${details.stdout?.toLowerCase() ?? ""}\n${details.stderr?.toLowerCase() ?? ""}`;
+  const combinedText = `${normalizedCommand}\n${commandText(details).toLowerCase()}`;
   return [...candidates].some((candidate) => combinedText.includes(candidate));
 }
 
@@ -202,35 +228,29 @@ export function createPluginAuthOrchestration(
     throw pendingPause;
   };
 
-  const handleCredentialUnavailable = async (input: {
-    activeSkill: Skill | null;
-    error: CredentialUnavailableError;
-  }): Promise<never> => {
-    if (pendingPause) {
-      throw pendingPause;
-    }
-
-    if (!deps.requesterId || !getPluginOAuthConfig(input.error.provider)) {
-      throw input.error;
-    }
-
-    return await startAuthorizationPause(
-      input.error.provider,
-      input.activeSkill,
-    );
-  };
-
   return {
-    handleCredentialUnavailable,
     handleCommandFailure: async (input) => {
-      const provider = input.activeSkill?.pluginProvider;
+      const providers = registeredProviderNames();
+      const authFailure = isCommandAuthFailure(input.details);
+      if (!authFailure) {
+        return;
+      }
+      const explicitProvider = explicitAuthRequiredProvider(input.details);
+      const provider =
+        explicitProvider && providers.includes(explicitProvider)
+          ? explicitProvider
+          : providers.find((availableProvider) =>
+              commandTargetsProvider(
+                availableProvider,
+                input.command,
+                input.details,
+              ),
+            );
       if (
         !provider ||
         !deps.requesterId ||
         !deps.userTokenStore ||
-        !getPluginOAuthConfig(provider) ||
-        !isCommandAuthFailure(input.details) ||
-        !commandTargetsProvider(provider, input.command, input.details)
+        !getPluginOAuthConfig(provider)
       ) {
         return;
       }

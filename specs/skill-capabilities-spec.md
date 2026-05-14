@@ -3,7 +3,7 @@
 ## Metadata
 
 - Created: 2026-02-26
-- Last Edited: 2026-05-08
+- Last Edited: 2026-05-13
 
 ## Changelog
 
@@ -13,6 +13,8 @@
 - 2026-04-17: Removed skill-level capability declarations and explicit model-facing auth commands in favor of plugin-owned permission manifests plus runtime-owned implicit auth.
 - 2026-04-26: Added the plugin-owned runtime setup boundary for packages, MCP endpoints, OAuth, and credentials.
 - 2026-05-08: Added plugin-owned `command-env` as a non-secret CLI compatibility surface.
+- 2026-05-12: Added Vercel Sandbox egress proxy activation for request-time credential issuance.
+- 2026-05-13: Removed the old per-turn credential runtime in favor of egress proxy-only credential activation.
 
 ## Status
 
@@ -26,16 +28,17 @@ Draft
 
 ## Purpose
 
-Define how Junior maps a loaded plugin-backed skill to host-managed credentials without exposing secrets or manual auth commands to the model.
+Define how Junior maps registered plugin provider domains to host-managed credentials without exposing secrets or manual auth commands to the model.
 
 ## Core model
 
 1. Plugins own provider permissions in `plugin.yaml`.
 2. Skills do not declare capabilities or config keys.
-3. After a plugin-backed skill is loaded, the agent runs the real provider command.
-4. The runtime resolves the provider from the active skill, issues a provider lease, and injects credentials for the current turn only.
-5. If auth is missing or stale, the runtime starts a private OAuth flow and resumes the paused turn after authorization.
-6. Plugin manifests own runtime setup. Skills do not instruct the agent to install packages, bootstrap CLIs, configure provider credentials, command env, or MCP servers.
+3. Registered providers are always available to sandbox commands.
+4. The agent runs the real provider command.
+5. The runtime resolves the provider from the outgoing request host, issues a provider lease, and injects credentials for that request only.
+6. If auth is missing or stale, the proxy returns a command-readable auth-required response and the command failure path starts a private OAuth flow, then resumes the paused turn after authorization.
+7. Plugin manifests own runtime setup. Skills do not instruct the agent to install packages, bootstrap CLIs, configure provider credentials, command env, or MCP servers.
 
 ## Plugin contract
 
@@ -72,27 +75,38 @@ Rules:
 
 ### Lease issuance
 
-- Resolve provider from `activeSkill.pluginProvider`.
+- Resolve provider from the Vercel Sandbox forwarded host for proxied sandbox egress.
 - Require requester context before issuing provider credentials.
 - Return short-lived leases only.
-- Keep lease reuse in memory only, keyed by provider for the active turn.
+- Keep any host-side egress lease cache bounded by the sandbox egress session expiry and lease expiry.
 
 ### Injection behavior
 
-- Enablement happens when the authenticated provider command runs, not at skill-load time.
-- Delivery uses sandbox header transforms for matching domains.
+- Enablement happens when sandbox traffic reaches a registered provider domain, not at skill-load time.
+- Delivery uses the Vercel Sandbox firewall request proxy for provider domains when available, with host-side header injection on the forwarded request.
 - Plugin credentials may define a provider-specific `auth-token-placeholder` for CLI compatibility.
-- Plugin manifests may define non-secret `command-env` values for CLI compatibility. These may include placeholder API keys or deployment defaults, but never real secrets.
+- Plugin manifests may define non-secret `command-env` values for CLI compatibility. These may include placeholder API keys, deployment defaults, or explicit public host env bindings, but never real secrets.
 - Do not inject long-lived secrets into sandbox files.
+
+### Sandbox egress proxy
+
+- New sandbox sessions use a Vercel Sandbox network policy that forwards declared credential provider domains to Junior's internal egress route.
+- The internal egress route must verify the Vercel Sandbox OIDC token before proxying.
+- The egress route must reconstruct the upstream URL only from Vercel forwarded host/scheme/port headers and the request path.
+- The egress route must reject forwarded hosts that do not match a registered provider domain.
+- The proxy must not use method/URL/body-only replay fingerprints as an authorization boundary because duplicate request shapes can be legitimate client retries.
+- The proxy must strip hop-by-hop and proxy-control headers before sending the upstream request.
+- Sandbox-supplied request headers and upstream response state may pass through once Vercel OIDC, requester-bound session state, and provider-domain ownership have been verified.
 
 ### Runtime setup boundary
 
 - Loaded plugin-backed skills include a host-owned boundary derived from the plugin manifest before the skill body.
 - `loadSkill` re-resolves plugin ownership from the skill path, rejects mismatched plugin metadata, and builds loaded metadata from the current `SKILL.md` frontmatter.
+- Turn checkpoints persist loaded skill names for MCP resume; sandbox credential availability comes from registered providers, not checkpointed active-provider state.
 - CLI and system packages belong in `plugin.yaml` `runtime-dependencies`.
 - Postinstall/bootstrap commands belong in `plugin.yaml` `runtime-postinstall`.
 - MCP endpoints and allowed tool surfaces belong in `plugin.yaml` `mcp`.
-- CLI env placeholders and deployment defaults belong in `plugin.yaml` `command-env`.
+- CLI env placeholders, deployment defaults, and public host-env bindings belong in `plugin.yaml` `command-env`.
 - OAuth and static credential env names belong in `plugin.yaml` `oauth` and `credentials`.
 - Skill text may diagnose missing runtime surfaces, but must not tell the agent to install packages, run installer scripts, configure API keys, or repair sandbox package installation from inside a user workflow.
 
@@ -113,9 +127,12 @@ Rules:
 
 ### Lease behavior
 
-- Header transforms target `api.github.com`.
-- If repo contents access is declared, runtime also injects auth for `github.com` git smart-HTTP.
-- Runtime cache may reuse a lease in memory for repeated GitHub commands in the same turn.
+- Header transforms target the domains declared by the GitHub plugin manifest.
+- The GitHub API host is the declared `api.github.com` or `api.*` domain, independent of manifest order.
+- The built-in GitHub plugin declares `api.github.com` for REST API calls and
+  `github.com` for git smart-HTTP.
+- Runtime may reuse a short-lived sandbox egress lease for repeated GitHub commands in the same turn.
+- Provider `401`/`403` responses discard the cached sandbox egress lease so resumed auth can mint from current provider state.
 
 ## Sentry profile
 
@@ -137,7 +154,6 @@ Emit events without secret material:
 - `credential_issue_request`
 - `credential_issue_success`
 - `credential_issue_failed`
-- `credential_inject_start`
 
 ## Non-goals
 

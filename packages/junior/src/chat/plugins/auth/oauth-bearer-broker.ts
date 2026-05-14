@@ -7,6 +7,7 @@ import { CredentialUnavailableError } from "@/chat/credentials/broker";
 import { mergeHeaderTransforms } from "@/chat/credentials/header-transforms";
 import { hasRequiredOAuthScope } from "@/chat/credentials/oauth-scope";
 import type { UserTokenStore } from "@/chat/credentials/user-token-store";
+import { resolvePluginCommandEnv } from "@/chat/plugins/command-env";
 import { resolveAuthTokenPlaceholder } from "./auth-token-placeholder";
 import { resolveApiHeaderTransforms } from "./api-headers-broker";
 import {
@@ -72,7 +73,7 @@ export function createOAuthBearerBroker(
   deps: { userTokenStore: UserTokenStore },
 ): CredentialBroker {
   const provider = manifest.name;
-  const { apiDomains, apiHeaders, authTokenEnv } = credentials;
+  const { domains, apiHeaders, authTokenEnv } = credentials;
   const authTokenPlaceholder = resolveAuthTokenPlaceholder(credentials);
   const pluginHeaderTransforms = () => resolveApiHeaderTransforms(manifest);
 
@@ -85,12 +86,12 @@ export function createOAuthBearerBroker(
       id: randomUUID(),
       provider,
       env: {
-        ...(manifest.commandEnv ?? {}),
+        ...resolvePluginCommandEnv(manifest),
         [authTokenEnv]: authTokenPlaceholder,
       },
       headerTransforms: mergeHeaderTransforms([
         ...pluginHeaderTransforms(),
-        ...apiDomains.map((domain) => ({
+        ...domains.map((domain) => ({
           domain,
           headers: { ...(apiHeaders ?? {}), Authorization: `Bearer ${token}` },
         })),

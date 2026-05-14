@@ -40,7 +40,7 @@ async function writePackagedPlugin(tempRoot: string): Promise<void> {
       "  - org",
       "credentials:",
       "  type: oauth-bearer",
-      "  api-domains:",
+      "  domains:",
       "    - api.example.com",
       "  auth-token-env: DEMO_AUTH_TOKEN",
     ].join("\n"),
@@ -70,7 +70,7 @@ async function writePackagedPluginWithImplicitLatest(
       "  - org",
       "credentials:",
       "  type: oauth-bearer",
-      "  api-domains:",
+      "  domains:",
       "    - api.example.com",
       "  auth-token-env: DEMO_AUTH_TOKEN",
       "runtime-dependencies:",
@@ -133,7 +133,7 @@ async function writePackagedPluginWithRuntimePostinstall(
   );
 }
 
-async function writePackagedPluginWithInvalidApiDomain(
+async function writePackagedPluginWithInvalidDomain(
   tempRoot: string,
 ): Promise<void> {
   const packageRoot = path.join(
@@ -155,12 +155,68 @@ async function writePackagedPluginWithInvalidApiDomain(
       "  - org",
       "credentials:",
       "  type: oauth-bearer",
-      "  api-domains:",
+      "  domains:",
       "    - '*'",
       "  auth-token-env: DEMO_AUTH_TOKEN",
     ].join("\n"),
     "utf8",
   );
+}
+
+async function writePackagedPluginsWithDuplicateDomain(
+  tempRoot: string,
+): Promise<void> {
+  for (const name of ["alpha", "beta"]) {
+    const packageRoot = path.join(
+      tempRoot,
+      "node_modules",
+      "@acme",
+      `junior-plugin-${name}`,
+    );
+    const skillsDir = path.join(packageRoot, "skills", name);
+    await fs.mkdir(skillsDir, { recursive: true });
+    await fs.writeFile(
+      path.join(packageRoot, "plugin.yaml"),
+      [
+        `name: ${name}`,
+        `description: ${name} plugin`,
+        "credentials:",
+        "  type: oauth-bearer",
+        "  domains:",
+        "    - api.example.com",
+        `  auth-token-env: ${name.toUpperCase()}_AUTH_TOKEN`,
+      ].join("\n"),
+      "utf8",
+    );
+  }
+}
+
+async function writePackagedPluginsWithDuplicateName(
+  tempRoot: string,
+): Promise<void> {
+  for (const packageName of ["junior-plugin-first", "junior-plugin-second"]) {
+    const packageRoot = path.join(
+      tempRoot,
+      "node_modules",
+      "@acme",
+      packageName,
+    );
+    const skillsDir = path.join(packageRoot, "skills", "demo");
+    await fs.mkdir(skillsDir, { recursive: true });
+    await fs.writeFile(
+      path.join(packageRoot, "plugin.yaml"),
+      [
+        "name: demo",
+        "description: Demo plugin",
+        "credentials:",
+        "  type: oauth-bearer",
+        "  domains:",
+        `    - ${packageName}.example.com`,
+        "  auth-token-env: DEMO_AUTH_TOKEN",
+      ].join("\n"),
+      "utf8",
+    );
+  }
 }
 
 async function writePackagedPluginWithInvalidAuthTokenEnv(
@@ -185,7 +241,7 @@ async function writePackagedPluginWithInvalidAuthTokenEnv(
       "  - org",
       "credentials:",
       "  type: oauth-bearer",
-      "  api-domains:",
+      "  domains:",
       "    - api.example.com",
       "  auth-token-env: demo_token",
     ].join("\n"),
@@ -236,7 +292,7 @@ async function writePackagedPluginWithInvalidOauthEndpoint(
       "  - api",
       "credentials:",
       "  type: oauth-bearer",
-      "  api-domains:",
+      "  domains:",
       "    - api.example.com",
       "  auth-token-env: DEMO_AUTH_TOKEN",
       "oauth:",
@@ -270,7 +326,7 @@ async function writePackagedPluginWithOauthOverrides(
       "  - api.read",
       "credentials:",
       "  type: oauth-bearer",
-      "  api-domains:",
+      "  domains:",
       "    - api.example.com",
       "  api-headers:",
       '    X-Api-Version: "2026-01-01"',
@@ -311,7 +367,7 @@ async function writePackagedPluginWithForbiddenApiHeader(
       "  - api",
       "credentials:",
       "  type: oauth-bearer",
-      "  api-domains:",
+      "  domains:",
       "    - api.example.com",
       "  api-headers:",
       "    Authorization: Bearer nope",
@@ -667,11 +723,11 @@ describe("plugin registry package discovery", () => {
     ]);
   });
 
-  it("rejects credentials with invalid api-domains values", async () => {
+  it("rejects credentials with invalid domains values", async () => {
     const tempRoot = await fs.mkdtemp(
       path.join(os.tmpdir(), "junior-plugin-package-"),
     );
-    await writePackagedPluginWithInvalidApiDomain(tempRoot);
+    await writePackagedPluginWithInvalidDomain(tempRoot);
     await fs.writeFile(
       path.join(tempRoot, "package.json"),
       JSON.stringify({
@@ -693,7 +749,69 @@ describe("plugin registry package discovery", () => {
 
     await expectRegistryLoadFailure(
       ["@acme/junior-plugin-invalid-domain"],
-      "credentials.api-domains entries must be valid domain names",
+      "credentials.domains entries must be valid domain names",
+    );
+  });
+
+  it("rejects provider domains claimed by multiple plugins", async () => {
+    const tempRoot = await fs.mkdtemp(
+      path.join(os.tmpdir(), "junior-plugin-package-"),
+    );
+    await writePackagedPluginsWithDuplicateDomain(tempRoot);
+    await fs.writeFile(
+      path.join(tempRoot, "package.json"),
+      JSON.stringify({
+        name: "temp-junior-app",
+        private: true,
+        dependencies: {
+          "@acme/junior-plugin-alpha": "1.0.0",
+          "@acme/junior-plugin-beta": "1.0.0",
+        },
+      }),
+      "utf8",
+    );
+    process.chdir(tempRoot);
+
+    vi.resetModules();
+    vi.doMock("@/chat/discovery", async (importOriginal) => ({
+      ...(await importOriginal<typeof import("@/chat/discovery")>()),
+      pluginRoots: () => [],
+    }));
+
+    await expectRegistryLoadFailure(
+      ["@acme/junior-plugin-alpha", "@acme/junior-plugin-beta"],
+      'Duplicate provider domain "api.example.com" in plugin "beta" already declared by plugin "alpha"',
+    );
+  });
+
+  it("rejects duplicate plugin names", async () => {
+    const tempRoot = await fs.mkdtemp(
+      path.join(os.tmpdir(), "junior-plugin-package-"),
+    );
+    await writePackagedPluginsWithDuplicateName(tempRoot);
+    await fs.writeFile(
+      path.join(tempRoot, "package.json"),
+      JSON.stringify({
+        name: "temp-junior-app",
+        private: true,
+        dependencies: {
+          "@acme/junior-plugin-first": "1.0.0",
+          "@acme/junior-plugin-second": "1.0.0",
+        },
+      }),
+      "utf8",
+    );
+    process.chdir(tempRoot);
+
+    vi.resetModules();
+    vi.doMock("@/chat/discovery", async (importOriginal) => ({
+      ...(await importOriginal<typeof import("@/chat/discovery")>()),
+      pluginRoots: () => [],
+    }));
+
+    await expectRegistryLoadFailure(
+      ["@acme/junior-plugin-first", "@acme/junior-plugin-second"],
+      'Duplicate plugin name "demo"',
     );
   });
 

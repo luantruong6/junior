@@ -11,7 +11,7 @@ const ORIGINAL_FETCH = globalThis.fetch;
 
 const TEST_CREDENTIALS: GitHubAppCredentials = {
   type: "github-app",
-  apiDomains: ["api.github.com"],
+  domains: ["api.github.com", "github.com"],
   authTokenEnv: "GITHUB_TOKEN",
   appIdEnv: "GITHUB_APP_ID",
   privateKeyEnv: "GITHUB_APP_PRIVATE_KEY",
@@ -77,7 +77,6 @@ function mockGitHubApi(options?: {
         expires_at: "2099-01-01T00:00:00Z",
       });
     }
-
     throw new Error(`Unexpected fetch request: ${url}`);
   }) as unknown as typeof fetch;
 }
@@ -107,7 +106,9 @@ describe("github app credential broker", () => {
     });
 
     expect(lease.provider).toBe("github");
-    expect(lease.env).toEqual({ GITHUB_TOKEN: "ghp_host_managed_credential" });
+    expect(lease.env).toEqual({
+      GITHUB_TOKEN: "ghp_host_managed_credential",
+    });
     expect(lease.headerTransforms).toEqual([
       {
         domain: "api.github.com",
@@ -124,6 +125,7 @@ describe("github app credential broker", () => {
       installationId: "42",
       reason: "test:lease-shape",
     });
+    expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledTimes(1);
   });
 
   it("uses the configured auth token placeholder when provided", async () => {
@@ -141,24 +143,154 @@ describe("github app credential broker", () => {
     expect(lease.env.GITHUB_TOKEN).toBe("github_host_managed_credential");
   });
 
-  it("reuses cached leases for the same installation", async () => {
+  it("derives REST and git auth modes from configured domains", async () => {
     setupValidEnv();
-    mockGitHubApi({ token: "cached-token" });
+    mockGitHubApi({ token: "enterprise-token" });
+    const credentials: GitHubAppCredentials = {
+      ...TEST_CREDENTIALS,
+      domains: ["api.github.example", "github.example"],
+    };
+
+    const broker = createGitHubAppBroker(
+      {
+        ...TEST_MANIFEST,
+        credentials,
+      },
+      credentials,
+    );
+    const lease = await broker.issue({
+      reason: "test:configured-domains",
+    });
+
+    expect(String(findAccessTokenCall()[0])).toBe(
+      "https://api.github.example/app/installations/42/access_tokens",
+    );
+    expect(lease.headerTransforms).toEqual([
+      {
+        domain: "api.github.example",
+        headers: { Authorization: "Bearer enterprise-token" },
+      },
+      {
+        domain: "github.example",
+        headers: {
+          Authorization: `Basic ${Buffer.from("x-access-token:enterprise-token").toString("base64")}`,
+        },
+      },
+    ]);
+  });
+
+  it("uses bearer auth for non-git GitHub service domains", async () => {
+    setupValidEnv();
+    mockGitHubApi({ token: "service-token" });
+    const credentials: GitHubAppCredentials = {
+      ...TEST_CREDENTIALS,
+      domains: ["api.github.com", "github.com", "uploads.github.com"],
+    };
+
+    const broker = createGitHubAppBroker(
+      {
+        ...TEST_MANIFEST,
+        credentials,
+      },
+      credentials,
+    );
+    const lease = await broker.issue({
+      reason: "test:service-domains",
+    });
+
+    expect(lease.headerTransforms).toEqual([
+      {
+        domain: "api.github.com",
+        headers: { Authorization: "Bearer service-token" },
+      },
+      {
+        domain: "github.com",
+        headers: {
+          Authorization: `Basic ${Buffer.from("x-access-token:service-token").toString("base64")}`,
+        },
+      },
+      {
+        domain: "uploads.github.com",
+        headers: { Authorization: "Bearer service-token" },
+      },
+    ]);
+  });
+
+  it("resolves the REST API domain independent of manifest ordering", async () => {
+    setupValidEnv();
+    mockGitHubApi({ token: "reordered-token" });
+    const credentials: GitHubAppCredentials = {
+      ...TEST_CREDENTIALS,
+      domains: ["github.com", "api.github.com"],
+    };
+
+    const broker = createGitHubAppBroker(
+      {
+        ...TEST_MANIFEST,
+        credentials,
+      },
+      credentials,
+    );
+    const lease = await broker.issue({
+      reason: "test:reordered-domains",
+    });
+
+    expect(String(findAccessTokenCall()[0])).toBe(
+      "https://api.github.com/app/installations/42/access_tokens",
+    );
+    expect(lease.headerTransforms).toEqual([
+      {
+        domain: "github.com",
+        headers: {
+          Authorization: `Basic ${Buffer.from("x-access-token:reordered-token").toString("base64")}`,
+        },
+      },
+      {
+        domain: "api.github.com",
+        headers: { Authorization: "Bearer reordered-token" },
+      },
+    ]);
+  });
+
+  it("mints fresh installation tokens on each broker issue", async () => {
+    setupValidEnv();
+    const issuedTokens = ["first-token", "second-token"];
+    globalThis.fetch = vi.fn(async (input) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : String(input);
+      if (url.includes("/access_tokens")) {
+        return mockJsonResponse({
+          token: issuedTokens.shift(),
+          expires_at: "2099-01-01T00:00:00Z",
+        });
+      }
+      throw new Error(`Unexpected fetch request: ${url}`);
+    }) as unknown as typeof fetch;
 
     const broker = createGitHubAppBroker(TEST_MANIFEST, TEST_CREDENTIALS);
     const firstLease = await broker.issue({
-      reason: "test:cache-prime",
+      reason: "test:first-token",
     });
-
-    delete process.env.GITHUB_APP_ID;
-    delete process.env.GITHUB_APP_PRIVATE_KEY;
-
     const secondLease = await broker.issue({
-      reason: "test:cache-hit",
+      reason: "test:second-token",
     });
 
-    expect(secondLease.headerTransforms).toEqual(firstLease.headerTransforms);
-    expect(vi.mocked(globalThis.fetch).mock.calls).toHaveLength(1);
+    expect(firstLease.headerTransforms?.[0]).toEqual({
+      domain: "api.github.com",
+      headers: { Authorization: "Bearer first-token" },
+    });
+    expect(secondLease.headerTransforms?.[0]).toEqual({
+      domain: "api.github.com",
+      headers: { Authorization: "Bearer second-token" },
+    });
+    const accessTokenCalls = vi
+      .mocked(globalThis.fetch)
+      .mock.calls.filter(([url]) => String(url).includes("/access_tokens"));
+    expect(accessTokenCalls).toHaveLength(2);
   });
 
   it("requests the full plugin permission set when minting installation tokens", async () => {

@@ -7,6 +7,11 @@ import {
   withSpan,
   type LogContext,
 } from "@/chat/logging";
+import {
+  buildSandboxEgressNetworkPolicy,
+  resolveSandboxCommandEnvironment,
+} from "@/chat/sandbox/egress-policy";
+import { upsertSandboxEgressSession } from "@/chat/sandbox/egress-session";
 import { throwSandboxOperationError } from "@/chat/sandbox/errors";
 import { SANDBOX_WORKSPACE_ROOT } from "@/chat/sandbox/paths";
 import { createSandboxSessionManager } from "@/chat/sandbox/session";
@@ -76,37 +81,6 @@ const SANDBOX_TOOL_NAMES = new Set([
   "writeFile",
 ]);
 
-function parseHeaderTransforms(
-  raw: unknown,
-): Array<{ domain: string; headers: Record<string, string> }> | undefined {
-  if (!Array.isArray(raw)) {
-    return undefined;
-  }
-
-  return raw
-    .filter((value): value is Record<string, unknown> =>
-      Boolean(value && typeof value === "object"),
-    )
-    .map((transform) => ({
-      domain: String(transform.domain ?? "").trim(),
-      headers:
-        transform.headers &&
-        typeof transform.headers === "object" &&
-        !Array.isArray(transform.headers)
-          ? Object.fromEntries(
-              Object.entries(transform.headers as Record<string, unknown>)
-                .filter(([, value]) => typeof value === "string")
-                .map(([key, value]) => [key, value as string]),
-            )
-          : {},
-    }))
-    .filter(
-      (transform) =>
-        transform.domain.length > 0 &&
-        Object.keys(transform.headers).length > 0,
-    );
-}
-
 function parseEnv(raw: unknown): Record<string, string> | undefined {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     return undefined;
@@ -120,8 +94,9 @@ function parseEnv(raw: unknown): Record<string, string> | undefined {
 }
 
 function createSandboxWorkspace(sandbox: Sandbox): SandboxWorkspace {
+  const sandboxId = sandbox.name;
   return {
-    sandboxId: sandbox.sandboxId,
+    sandboxId,
     readFileToBuffer(input) {
       return sandbox.readFileToBuffer(input);
     },
@@ -137,6 +112,9 @@ export function createSandboxExecutor(options?: {
   sandboxDependencyProfileHash?: string;
   timeoutMs?: number;
   traceContext?: LogContext;
+  credentialEgress?: {
+    requesterId: string;
+  };
   onSandboxAcquired?: (sandbox: SandboxAcquiredState) => void | Promise<void>;
   runBashCustomCommand?: (
     command: string,
@@ -145,12 +123,32 @@ export function createSandboxExecutor(options?: {
   let availableSkills: SkillMetadata[] = [];
   let referenceFiles: string[] = [];
   const traceContext = options?.traceContext ?? {};
+  const credentialEgress = options?.credentialEgress;
+  const syncSandboxEgressSession = credentialEgress
+    ? async (sandboxId: string): Promise<void> => {
+        await upsertSandboxEgressSession({
+          sandboxId,
+          requesterId: credentialEgress.requesterId,
+          ttlMs: options?.timeoutMs,
+        });
+      }
+    : undefined;
   const sessionManager = createSandboxSessionManager({
     sandboxId: options?.sandboxId,
     sandboxDependencyProfileHash: options?.sandboxDependencyProfileHash,
     timeoutMs: options?.timeoutMs,
     traceContext,
-    onSandboxAcquired: options?.onSandboxAcquired,
+    commandEnv: credentialEgress
+      ? async () => await resolveSandboxCommandEnvironment()
+      : undefined,
+    createNetworkPolicy: credentialEgress
+      ? buildSandboxEgressNetworkPolicy
+      : undefined,
+    beforeCommand: syncSandboxEgressSession,
+    onSandboxAcquired: async (sandbox) => {
+      await syncSandboxEgressSession?.(sandbox.sandboxId);
+      await options?.onSandboxAcquired?.(sandbox);
+    },
   });
 
   const withSandboxSpan = <T>(
@@ -183,7 +181,6 @@ export function createSandboxExecutor(options?: {
     rawInput: Record<string, unknown>,
     command: string,
   ): Promise<SandboxExecutionEnvelope<T>> => {
-    const headerTransforms = parseHeaderTransforms(rawInput.headerTransforms);
     const env = parseEnv(rawInput.env);
     const timeoutMs = positiveInteger(rawInput.timeoutMs);
     logSandboxBootRequest("tool.bash", {
@@ -200,7 +197,6 @@ export function createSandboxExecutor(options?: {
         try {
           const response = await executeBash({
             command,
-            ...(headerTransforms ? { headerTransforms } : {}),
             ...(env ? { env } : {}),
             ...(timeoutMs ? { timeoutMs } : {}),
           });

@@ -1,23 +1,30 @@
+import type { StateAdapter } from "chat";
 import { logCapabilityCatalogLoadedOnce } from "@/chat/capabilities/catalog";
 import { ProviderCredentialRouter } from "@/chat/capabilities/router";
-import { SkillCapabilityRuntime } from "@/chat/capabilities/runtime";
 import type {
   CredentialBroker,
+  CredentialLease,
   CredentialHeaderTransform,
 } from "@/chat/credentials/broker";
 import { StateAdapterTokenStore } from "@/chat/credentials/state-adapter-token-store";
 import { TestCredentialBroker } from "@/chat/credentials/test-broker";
 import type { UserTokenStore } from "@/chat/credentials/user-token-store";
 import { resolveAuthTokenPlaceholder } from "@/chat/plugins/auth/auth-token-placeholder";
+import { resolvePluginCommandEnv } from "@/chat/plugins/command-env";
 import {
   createPluginBroker,
   getPluginProviders,
 } from "@/chat/plugins/registry";
-import type { PluginManifest } from "@/chat/plugins/types";
+import type { PluginDefinition, PluginManifest } from "@/chat/plugins/types";
 import { getStateAdapter } from "@/chat/state/adapter";
 
 const ENV_PLACEHOLDER_RE = /\$\{([A-Z_][A-Z0-9_]*)\}/g;
+const sandboxEgressRouters = new WeakMap<
+  StateAdapter,
+  ProviderCredentialRouter
+>();
 
+/** Create the user token store used by OAuth-backed credential brokers. */
 export function createUserTokenStore(): UserTokenStore {
   return new StateAdapterTokenStore(getStateAdapter());
 }
@@ -25,8 +32,8 @@ export function createUserTokenStore(): UserTokenStore {
 function resolveTestApiHeaderTransforms(
   manifest: PluginManifest,
 ): CredentialHeaderTransform[] {
-  const { apiDomains, apiHeaders } = manifest;
-  if (!apiDomains || !apiHeaders) {
+  const { domains, apiHeaders } = manifest;
+  if (!domains || !apiHeaders) {
     return [];
   }
   // Eval mode must not read deployment secrets; placeholders become dummy values.
@@ -38,70 +45,72 @@ function resolveTestApiHeaderTransforms(
       }),
     ]),
   );
-  return apiDomains.map((domain) => ({ domain, headers }));
+  return domains.map((domain) => ({ domain, headers }));
 }
 
-// Encapsulation boundary for capability runtime construction.
-// Swap broker strategy here (provider router, test broker, etc.) without
-// changing agent orchestration code in respond.ts.
-export function createSkillCapabilityRuntime(
-  options: {
-    requesterId?: string;
-  } = {},
-): SkillCapabilityRuntime {
-  logCapabilityCatalogLoadedOnce();
-  const useTestBroker = process.env.EVAL_ENABLE_TEST_CREDENTIALS === "1";
-  const userTokenStore = createUserTokenStore();
-
-  const brokersByProvider: Record<string, CredentialBroker> = {};
-
-  // Plugin providers
-  for (const plugin of getPluginProviders()) {
-    const { apiHeaders, credentials, name } = plugin.manifest;
-    if (!credentials && !apiHeaders) {
-      continue;
-    }
-    if (!credentials) {
-      brokersByProvider[name] = useTestBroker
-        ? new TestCredentialBroker({
-            provider: name,
-            headerTransforms: () =>
-              resolveTestApiHeaderTransforms(plugin.manifest),
-            ...(plugin.manifest.commandEnv
-              ? { env: plugin.manifest.commandEnv }
-              : {}),
-          })
-        : createPluginBroker(name, { userTokenStore });
-      continue;
-    }
-
-    const placeholder = resolveAuthTokenPlaceholder(credentials);
-    brokersByProvider[name] = useTestBroker
-      ? new TestCredentialBroker({
-          provider: name,
-          domains: credentials.apiDomains,
+function createTestBroker(plugin: PluginDefinition): TestCredentialBroker {
+  const { apiHeaders, credentials, name } = plugin.manifest;
+  const commandEnv = resolvePluginCommandEnv(plugin.manifest);
+  return new TestCredentialBroker({
+    provider: name,
+    ...(credentials
+      ? {
+          domains: credentials.domains,
           ...(credentials.apiHeaders
             ? { apiHeaders: credentials.apiHeaders }
             : {}),
-          ...(apiHeaders
-            ? {
-                headerTransforms: () =>
-                  resolveTestApiHeaderTransforms(plugin.manifest),
-              }
-            : {}),
-          ...(plugin.manifest.commandEnv
-            ? { env: plugin.manifest.commandEnv }
-            : {}),
           envKey: credentials.authTokenEnv,
-          placeholder,
-        })
+          placeholder: resolveAuthTokenPlaceholder(credentials),
+        }
+      : {}),
+    ...(apiHeaders
+      ? {
+          headerTransforms: () =>
+            resolveTestApiHeaderTransforms(plugin.manifest),
+        }
+      : {}),
+    ...(Object.keys(commandEnv).length > 0 ? { env: commandEnv } : {}),
+  });
+}
+
+function createProviderCredentialRouter(
+  userTokenStore: UserTokenStore,
+): ProviderCredentialRouter {
+  logCapabilityCatalogLoadedOnce();
+  const useTestBroker = process.env.EVAL_ENABLE_TEST_CREDENTIALS === "1";
+
+  const brokersByProvider: Record<string, CredentialBroker> = {};
+
+  for (const plugin of getPluginProviders()) {
+    const { name } = plugin.manifest;
+    if (!plugin.manifest.credentials && !plugin.manifest.apiHeaders) {
+      continue;
+    }
+    brokersByProvider[name] = useTestBroker
+      ? createTestBroker(plugin)
       : createPluginBroker(name, { userTokenStore });
   }
 
-  const router = new ProviderCredentialRouter({ brokersByProvider });
+  return new ProviderCredentialRouter({ brokersByProvider });
+}
 
-  return new SkillCapabilityRuntime({
-    router,
-    requesterId: options.requesterId,
-  });
+function getSandboxEgressRouter(): ProviderCredentialRouter {
+  const stateAdapter = getStateAdapter();
+  let router = sandboxEgressRouters.get(stateAdapter);
+  if (!router) {
+    router = createProviderCredentialRouter(
+      new StateAdapterTokenStore(stateAdapter),
+    );
+    sandboxEgressRouters.set(stateAdapter, router);
+  }
+  return router;
+}
+
+/** Issue one provider credential lease for host-side sandbox egress proxying. */
+export async function issueProviderCredentialLease(input: {
+  provider: string;
+  requesterId: string;
+  reason: string;
+}): Promise<CredentialLease> {
+  return await getSandboxEgressRouter().issue(input);
 }

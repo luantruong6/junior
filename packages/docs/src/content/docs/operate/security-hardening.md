@@ -25,9 +25,10 @@ Operators should assume provider access is fetched just in time, not kept as
 session-wide sandbox state.
 
 - Use short-lived scoped credentials.
-- Let loaded skills and their plugin capabilities determine which credentials may be injected.
-- Fetch credentials per authenticated command and keep them bound to the requesting turn.
-- Inject scoped auth at host boundary instead of exposing raw tokens.
+- Let registered plugin providers determine which credentials may be injected for matching domains.
+- Fetch credentials from the host when sandbox traffic hits a declared provider domain.
+- Keep sandbox egress authorization bound to the requester and current sandbox session.
+- Inject scoped auth at the host proxy boundary instead of exposing raw tokens.
 
 ## OAuth handling
 

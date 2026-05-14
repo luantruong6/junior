@@ -4,6 +4,7 @@ import type {
   CredentialHeaderTransform,
   CredentialLease,
 } from "@/chat/credentials/broker";
+import { resolvePluginCommandEnv } from "@/chat/plugins/command-env";
 import type { PluginManifest } from "@/chat/plugins/types";
 
 const MAX_LEASE_MS = 60 * 60 * 1000;
@@ -34,12 +35,12 @@ function resolveHeaders(
 export function resolveApiHeaderTransforms(
   manifest: PluginManifest,
 ): CredentialHeaderTransform[] {
-  const { apiDomains, apiHeaders } = manifest;
-  if (!apiDomains || !apiHeaders) {
+  const { domains, apiHeaders } = manifest;
+  if (!domains || !apiHeaders) {
     return [];
   }
   const resolvedHeaders = resolveHeaders(manifest.name, apiHeaders);
-  return apiDomains.map((domain) => ({
+  return domains.map((domain) => ({
     domain,
     headers: resolvedHeaders,
   }));
@@ -60,7 +61,7 @@ export function createApiHeadersBroker(
       return {
         id: randomUUID(),
         provider,
-        env: { ...(manifest.commandEnv ?? {}) },
+        env: resolvePluginCommandEnv(manifest),
         headerTransforms,
         expiresAt: new Date(Date.now() + MAX_LEASE_MS).toISOString(),
         metadata: {

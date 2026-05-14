@@ -8,12 +8,14 @@ import type { Skill } from "@/chat/skills";
 const {
   formatProviderLabel,
   getPluginDefinition,
+  getPluginProviders,
   getPluginOAuthConfig,
   startOAuthFlow,
   unlinkProvider,
 } = vi.hoisted(() => ({
   formatProviderLabel: vi.fn((provider: string) => provider),
   getPluginDefinition: vi.fn(),
+  getPluginProviders: vi.fn(),
   getPluginOAuthConfig: vi.fn(),
   startOAuthFlow: vi.fn(),
   unlinkProvider: vi.fn(),
@@ -26,6 +28,7 @@ vi.mock("@/chat/oauth-flow", () => ({
 
 vi.mock("@/chat/plugins/registry", () => ({
   getPluginDefinition,
+  getPluginProviders,
   getPluginOAuthConfig,
 }));
 
@@ -62,7 +65,7 @@ describe("createPluginAuthOrchestration", () => {
             name: "github",
             credentials: {
               type: "github-app",
-              apiDomains: ["api.github.com"],
+              domains: ["api.github.com"],
               authTokenEnv: "GITHUB_TOKEN",
             },
           },
@@ -75,7 +78,7 @@ describe("createPluginAuthOrchestration", () => {
             name: "sentry",
             credentials: {
               type: "oauth-bearer",
-              apiDomains: ["sentry.io"],
+              domains: ["sentry.io"],
               authTokenEnv: "SENTRY_AUTH_TOKEN",
             },
           },
@@ -84,6 +87,12 @@ describe("createPluginAuthOrchestration", () => {
 
       return undefined;
     });
+    getPluginProviders.mockReset();
+    getPluginProviders.mockImplementation(() =>
+      ["github", "sentry"]
+        .map((provider) => getPluginDefinition(provider))
+        .filter(Boolean),
+    );
     getPluginOAuthConfig.mockReset();
     getPluginOAuthConfig.mockImplementation((provider: string) =>
       provider === "github" || provider === "sentry" ? { provider } : undefined,
@@ -114,7 +123,7 @@ describe("createPluginAuthOrchestration", () => {
         command: "sentry issue list",
         details: {
           exit_code: 1,
-          stderr: "401 unauthorized",
+          stderr: "junior-auth-required provider=sentry",
         },
       }),
     ).rejects.toBeInstanceOf(PluginAuthorizationPauseError);
@@ -230,5 +239,65 @@ describe("createPluginAuthOrchestration", () => {
 
     expect(startOAuthFlow).not.toHaveBeenCalled();
     expect(unlinkProvider).not.toHaveBeenCalled();
+  });
+
+  it("ignores explicit auth markers for unregistered providers", async () => {
+    const orchestration = createPluginAuthOrchestration(
+      {
+        requesterId: "U123",
+        userMessage: "check Linear",
+        userTokenStore: {} as any,
+      },
+      vi.fn(),
+    );
+
+    await expect(
+      orchestration.handleCommandFailure({
+        activeSkill: githubSkill,
+        command: "curl https://linear.app/api",
+        details: {
+          exit_code: 1,
+          stderr: "junior-auth-required provider=linear 401 unauthorized",
+        },
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(startOAuthFlow).not.toHaveBeenCalled();
+    expect(unlinkProvider).not.toHaveBeenCalled();
+  });
+
+  it("starts oauth recovery from an explicit provider marker without an active skill", async () => {
+    startOAuthFlow.mockResolvedValue({
+      ok: true,
+      delivery: { channelId: "D123" },
+    });
+
+    const orchestration = createPluginAuthOrchestration(
+      {
+        requesterId: "U123",
+        userMessage: "check Sentry",
+        userTokenStore: {} as any,
+      },
+      vi.fn(),
+    );
+
+    await expect(
+      orchestration.handleCommandFailure({
+        activeSkill: null,
+        command: "curl https://sentry.io/api/0/issues/",
+        details: {
+          exit_code: 1,
+          stderr: "junior-auth-required provider=sentry 401 unauthorized",
+        },
+      }),
+    ).rejects.toBeInstanceOf(PluginAuthorizationPauseError);
+
+    expect(startOAuthFlow).toHaveBeenCalledWith(
+      "sentry",
+      expect.objectContaining({
+        requesterId: "U123",
+        activeSkillName: undefined,
+      }),
+    );
   });
 });

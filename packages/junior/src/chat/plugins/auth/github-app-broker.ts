@@ -4,17 +4,12 @@ import type {
   CredentialLease,
 } from "@/chat/credentials/broker";
 import { mergeHeaderTransforms } from "@/chat/credentials/header-transforms";
+import { resolvePluginCommandEnv } from "@/chat/plugins/command-env";
 import { resolveApiHeaderTransforms } from "./api-headers-broker";
 import { resolveAuthTokenPlaceholder } from "./auth-token-placeholder";
 import type { GitHubAppCredentials, PluginManifest } from "../types";
 
 const MAX_LEASE_MS = 60 * 60 * 1000;
-
-type CachedInstallationToken = {
-  installationId: number;
-  token: string;
-  expiresAt: number;
-};
 
 function base64Url(input: string): string {
   return Buffer.from(input)
@@ -100,6 +95,14 @@ function createAppJwt(appId: string, privateKeyEnv: string): string {
   return `${signingInput}.${signature}`;
 }
 
+function resolveAppId(appIdEnv: string): string {
+  const appId = process.env[appIdEnv]?.trim();
+  if (!appId) {
+    throw new Error(`Missing ${appIdEnv}`);
+  }
+  return appId;
+}
+
 async function githubRequest<T>(
   apiBase: string,
   path: string,
@@ -142,6 +145,20 @@ async function githubRequest<T>(
   }
 
   return parsed as T;
+}
+
+function resolveGitHubApiDomain(credentials: GitHubAppCredentials): string {
+  const apiDomain = credentials.domains.find((domain) => {
+    const normalizedDomain = domain.toLowerCase();
+    return (
+      normalizedDomain === "api.github.com" ||
+      normalizedDomain.startsWith("api.")
+    );
+  });
+  if (!apiDomain) {
+    throw new Error("GitHub App provider requires an API domain");
+  }
+  return apiDomain;
 }
 
 /**
@@ -207,60 +224,85 @@ function capabilitiesToPermissions(
   return permissions;
 }
 
+/** Create a broker that keeps GitHub App tokens on the host while authorizing provider traffic. */
 export function createGitHubAppBroker(
   manifest: PluginManifest,
   credentials: GitHubAppCredentials,
 ): CredentialBroker {
-  const tokenCache = new Map<string, CachedInstallationToken>();
   const provider = manifest.name;
   const {
-    apiDomains,
+    domains,
     apiHeaders,
     authTokenEnv,
     appIdEnv,
     privateKeyEnv,
     installationIdEnv,
   } = credentials;
-  const apiBase = `https://${apiDomains[0]}`;
+  const apiDomain = resolveGitHubApiDomain(credentials);
+  const apiBase = `https://${apiDomain}`;
   const placeholder = resolveAuthTokenPlaceholder(credentials);
   const pluginHeaderTransforms = () => resolveApiHeaderTransforms(manifest);
 
-  /**
-   * Capabilities that require git HTTPS auth (github.com, not just api.github.com).
-   * The sandbox network proxy intercepts HTTPS traffic to these domains and injects
-   * the real token via headerTransforms — `gh` and `git` authenticate through the
-   * proxy, not via the GITHUB_TOKEN env var (which holds a placeholder).
-   */
-  const GIT_DOMAIN = "github.com";
-  const GIT_CAPABILITIES = new Set([
-    `${provider}.contents.read`,
-    `${provider}.contents.write`,
-  ]);
-  const leaseDomains = manifest.capabilities.some((capability) =>
-    GIT_CAPABILITIES.has(capability),
-  )
-    ? [...apiDomains, GIT_DOMAIN]
-    : apiDomains;
+  const leaseDomains = [...new Set(domains)];
 
   /**
    * Build the correct Authorization header for a domain.
    *
-   * GitHub's REST API (api.github.com) accepts Bearer tokens, but its git
-   * smart-HTTP transport (github.com) only accepts HTTP Basic auth with
-   * `x-access-token` as the username. This matches how `actions/checkout`
-   * and the `gh` credential helper authenticate git operations.
+   * Git smart-HTTP hosts require Basic auth with `x-access-token`. Other
+   * GitHub service hosts use the same Bearer installation token as REST API.
    */
   function authorizationFor(domain: string, token: string): string {
-    if (domain === GIT_DOMAIN) {
+    if (isGitSmartHttpDomain(domain)) {
       return `Basic ${Buffer.from(`x-access-token:${token}`).toString("base64")}`;
     }
     return `Bearer ${token}`;
+  }
+
+  function isGitSmartHttpDomain(domain: string): boolean {
+    const normalizedDomain = domain.toLowerCase();
+    const normalizedApiDomain = apiDomain.toLowerCase();
+    return (
+      normalizedDomain === "github.com" ||
+      (normalizedApiDomain.startsWith("api.") &&
+        normalizedDomain === normalizedApiDomain.slice("api.".length))
+    );
   }
 
   const permissions = capabilitiesToPermissions(
     manifest.capabilities,
     provider,
   );
+
+  function createLease(params: {
+    installationId: number;
+    token: string;
+    expiresAtMs: number;
+    reason: string;
+  }): CredentialLease {
+    return {
+      id: randomUUID(),
+      provider,
+      env: {
+        ...resolvePluginCommandEnv(manifest),
+        [authTokenEnv]: placeholder,
+      },
+      headerTransforms: mergeHeaderTransforms([
+        ...pluginHeaderTransforms(),
+        ...leaseDomains.map((domain) => ({
+          domain,
+          headers: {
+            ...(apiHeaders ?? {}),
+            Authorization: authorizationFor(domain, params.token),
+          },
+        })),
+      ]),
+      expiresAt: new Date(params.expiresAtMs).toISOString(),
+      metadata: {
+        installationId: String(params.installationId),
+        reason: params.reason,
+      },
+    };
+  }
 
   function resolveInstallationId(): number {
     const installationIdRaw = process.env[installationIdEnv]?.trim();
@@ -277,42 +319,13 @@ export function createGitHubAppBroker(
   return {
     async issue(input: { reason: string }): Promise<CredentialLease> {
       const installationId = resolveInstallationId();
-      const cacheKey = String(installationId);
-      const cached = tokenCache.get(cacheKey);
-      const now = Date.now();
-      if (cached && cached.expiresAt - now > 2 * 60 * 1000) {
-        return {
-          id: randomUUID(),
-          provider,
-          env: { ...(manifest.commandEnv ?? {}), [authTokenEnv]: placeholder },
-          headerTransforms: mergeHeaderTransforms([
-            ...pluginHeaderTransforms(),
-            ...leaseDomains.map((domain) => ({
-              domain,
-              headers: {
-                ...(apiHeaders ?? {}),
-                Authorization: authorizationFor(domain, cached.token),
-              },
-            })),
-          ]),
-          expiresAt: new Date(cached.expiresAt).toISOString(),
-          metadata: {
-            installationId: String(cached.installationId),
-            reason: input.reason,
-          },
-        };
-      }
-
       const tokenRequestBody: {
         permissions: Record<string, "read" | "write">;
       } = {
         permissions,
       };
 
-      const appId = process.env[appIdEnv];
-      if (!appId) {
-        throw new Error(`Missing ${appIdEnv}`);
-      }
+      const appId = resolveAppId(appIdEnv);
       const appJwt = createAppJwt(appId, privateKeyEnv);
 
       const accessTokenResponse = await githubRequest<{
@@ -329,35 +342,13 @@ export function createGitHubAppBroker(
         providerExpiresAtMs,
         Date.now() + MAX_LEASE_MS,
       );
-      tokenCache.set(cacheKey, {
+
+      return createLease({
         installationId,
         token: accessTokenResponse.token,
-        expiresAt: expiresAtMs,
+        expiresAtMs,
+        reason: input.reason,
       });
-
-      return {
-        id: randomUUID(),
-        provider,
-        env: { ...(manifest.commandEnv ?? {}), [authTokenEnv]: placeholder },
-        headerTransforms: mergeHeaderTransforms([
-          ...pluginHeaderTransforms(),
-          ...leaseDomains.map((domain) => ({
-            domain,
-            headers: {
-              ...(apiHeaders ?? {}),
-              Authorization: authorizationFor(
-                domain,
-                accessTokenResponse.token,
-              ),
-            },
-          })),
-        ]),
-        expiresAt: new Date(expiresAtMs).toISOString(),
-        metadata: {
-          installationId: String(installationId),
-          reason: input.reason,
-        },
-      };
     },
   };
 }
