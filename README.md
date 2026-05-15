@@ -1,5 +1,7 @@
 # junior
 
+**Junior is broadly unstable as rapidly improve it, but if you're interested in using it we'd love to hear your feedback!**
+
 Junior is a Slack bot runtime powered by Hono.
 
 Use it to investigate issues, summarize context, and take action from Slack with connected tools.
