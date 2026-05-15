@@ -76,14 +76,14 @@ import { disconnectStateAdapter } from "@/chat/state/adapter";
 import { CredentialUnavailableError } from "@/chat/credentials/broker";
 import { ALL } from "@/handlers/sandbox-egress-proxy";
 
-const SANDBOX_ID = "junior-sbx";
+const EGRESS_ID = "junior-sbx";
 const REQUESTER_ID = "U123";
 
 async function authorizeSandboxEgress(
   requesterId = REQUESTER_ID,
 ): Promise<void> {
   await upsertSandboxEgressSession({
-    sandboxId: SANDBOX_ID,
+    egressId: EGRESS_ID,
     requesterId,
     ttlMs: 60_000,
   });
@@ -116,7 +116,7 @@ function egressRequest(
   } = {},
 ): Request {
   return new Request(
-    `https://junior.example.com/api/internal/sandbox-egress/${SANDBOX_ID}${input.path ?? "/api/0/issues/"}`,
+    `https://junior.example.com/api/internal/sandbox-egress/${EGRESS_ID}${input.path ?? "/api/0/issues/"}`,
     {
       method: input.method ?? "GET",
       headers: {
@@ -139,7 +139,7 @@ function proxy(
     async () => new Response("ok"),
   ) as typeof fetch,
 ): Promise<Response> {
-  return proxySandboxEgressRequest(request, SANDBOX_ID, {
+  return proxySandboxEgressRequest(request, EGRESS_ID, {
     fetch: fetchMock,
     verifyOidc: async () => ({ sub: "sandbox" }),
   });
@@ -161,30 +161,24 @@ describe("sandbox egress proxy", () => {
     await disconnectStateAdapter();
     delete process.env.JUNIOR_STATE_ADAPTER;
     delete process.env.JUNIOR_BASE_URL;
-    delete process.env.VERCEL_OIDC_AUDIENCE;
-    delete process.env.VERCEL_PROJECT_ID;
-    delete process.env.VERCEL_TEAM_ID;
     delete process.env.SENTRY_BOT_EMAIL;
     vi.restoreAllMocks();
   });
 
   it("builds provider forwarding policy for sandbox egress", () => {
-    process.env.VERCEL_OIDC_AUDIENCE = "https://vercel.com/acme";
-    process.env.VERCEL_PROJECT_ID = "prj_123";
-
     expect(matchesSandboxEgressDomain("SENTRY.IO", "sentry.io")).toBe(true);
     expect(matchesSandboxEgressDomain("eu.sentry.io", "sentry.io")).toBe(false);
-    expect(buildSandboxEgressNetworkPolicy(SANDBOX_ID)).toEqual({
+    expect(buildSandboxEgressNetworkPolicy(EGRESS_ID)).toEqual({
       allow: {
         "*": [],
         "sentry.io": [
           {
-            forwardURL: `https://junior.example.com/api/internal/sandbox-egress/${SANDBOX_ID}`,
+            forwardURL: `https://junior.example.com/api/internal/sandbox-egress/${EGRESS_ID}`,
           },
         ],
         "us.sentry.io": [
           {
-            forwardURL: `https://junior.example.com/api/internal/sandbox-egress/${SANDBOX_ID}`,
+            forwardURL: `https://junior.example.com/api/internal/sandbox-egress/${EGRESS_ID}`,
           },
         ],
       },
@@ -193,27 +187,9 @@ describe("sandbox egress proxy", () => {
 
   it("fails sandbox egress policy setup without a public callback URL", () => {
     delete process.env.JUNIOR_BASE_URL;
-    process.env.VERCEL_OIDC_AUDIENCE = "https://vercel.com/acme";
-    process.env.VERCEL_PROJECT_ID = "prj_123";
 
-    expect(() => buildSandboxEgressNetworkPolicy(SANDBOX_ID)).toThrow(
+    expect(() => buildSandboxEgressNetworkPolicy(EGRESS_ID)).toThrow(
       "Cannot determine base URL for sandbox credential egress",
-    );
-  });
-
-  it("fails sandbox egress policy setup without trusted OIDC configuration", () => {
-    process.env.VERCEL_PROJECT_ID = "prj_123";
-
-    expect(() => buildSandboxEgressNetworkPolicy(SANDBOX_ID)).toThrow(
-      "VERCEL_OIDC_AUDIENCE is required for sandbox egress OIDC",
-    );
-  });
-
-  it("fails sandbox egress policy setup without the expected Vercel project", () => {
-    process.env.VERCEL_OIDC_AUDIENCE = "https://vercel.com/acme";
-
-    expect(() => buildSandboxEgressNetworkPolicy(SANDBOX_ID)).toThrow(
-      "VERCEL_PROJECT_ID is required for sandbox egress OIDC",
     );
   });
 
@@ -239,9 +215,9 @@ describe("sandbox egress proxy", () => {
 
     const response = await ALL(
       new Request(
-        `https://junior.example.com/api/internal/sandbox-egress/${SANDBOX_ID}`,
+        `https://junior.example.com/api/internal/sandbox-egress/${EGRESS_ID}`,
       ),
-      SANDBOX_ID,
+      EGRESS_ID,
     );
 
     expect(response.status).toBe(401);
@@ -579,7 +555,7 @@ describe("sandbox egress proxy", () => {
     const fetchMock = vi.fn();
 
     const response = await proxy(
-      new Request(`https://junior.example.com/not-egress/${SANDBOX_ID}`, {
+      new Request(`https://junior.example.com/not-egress/${EGRESS_ID}`, {
         headers: {
           "vercel-forwarded-host": "sentry.io",
           "vercel-forwarded-scheme": "https",
@@ -655,55 +631,33 @@ describe("sandbox egress proxy", () => {
     expect(issueProviderCredentialLeaseMock).not.toHaveBeenCalled();
   });
 
-  it("requires OIDC claims to match the Vercel project and sandbox", () => {
-    process.env.VERCEL_PROJECT_ID = "prj_123";
-    process.env.VERCEL_TEAM_ID = "team_123";
-
+  it("requires OIDC sandbox claims to match the egress route", () => {
     expect(() =>
       validateVercelSandboxOidcClaims(
         {
-          owner_id: "team_123",
-          project_id: "prj_123",
-          sandbox_id: SANDBOX_ID,
+          sandbox_id: EGRESS_ID,
         },
-        SANDBOX_ID,
+        EGRESS_ID,
       ),
     ).not.toThrow();
 
     expect(() =>
       validateVercelSandboxOidcClaims(
         {
-          owner_id: "team_123",
-          project_id: "prj_other",
-          sandbox_id: SANDBOX_ID,
-        },
-        SANDBOX_ID,
-      ),
-    ).toThrow("different project");
-
-    expect(() =>
-      validateVercelSandboxOidcClaims(
-        {
-          owner_id: "team_123",
-          project_id: "prj_123",
           sandbox_id: "other-sandbox",
         },
-        SANDBOX_ID,
+        EGRESS_ID,
       ),
     ).toThrow("different sandbox");
   });
 
   it("caches Vercel OIDC discovery metadata by issuer", async () => {
-    process.env.VERCEL_OIDC_AUDIENCE = "https://vercel.com/cache-test";
-    process.env.VERCEL_PROJECT_ID = "prj_123";
     decodeJwtMock.mockReturnValue({
       iss: "https://oidc.vercel.com/cache-test",
-      owner: "cache-test",
     });
     jwtVerifyMock.mockResolvedValue({
       payload: {
-        project_id: "prj_123",
-        sandbox_id: SANDBOX_ID,
+        sandbox_id: EGRESS_ID,
       },
     });
     const fetchMock = vi.fn(async (_url: URL | string, _init?: RequestInit) =>
@@ -713,26 +667,24 @@ describe("sandbox egress proxy", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
 
-    await verifyVercelSandboxOidcToken("signed-token-1", SANDBOX_ID);
-    await verifyVercelSandboxOidcToken("signed-token-2", SANDBOX_ID);
+    await verifyVercelSandboxOidcToken("signed-token-1", EGRESS_ID);
+    await verifyVercelSandboxOidcToken("signed-token-2", EGRESS_ID);
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0]?.[1]).toEqual({ redirect: "error" });
     expect(createRemoteJWKSetMock).toHaveBeenCalledTimes(1);
   });
 
-  it("verifies Vercel OIDC audience from trusted configuration", async () => {
-    process.env.VERCEL_OIDC_AUDIENCE = "https://vercel.com/acme";
-    process.env.VERCEL_PROJECT_ID = "prj_123";
+  it("verifies sandbox tokens without assuming the deployment OIDC audience", async () => {
     decodeJwtMock.mockReturnValue({
       iss: "https://oidc.vercel.com/acme",
-      owner: "attacker-controlled",
     });
     jwtVerifyMock.mockResolvedValue({
       payload: {
-        owner: "acme",
-        project_id: "prj_123",
-        sandbox_id: SANDBOX_ID,
+        aud: "sandbox-proxy-audience",
+        owner_id: "different-team",
+        project_id: "different-project",
+        sandbox_id: EGRESS_ID,
       },
     });
     vi.stubGlobal(
@@ -744,37 +696,20 @@ describe("sandbox egress proxy", () => {
       ),
     );
 
-    await verifyVercelSandboxOidcToken("signed-token", SANDBOX_ID);
+    await verifyVercelSandboxOidcToken("signed-token", EGRESS_ID);
 
     expect(jwtVerifyMock).toHaveBeenCalledWith(
       "signed-token",
       expect.anything(),
       {
         issuer: "https://oidc.vercel.com/acme",
-        audience: "https://vercel.com/acme",
       },
     );
   });
 
-  it("requires trusted Vercel OIDC audience configuration", async () => {
-    process.env.VERCEL_PROJECT_ID = "prj_123";
-    decodeJwtMock.mockReturnValue({
-      iss: "https://oidc.vercel.com/acme",
-    });
-
-    await expect(
-      verifyVercelSandboxOidcToken("signed-token", SANDBOX_ID),
-    ).rejects.toThrow("VERCEL_OIDC_AUDIENCE");
-
-    expect(jwtVerifyMock).not.toHaveBeenCalled();
-  });
-
   it("rejects non-HTTPS Vercel OIDC JWKS metadata", async () => {
-    process.env.VERCEL_OIDC_AUDIENCE = "https://vercel.com/bad-jwks";
-    process.env.VERCEL_PROJECT_ID = "prj_123";
     decodeJwtMock.mockReturnValue({
       iss: "https://oidc.vercel.com/bad-jwks",
-      owner: "bad-jwks",
     });
     const fetchMock = vi.fn(async () =>
       Response.json({
@@ -784,7 +719,7 @@ describe("sandbox egress proxy", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     await expect(
-      verifyVercelSandboxOidcToken("signed-token", SANDBOX_ID),
+      verifyVercelSandboxOidcToken("signed-token", EGRESS_ID),
     ).rejects.toThrow("jwks_uri");
 
     expect(createRemoteJWKSetMock).not.toHaveBeenCalled();
