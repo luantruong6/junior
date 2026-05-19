@@ -4,7 +4,6 @@ import {
   TEST_FILE_ID,
   TEST_LIST_ID,
   TEST_MESSAGE_TS,
-  TEST_SECTION_ID,
   TEST_THREAD_TS,
   TEST_USER_ID,
   slackTimestamp,
@@ -140,23 +139,6 @@ export function conversationsCanvasesCreateOk(
   return canvasesCreateOk(input);
 }
 
-export function canvasesSectionsLookupOk(
-  input: {
-    sectionId?: string;
-    containsText?: string;
-  } = {},
-): { ok: true; sections: Array<{ id: string; type: string; text: string }> } {
-  return slackOk({
-    sections: [
-      {
-        id: input.sectionId ?? TEST_SECTION_ID,
-        type: "rich_text",
-        text: input.containsText ?? "section",
-      },
-    ],
-  });
-}
-
 export function canvasesEditOk(): { ok: true } {
   return slackOk();
 }
@@ -289,8 +271,8 @@ export function filesInfoOk(
         : {}),
       ...(input.title ? { title: input.title } : {}),
       ...(input.name ? { name: input.name } : {}),
-      ...(input.filetype ? { filetype: input.filetype } : {}),
-      ...(input.mimetype ? { mimetype: input.mimetype } : {}),
+      filetype: input.filetype ?? "quip",
+      mimetype: input.mimetype ?? "text/plain",
     },
   });
 }

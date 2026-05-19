@@ -1,7 +1,4 @@
-import type {
-  CanvasesSectionsLookupResponse,
-  FilesInfoResponse,
-} from "@slack/web-api";
+import type { FilesInfoResponse } from "@slack/web-api";
 import { logWarn } from "@/chat/logging";
 import {
   downloadPrivateSlackFile,
@@ -11,18 +8,14 @@ import {
   normalizeSlackConversationId,
   withSlackRetries,
 } from "@/chat/slack/client";
+import { extractCanvasId } from "@/chat/slack/canvas-references";
+
+export { extractCanvasId } from "@/chat/slack/canvas-references";
 
 export interface CanvasCreateInput {
   title: string;
   markdown: string;
   channelId?: string;
-}
-
-export interface CanvasUpdateInput {
-  canvasId: string;
-  markdown: string;
-  operation: "insert_at_end" | "insert_at_start" | "replace";
-  sectionId?: string;
 }
 
 export interface CanvasReadResult {
@@ -162,35 +155,11 @@ async function grantChannelCanvasAccess(
   }
 }
 
-/** Find a canvas section whose content contains the given text. */
-export async function lookupCanvasSection(
-  canvasId: string,
-  containsText: string,
-): Promise<string | undefined> {
-  const client = getSlackClient();
-  const response: CanvasesSectionsLookupResponse = await withSlackRetries(
-    () =>
-      client.canvases.sections.lookup({
-        canvas_id: canvasId,
-        criteria: {
-          contains_text: containsText,
-        },
-      }),
-    3,
-    {
-      action: "canvases.sections.lookup",
-      attributes: {
-        "app.slack.canvas.canvas_id_prefix": canvasId.slice(0, 1),
-        "app.slack.canvas.contains_text_length": containsText.length,
-      },
-    },
-  );
-
-  return response.sections?.[0]?.id;
-}
-
-/** Insert or replace content in an existing Slack canvas. */
-export async function updateCanvas(input: CanvasUpdateInput): Promise<void> {
+/** Replace an existing Slack canvas body with the provided markdown. */
+export async function writeCanvasMarkdown(input: {
+  canvasId: string;
+  markdown: string;
+}): Promise<{ markdown: string; normalizedHeadingCount: number }> {
   const client = getSlackClient();
   const normalizedContent = normalizeCanvasMarkdown(input.markdown);
 
@@ -200,8 +169,7 @@ export async function updateCanvas(input: CanvasUpdateInput): Promise<void> {
         canvas_id: input.canvasId,
         changes: [
           {
-            operation: input.operation,
-            section_id: input.sectionId,
+            operation: "replace",
             document_content: {
               type: "markdown",
               markdown: normalizedContent.markdown,
@@ -214,7 +182,7 @@ export async function updateCanvas(input: CanvasUpdateInput): Promise<void> {
       action: "canvases.edit",
       attributes: {
         "app.slack.canvas.canvas_id_prefix": input.canvasId.slice(0, 1),
-        "app.slack.canvas.operation": input.operation,
+        "app.slack.canvas.operation": "replace",
         "app.slack.canvas.markdown_length": normalizedContent.markdown.length,
         "app.slack.canvas.markdown_normalized":
           normalizedContent.normalizedHeadingCount > 0,
@@ -223,31 +191,19 @@ export async function updateCanvas(input: CanvasUpdateInput): Promise<void> {
       },
     },
   );
+
+  return normalizedContent;
 }
 
-const CANVAS_ID_PATTERN = /^F[A-Z0-9]+$/i;
-const CANVAS_URL_FILE_ID_PATTERN =
-  /\/(?:docs|canvas|files)\/(?:T[A-Z0-9]+\/)?(?:U[A-Z0-9]+\/)?(F[A-Z0-9]+)/i;
-
-/**
- * Resolve a Slack canvas ID from a raw canvas ID or Slack docs/canvas URL.
- * Accepts forms like `F0ABCDE`, `https://team.slack.com/docs/T.../F...`, and
- * `https://team.slack.com/canvas/F...`.
- */
-export function extractCanvasId(input: string): string | undefined {
-  const trimmed = input.trim();
-  if (!trimmed) return undefined;
-
-  if (CANVAS_ID_PATTERN.test(trimmed)) {
-    return trimmed.toUpperCase();
-  }
-
-  const urlMatch = trimmed.match(CANVAS_URL_FILE_ID_PATTERN);
-  if (urlMatch?.[1]) {
-    return urlMatch[1].toUpperCase();
-  }
-
-  return undefined;
+function isCanvasFile(file: NonNullable<FilesInfoResponse["file"]>): boolean {
+  const filetype = file.filetype?.toLowerCase() ?? "";
+  const mimetype = file.mimetype?.toLowerCase() ?? "";
+  return (
+    filetype === "quip" ||
+    filetype === "canvas" ||
+    mimetype.includes("quip") ||
+    mimetype.includes("canvas")
+  );
 }
 
 /**
@@ -284,6 +240,9 @@ export async function readCanvas(
   const file = info.file;
   if (!file) {
     throw new Error("Slack returned no file metadata for canvas.");
+  }
+  if (!isCanvasFile(file)) {
+    throw new Error("Slack file metadata did not describe a Canvas document.");
   }
 
   const downloadUrl = file.url_private_download ?? file.url_private;

@@ -4,12 +4,21 @@ import { extractCanvasId } from "@/chat/tools/slack/canvases";
 describe("extractCanvasId", () => {
   it("returns an uppercased F-prefixed ID as-is", () => {
     expect(extractCanvasId("F0AU9MRL63T")).toBe("F0AU9MRL63T");
+    expect(extractCanvasId("FABCD12345")).toBe("FABCD12345");
     expect(extractCanvasId("f0abcdef")).toBe("F0ABCDEF");
   });
 
   it("parses canvas IDs from /docs/ URLs", () => {
     expect(
       extractCanvasId("https://sentry.slack.com/docs/T024ZCV9U/F0AU9MRL63T"),
+    ).toBe("F0AU9MRL63T");
+    expect(
+      extractCanvasId("https://sentry.slack.com/docs/T024ZCV9U/FABCD12345"),
+    ).toBe("FABCD12345");
+    expect(
+      extractCanvasId(
+        "<https://sentry.slack.com/docs/T024ZCV9U/F0AU9MRL63T|Canvas>",
+      ),
     ).toBe("F0AU9MRL63T");
   });
 
@@ -29,7 +38,11 @@ describe("extractCanvasId", () => {
 
   it("returns undefined for unparseable input", () => {
     expect(extractCanvasId("")).toBeUndefined();
+    expect(extractCanvasId("file")).toBeUndefined();
     expect(extractCanvasId("https://example.com/foo")).toBeUndefined();
+    expect(
+      extractCanvasId("https://example.com/docs/T024ZCV9U/F0AU9MRL63T"),
+    ).toBeUndefined();
     expect(extractCanvasId("not-a-canvas")).toBeUndefined();
   });
 });

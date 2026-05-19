@@ -83,8 +83,11 @@ describe("createSlackCanvasReadTool", () => {
     });
   });
 
-  it("truncates long canvas content and exposes original_byte_length", async () => {
-    const body = "x".repeat(40_100);
+  it("reads a bounded line range and exposes continuation details", async () => {
+    const body = Array.from(
+      { length: 1005 },
+      (_, index) => `line ${index + 1}`,
+    ).join("\n");
     queueSlackApiResponse("files.info", {
       body: filesInfoOk({
         fileId: "F0LONG",
@@ -103,12 +106,86 @@ describe("createSlackCanvasReadTool", () => {
       truncated: boolean;
       content: string;
       original_byte_length: number;
+      start_line: number;
+      end_line: number;
+      total_lines: number;
+      continuation?: string;
     };
 
     expect(result.ok).toBe(true);
     expect(result.truncated).toBe(true);
-    expect(result.content).toHaveLength(40_000);
+    expect(result.content).toBe(
+      Array.from({ length: 1000 }, (_, index) => `line ${index + 1}`).join(
+        "\n",
+      ),
+    );
+    expect(result.start_line).toBe(1);
+    expect(result.end_line).toBe(1000);
+    expect(result.total_lines).toBe(1005);
+    expect(result.continuation).toBe(
+      "Read more with offset=1001 and limit=1000.",
+    );
     expect(result.original_byte_length).toBe(body.length);
+  });
+
+  it("reads a requested line window", async () => {
+    queueSlackApiResponse("files.info", {
+      body: filesInfoOk({
+        fileId: "F0WINDOW",
+        urlPrivate: "https://files.slack.com/files-pri/T000-F0WINDOW/canvas.md",
+      }),
+    });
+    queueSlackPrivateFileDownload({
+      status: 200,
+      body: "one\ntwo\nthree\nfour",
+    });
+
+    const tool = createSlackCanvasReadTool();
+    if (typeof tool.execute !== "function") {
+      throw new Error("slackCanvasRead execute function missing");
+    }
+
+    const result = await tool.execute(
+      { canvas: "F0WINDOW", offset: 2, limit: 2 },
+      {} as never,
+    );
+
+    expect(result).toMatchObject({
+      ok: true,
+      canvas_id: "F0WINDOW",
+      content: "two\nthree",
+      start_line: 2,
+      end_line: 3,
+      total_lines: 4,
+      truncated: true,
+      continuation: "Read more with offset=4 and limit=2.",
+    });
+  });
+
+  it("normalizes lowercase canvas IDs", async () => {
+    queueSlackApiResponse("files.info", {
+      body: filesInfoOk({
+        fileId: "F0LOWER",
+        urlPrivate: "https://files.slack.com/files-pri/T000-F0LOWER/canvas.md",
+      }),
+    });
+    queueSlackPrivateFileDownload({
+      status: 200,
+      body: "lowercase artifact id body",
+    });
+
+    const tool = createSlackCanvasReadTool();
+    if (typeof tool.execute !== "function") {
+      throw new Error("slackCanvasRead execute function missing");
+    }
+
+    const result = await tool.execute({ canvas: "f0lower" }, {} as never);
+
+    expect(result).toMatchObject({
+      ok: true,
+      canvas_id: "F0LOWER",
+      content: "lowercase artifact id body",
+    });
   });
 
   it("returns an error when canvas input is unparseable", async () => {
@@ -158,5 +235,26 @@ describe("createSlackCanvasReadTool", () => {
     const result = await tool.execute({ canvas: "F0ABCDEF" }, {} as never);
 
     expect(result).toMatchObject({ ok: false, canvas_id: "F0ABCDEF" });
+  });
+
+  it("rejects non-Canvas Slack files before download", async () => {
+    queueSlackApiResponse("files.info", {
+      body: filesInfoOk({
+        fileId: "F0SCRIPT",
+        filetype: "javascript",
+        mimetype: "application/javascript",
+        urlPrivate: "https://files.slack.com/files-pri/T000-F0SCRIPT/app.js",
+      }),
+    });
+
+    const tool = createSlackCanvasReadTool();
+    if (typeof tool.execute !== "function") {
+      throw new Error("slackCanvasRead execute function missing");
+    }
+
+    const result = await tool.execute({ canvas: "F0SCRIPT" }, {} as never);
+
+    expect(result).toMatchObject({ ok: false, canvas_id: "F0SCRIPT" });
+    expect((result as { error: string }).error).toContain("Canvas document");
   });
 });
