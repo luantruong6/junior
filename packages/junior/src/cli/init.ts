@@ -56,6 +56,37 @@ function writeVercelJson(targetDir: string): void {
   );
 }
 
+function writeGitHubWorkflow(targetDir: string): void {
+  const workflowDir = path.join(targetDir, ".github", "workflows");
+  fs.mkdirSync(workflowDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(workflowDir, "ci.yml"),
+    `name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - run: pnpm build
+`,
+  );
+}
+
 export async function runInit(
   dir: string,
   log: (line: string) => void = console.log,
@@ -158,6 +189,7 @@ SENTRY_ORG_SLUG=
   writeNitroConfig(target);
   writeViteConfig(target);
   writeVercelJson(target);
+  writeGitHubWorkflow(target);
 
   log(`Created ${name} at ${target}`);
   log("");
