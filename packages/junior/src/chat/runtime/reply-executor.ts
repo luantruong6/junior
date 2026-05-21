@@ -61,12 +61,12 @@ import { buildDeterministicTurnId } from "@/chat/runtime/turn";
 import { markTurnCompleted, markTurnFailed } from "@/chat/runtime/turn";
 import { startActiveTurn } from "@/chat/runtime/turn";
 import { isRedundantReactionAckText } from "@/chat/services/reply-delivery-plan";
-import { deleteSlackMessage } from "@/chat/slack/outbound";
+import { deleteSlackMessage, postSlackMessage } from "@/chat/slack/outbound";
 import {
   finalizeFailedTurnReply,
   getAgentTurnDiagnosticsAttributes,
 } from "@/chat/services/turn-failure-response";
-import { buildTurnContinuationResponse } from "@/chat/services/turn-continuation-response";
+import { buildSlackTurnContinuationNotice } from "@/chat/slack/turn-continuation-notice";
 import { buildAuthPauseResponse } from "@/chat/services/auth-pause-response";
 import { maybeApplyProviderDefaultConfigRequest } from "@/chat/services/provider-default-config";
 
@@ -232,9 +232,22 @@ export function createReplyToThread(deps: ReplyExecutorDeps) {
         const postTurnContinuationNotice = async (): Promise<void> => {
           try {
             await beforeFirstResponsePost();
-            await thread.post(
-              buildSlackOutputMessage(buildTurnContinuationResponse()),
-            );
+            const notice = buildSlackTurnContinuationNotice({ conversationId });
+            const shouldUseSlackFooter =
+              Boolean(notice.blocks?.length) &&
+              Boolean(channelId && threadTs) &&
+              (thread.adapter as { name?: string } | undefined)?.name ===
+                "slack";
+            if (shouldUseSlackFooter && channelId && threadTs) {
+              await postSlackMessage({
+                channelId,
+                threadTs,
+                ...notice,
+              });
+              return;
+            }
+
+            await thread.post(buildSlackOutputMessage(notice.text));
           } catch (error) {
             logException(
               error,

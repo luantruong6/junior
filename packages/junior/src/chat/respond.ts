@@ -81,11 +81,12 @@ import {
   toAgentThinkingLevel,
   type TurnThinkingSelection,
 } from "@/chat/services/turn-thinking-level";
-import type { AgentTurnUsage } from "@/chat/usage";
+import { hasAgentTurnUsage, type AgentTurnUsage } from "@/chat/usage";
 import {
   loadTurnCheckpoint,
   persistCompletedCheckpoint,
   persistAuthPauseCheckpoint,
+  persistRunningCheckpoint,
   persistTimeoutCheckpoint,
 } from "@/chat/services/turn-checkpoint";
 import { createMcpAuthOrchestration } from "@/chat/services/mcp-auth-orchestration";
@@ -183,6 +184,16 @@ function trimRouterAttachmentText(text: string): string {
   return normalized.length <= MAX_ROUTER_ATTACHMENT_PREVIEW_CHARS
     ? normalized
     : `${normalized.slice(0, MAX_ROUTER_ATTACHMENT_PREVIEW_CHARS)}...`;
+}
+
+function extractSliceUsage(
+  messages: PiMessage[],
+  beforeMessageCount: number,
+): AgentTurnUsage | undefined {
+  const usage = extractGenAiUsageSummary(
+    ...messages.slice(beforeMessageCount).filter(isAssistantMessage),
+  );
+  return hasAgentTurnUsage(usage) ? usage : undefined;
 }
 
 function supportsRouterTextPreview(mediaType: string): boolean {
@@ -394,6 +405,14 @@ export async function generateAssistantReply(
   let timedOut = false;
   let turnUsage: AgentTurnUsage | undefined;
   let thinkingSelection: TurnThinkingSelection | undefined;
+  const checkpointLogContext = {
+    threadId: context.correlation?.threadId,
+    requesterId: context.correlation?.requesterId,
+    channelId: context.correlation?.channelId,
+    runId: context.correlation?.runId,
+    assistantUserName: botConfig.userName,
+    modelId: botConfig.modelId,
+  };
 
   const getSandboxMetadata = () =>
     sandboxExecutor
@@ -917,8 +936,31 @@ export async function generateAssistantReply(
     });
     let hasEmittedText = false;
     let needsSeparator = false;
+    const persistSafeBoundary = async (
+      messages: PiMessage[],
+    ): Promise<void> => {
+      if (
+        !checkpointState.canUseTurnSession ||
+        !sessionConversationId ||
+        !sessionId
+      ) {
+        return;
+      }
+
+      await persistRunningCheckpoint({
+        conversationId: sessionConversationId,
+        sessionId,
+        sliceId: currentSliceId,
+        messages,
+        loadedSkillNames: loadedSkillNamesForResume,
+        logContext: checkpointLogContext,
+      });
+    };
 
     const unsubscribe = agent.subscribe((event) => {
+      if (event.type === "turn_end" && event.toolResults.length > 0) {
+        return persistSafeBoundary([...agent!.state.messages]);
+      }
       if (event.type === "message_start") {
         Promise.resolve(context.onAssistantMessageStart?.()).catch((error) => {
           logWarn(
@@ -977,13 +1019,20 @@ export async function generateAssistantReply(
         spanContext,
         async () => {
           let promptResult: unknown;
+          const freshPromptMessage: PiMessage = {
+            role: "user",
+            content: promptContentParts,
+            timestamp: Date.now(),
+          } as PiMessage;
+          if (!resumedFromCheckpoint) {
+            await persistSafeBoundary([
+              ...agent.state.messages,
+              freshPromptMessage,
+            ]);
+          }
           const promptPromise = resumedFromCheckpoint
             ? agent.continue()
-            : agent.prompt({
-                role: "user",
-                content: promptContentParts,
-                timestamp: Date.now(),
-              });
+            : agent.prompt(freshPromptMessage);
 
           let timeoutId: ReturnType<typeof setTimeout> | undefined;
           const timeoutPromise = new Promise<never>((_, reject) => {
@@ -1044,9 +1093,7 @@ export async function generateAssistantReply(
             agent.state,
             ...outputMessages,
           );
-          turnUsage = Object.values(usageSummary).some(
-            (value) => value !== undefined,
-          )
+          turnUsage = hasAgentTurnUsage(usageSummary)
             ? usageSummary
             : undefined;
           setSpanAttributes({
@@ -1082,10 +1129,13 @@ export async function generateAssistantReply(
     ) {
       await persistCompletedCheckpoint({
         conversationId: sessionConversationId,
+        currentDurationMs: Date.now() - replyStartedAtMs,
+        currentUsage: turnUsage,
         sessionId,
         sliceId: currentSliceId,
         allMessages: agent.state.messages,
         loadedSkillNames: activeSkills.map((skill) => skill.name),
+        logContext: checkpointLogContext,
       });
     }
 
@@ -1114,21 +1164,19 @@ export async function generateAssistantReply(
     });
   } catch (error) {
     if (timedOut && timeoutResumeConversationId && timeoutResumeSessionId) {
+      turnUsage =
+        turnUsage ??
+        extractSliceUsage(timeoutResumeMessages, beforeMessageCount);
       const checkpoint = await persistTimeoutCheckpoint({
         conversationId: timeoutResumeConversationId,
         sessionId: timeoutResumeSessionId,
         currentSliceId: timeoutResumeSliceId,
+        currentDurationMs: Date.now() - replyStartedAtMs,
+        currentUsage: turnUsage,
         messages: timeoutResumeMessages,
         loadedSkillNames: loadedSkillNamesForResume,
         errorMessage: error instanceof Error ? error.message : String(error),
-        logContext: {
-          threadId: context.correlation?.threadId,
-          requesterId: context.correlation?.requesterId,
-          channelId: context.correlation?.channelId,
-          runId: context.correlation?.runId,
-          assistantUserName: botConfig.userName,
-          modelId: botConfig.modelId,
-        },
+        logContext: checkpointLogContext,
       });
       if (checkpoint) {
         throw new RetryableTurnError(
@@ -1151,36 +1199,21 @@ export async function generateAssistantReply(
       timeoutResumeSessionId
     ) {
       if (!turnUsage && timeoutResumeMessages.length > 0) {
-        // Match the canonical slice-scoped extraction: sum usage from new
-        // assistant messages produced during this slice, not the full
-        // message history (which may include prior slices whose usage was
-        // already reported in earlier footers).
-        const fallbackUsage = extractGenAiUsageSummary(
-          ...timeoutResumeMessages
-            .slice(beforeMessageCount)
-            .filter(isAssistantMessage),
+        turnUsage = extractSliceUsage(
+          timeoutResumeMessages,
+          beforeMessageCount,
         );
-        turnUsage = Object.values(fallbackUsage).some(
-          (value) => value !== undefined,
-        )
-          ? fallbackUsage
-          : undefined;
       }
       const nextSliceId = await persistAuthPauseCheckpoint({
         conversationId: timeoutResumeConversationId,
         sessionId: timeoutResumeSessionId,
         currentSliceId: timeoutResumeSliceId,
+        currentDurationMs: Date.now() - replyStartedAtMs,
+        currentUsage: turnUsage,
         messages: timeoutResumeMessages,
         loadedSkillNames: loadedSkillNamesForResume,
         errorMessage: error.message,
-        logContext: {
-          threadId: context.correlation?.threadId,
-          requesterId: context.correlation?.requesterId,
-          channelId: context.correlation?.channelId,
-          runId: context.correlation?.runId,
-          assistantUserName: botConfig.userName,
-          modelId: botConfig.modelId,
-        },
+        logContext: checkpointLogContext,
       });
       throw new RetryableTurnError(
         error.kind === "plugin" ? "plugin_auth_resume" : "mcp_auth_resume",

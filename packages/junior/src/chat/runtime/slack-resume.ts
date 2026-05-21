@@ -15,7 +15,6 @@ import {
   finalizeFailedTurnReply,
   requireTurnFailureEventId,
 } from "@/chat/services/turn-failure-response";
-import { buildTurnContinuationResponse } from "@/chat/services/turn-continuation-response";
 import { persistThreadStateById } from "@/chat/runtime/thread-state";
 import {
   createSlackWebApiAssistantStatusSession,
@@ -27,7 +26,10 @@ import {
   postSlackApiReplyPosts,
 } from "@/chat/slack/reply";
 import { postSlackMessage as postSlackApiMessage } from "@/chat/slack/outbound";
+import { buildSlackTurnContinuationNotice } from "@/chat/slack/turn-continuation-notice";
 import { getStateAdapter } from "@/chat/state/adapter";
+import { getAgentTurnSessionCheckpoint } from "@/chat/state/turn-session-store";
+import { addAgentTurnUsage } from "@/chat/usage";
 import {
   startSlackProcessingReactionForMessage,
   type ProcessingReactionSession,
@@ -172,11 +174,15 @@ async function postTurnContinuationNoticeBestEffort(args: {
   lockKey: string;
   resumeArgs: ResumeSlackTurnArgs;
 }): Promise<void> {
+  const notice = buildSlackTurnContinuationNotice({
+    conversationId:
+      args.resumeArgs.replyContext?.correlation?.conversationId ?? args.lockKey,
+  });
   try {
     await postSlackApiMessage({
       channelId: args.resumeArgs.channelId,
       threadTs: args.resumeArgs.threadTs,
-      text: buildTurnContinuationResponse(),
+      ...notice,
     });
   } catch (error) {
     logException(
@@ -311,6 +317,14 @@ export async function resumeSlackTurn(args: ResumeSlackTurnArgs) {
 
     const generateReply = args.generateReply ?? generateAssistantReply;
     const replyContext = createResumeReplyContext(args, status);
+    const priorCheckpoint =
+      replyContext.correlation?.conversationId &&
+      replyContext.correlation?.turnId
+        ? await getAgentTurnSessionCheckpoint(
+            replyContext.correlation.conversationId,
+            replyContext.correlation.turnId,
+          )
+        : undefined;
     const replyPromise = generateReply(args.messageText, replyContext);
     const replyTimeoutMs = resolveReplyTimeoutMs(args.replyTimeoutMs);
     let reply =
@@ -339,9 +353,18 @@ export async function resumeSlackTurn(args: ResumeSlackTurnArgs) {
     await status.stop();
     const footer = buildSlackReplyFooter({
       conversationId: args.replyContext?.correlation?.conversationId ?? lockKey,
-      durationMs: reply.diagnostics.durationMs,
+      durationMs:
+        typeof priorCheckpoint?.cumulativeDurationMs === "number" ||
+        typeof reply.diagnostics.durationMs === "number"
+          ? (priorCheckpoint?.cumulativeDurationMs ?? 0) +
+            (reply.diagnostics.durationMs ?? 0)
+          : undefined,
       thinkingLevel: reply.diagnostics.thinkingLevel,
-      usage: reply.diagnostics.usage,
+      usage:
+        addAgentTurnUsage(
+          priorCheckpoint?.cumulativeUsage,
+          reply.diagnostics.usage,
+        ) ?? reply.diagnostics.usage,
     });
     await postSlackApiReplyPosts({
       channelId: args.channelId,
