@@ -3,7 +3,7 @@
 ## Metadata
 
 - Created: 2026-02-25
-- Last Edited: 2026-05-11
+- Last Edited: 2026-05-21
 
 ## Changelog
 
@@ -14,7 +14,9 @@
 - 2026-04-06: Added official GenAI finish-reasons, system-instructions, and tool-description tracing attributes.
 - 2026-04-28: Added MCP tool-call span attributes from the OpenTelemetry MCP semantic conventions.
 - 2026-05-01: Added `gen_ai.conversation.id` as required correlation context for GenAI spans when available.
+- 2026-05-06: Documented the `gen_ai.invoke_agent` / `gen_ai.chat` span hierarchy rule.
 - 2026-05-11: Aligned exception details and GenAI cache token counters with OpenTelemetry 1.41.0.
+- 2026-05-21: Added error status rule for failed gen_ai.chat spans; extended traced streamFn coverage to the advisor agent loop.
 
 ## Status
 
@@ -183,6 +185,15 @@ semantic conventions:
 
 - Sandbox spans should be nested under `ai.generate_assistant_reply` when invoked during reply generation.
 - Sandbox execution spans should be nested under the active tool-call/request span context.
+
+### GenAI Span Hierarchy
+
+- A `gen_ai.invoke_agent` span MUST have at least one `gen_ai.chat` child covering the LLM call(s) issued during its agent loop.
+- A `gen_ai.chat` span MAY appear at the top level (as a sibling of `gen_ai.invoke_agent`, or under a non-`gen_ai.*` parent such as `chat.route_thinking`) only when it represents an LLM call that is independent of an agent loop, for example a routing or classification pre-flight.
+- Every `gen_ai.chat` span MUST carry `gen_ai.input.messages` and `gen_ai.output.messages`.
+- The parent `gen_ai.invoke_agent` MAY also carry `gen_ai.input.messages` / `gen_ai.output.messages` as a high-level rollup; this is optional.
+- A `gen_ai.chat` span MUST have its status set to error (code 2) when the underlying LLM call fails — either because `streamFn` itself throws or because the returned stream rejects.
+- The per-iteration `gen_ai.chat` child span is created in `packages/junior/src/chat/pi/traced-stream.ts` via the `streamFn` injected into `pi-agent-core`'s `Agent`. This applies to both the main agent and the advisor agent.
 
 ## Rollout Guidance
 
