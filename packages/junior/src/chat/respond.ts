@@ -68,6 +68,7 @@ import {
   encodeNonImageAttachmentForPrompt,
   getSessionIdentifiers,
   isAssistantMessage,
+  refreshRuntimeTurnContext,
   summarizeMessageText,
   toObservablePromptPart,
   upsertActiveSkill,
@@ -298,92 +299,6 @@ function buildUserTurnInput(args: {
   }
 
   return { routerBlocks, userContentParts };
-}
-
-function refreshCheckpointTurnContext(
-  messages: PiMessage[],
-  turnContextPrompt: string,
-): PiMessage[] {
-  // Resumes need fresh runtime facts without duplicating the original user turn.
-  const marker = getTurnContextMarker(turnContextPrompt);
-  for (let index = 0; index < messages.length; index += 1) {
-    const content = getUserMessageContent(messages[index]);
-    if (!content) {
-      continue;
-    }
-    const contextIndex = content.findIndex((part) =>
-      isTurnContextPart(part, marker),
-    );
-    if (contextIndex < 0) {
-      continue;
-    }
-
-    const updatedMessages = [...messages];
-    const updatedContent = [...content];
-    updatedContent[contextIndex] = {
-      ...(updatedContent[contextIndex] as object),
-      text: turnContextPrompt,
-    };
-    updatedMessages[index] = {
-      ...messages[index],
-      content: updatedContent,
-    } as PiMessage;
-    return updatedMessages;
-  }
-
-  return [
-    ...messages,
-    {
-      role: "user",
-      content: [{ type: "text", text: turnContextPrompt }],
-      timestamp: Date.now(),
-    } as PiMessage,
-  ];
-}
-
-function stripTurnContextFromMessages(
-  messages: PiMessage[],
-  turnContextPrompt: string,
-): PiMessage[] {
-  const marker = getTurnContextMarker(turnContextPrompt);
-  return messages.flatMap((message) => {
-    const content = getUserMessageContent(message);
-    if (!content) {
-      return [message];
-    }
-
-    const strippedContent = content.filter(
-      (part) => !isTurnContextPart(part, marker),
-    );
-    if (strippedContent.length === content.length) {
-      return [message];
-    }
-    if (strippedContent.length === 0) {
-      return [];
-    }
-    return [{ ...message, content: strippedContent } as PiMessage];
-  });
-}
-
-function getTurnContextMarker(turnContextPrompt: string): string {
-  return turnContextPrompt.split("\n", 1)[0];
-}
-
-function getUserMessageContent(message: PiMessage): unknown[] | undefined {
-  const record = message as { role?: unknown; content?: unknown };
-  return record.role === "user" && Array.isArray(record.content)
-    ? record.content
-    : undefined;
-}
-
-function isTurnContextPart(part: unknown, marker: string): boolean {
-  return (
-    part !== null &&
-    typeof part === "object" &&
-    (part as { type?: unknown }).type === "text" &&
-    typeof (part as { text?: unknown }).text === "string" &&
-    (part as { text: string }).text.startsWith(marker)
-  );
 }
 
 /** Run a full agent turn: discover skills, execute tools, and return the assistant reply. */
@@ -1007,7 +922,7 @@ export async function generateAssistantReply(
     beforeMessageCount = agent.state.messages.length;
     try {
       if (resumedFromCheckpoint) {
-        agent.state.messages = refreshCheckpointTurnContext(
+        agent.state.messages = refreshRuntimeTurnContext(
           existingCheckpoint!.piMessages,
           turnContextPrompt,
         );
@@ -1124,7 +1039,6 @@ export async function generateAssistantReply(
       unsubscribe();
     }
 
-    // ── Persist completed checkpoint ─────────────────────────────────
     if (
       checkpointState.canUseTurnSession &&
       sessionConversationId &&
@@ -1145,10 +1059,6 @@ export async function generateAssistantReply(
     // ── Build turn result ────────────────────────────────────────────
     return buildTurnResult({
       newMessages,
-      piMessages: stripTurnContextFromMessages(
-        agent.state.messages,
-        turnContextPrompt,
-      ),
       userInput,
       replyFiles,
       artifactStatePatch,

@@ -50,8 +50,10 @@ import { publishAppHomeView } from "@/chat/slack/app-home";
 import { getSlackClient } from "@/chat/slack/client";
 import { getStateAdapter } from "@/chat/state/adapter";
 import { coerceThreadArtifactsState } from "@/chat/state/artifacts";
-import { getAgentTurnSessionCheckpoint } from "@/chat/state/turn-session-store";
-import { supersedeAgentTurnSessionCheckpoint } from "@/chat/state/turn-session-store";
+import {
+  getAgentTurnSessionCheckpoint,
+  supersedeAgentTurnSessionCheckpoint,
+} from "@/chat/state/turn-session-store";
 import {
   applyPendingAuthUpdate,
   clearPendingAuth,
@@ -125,9 +127,6 @@ async function persistCompletedOAuthReplyState(args: {
       replied: true,
     },
   });
-  if (args.reply.piMessages) {
-    conversation.piMessages = args.reply.piMessages;
-  }
   markTurnCompleted({
     conversation,
     nowMs: Date.now(),
