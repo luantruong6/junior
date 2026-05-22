@@ -43,11 +43,20 @@ For a new app, you usually do not need to hand-create routes or runtime wrapper 
 
 Copy values into your local env file. The scaffold includes `.env.example` with the core runtime variables.
 
+Generate `JUNIOR_SECRET` once, then paste the output into your local and production environments:
+
+```bash
+node -e "console.log(require('node:crypto').randomBytes(32).toString('base64url'))"
+```
+
+Keep this value private and stable for the deployment. Junior uses it to sign internal resume callbacks and sandbox requester context.
+
 Required:
 
 - `SLACK_SIGNING_SECRET`
 - `SLACK_BOT_TOKEN`
 - `REDIS_URL`
+- `JUNIOR_SECRET`
 
 Recommended:
 
@@ -164,11 +173,18 @@ Run `pnpm check` after updating Junior or plugin packages to validate local app 
 
 ### Configure production environment
 
+Use the same `JUNIOR_SECRET` generation command if you have not already created one:
+
+```bash
+node -e "console.log(require('node:crypto').randomBytes(32).toString('base64url'))"
+```
+
 Required:
 
 - `SLACK_SIGNING_SECRET`
 - `SLACK_BOT_TOKEN` (or `SLACK_BOT_USER_TOKEN`)
 - `REDIS_URL`
+- `JUNIOR_SECRET`
 
 Also required for build-time snapshot warmup:
 
