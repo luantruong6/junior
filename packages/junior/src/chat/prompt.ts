@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { botConfig, getRuntimeMetadata } from "@/chat/config";
+import { botConfig } from "@/chat/config";
 import { TURN_CONTEXT_TAG } from "@/chat/turn-context-tag";
 import {
   listReferenceFiles,
@@ -171,7 +171,7 @@ function formatSkillEntry(skill: SkillMetadata): string[] {
 function formatAvailableSkillsForPrompt(
   skills: SkillMetadata[],
   invocation: SkillInvocation | null,
-): string {
+): string | null {
   const autoSelectable = skills.filter(
     (s) => s.disableModelInvocation !== true,
   );
@@ -184,20 +184,18 @@ function formatAvailableSkillsForPrompt(
 
   const sections: string[] = [];
 
-  // Available skills: model may load these when they match the request.
-  const available = [
-    "<available-skills>",
-    ...(autoSelectable.length > 0
-      ? [
-          "Scan before answering. Load the most specific matching skill; do not answer from memory when a skill fits. If none fits, do not load a skill.",
-        ]
-      : []),
-  ];
-  for (const skill of autoSelectable) {
-    available.push(...formatSkillEntry(skill));
+  if (autoSelectable.length > 0) {
+    // Available skills: model may load these when they match the request.
+    const available = [
+      "<available-skills>",
+      "Scan before answering. Load the most specific matching skill; do not answer from memory when a skill fits. If none fits, do not load a skill.",
+    ];
+    for (const skill of autoSelectable) {
+      available.push(...formatSkillEntry(skill));
+    }
+    available.push("</available-skills>");
+    sections.push(available.join("\n"));
   }
-  available.push("</available-skills>");
-  sections.push(available.join("\n"));
 
   // User-callable skills: model must not auto-select these.
   if (invokedExplicitOnly.length > 0) {
@@ -212,12 +210,12 @@ function formatAvailableSkillsForPrompt(
     sections.push(userCallable.join("\n"));
   }
 
-  return sections.join("\n");
+  return sections.length > 0 ? sections.join("\n") : null;
 }
 
-function formatLoadedSkillsForPrompt(skills: Skill[]): string {
+function formatLoadedSkillsForPrompt(skills: Skill[]): string | null {
   if (skills.length === 0) {
-    return "<loaded-skills>\n</loaded-skills>";
+    return null;
   }
 
   const lines = ["<loaded-skills>"];
@@ -379,23 +377,6 @@ function formatConfigurationLines(
   );
 }
 
-function formatSlackCapabilityNames(
-  capabilities:
-    | {
-        canAddReactions?: boolean;
-        canCreateCanvas?: boolean;
-        canPostToChannel?: boolean;
-      }
-    | undefined,
-): string {
-  const names = [
-    capabilities?.canCreateCanvas ? "canvas_create" : "",
-    capabilities?.canPostToChannel ? "channel_post" : "",
-    capabilities?.canAddReactions ? "reaction_add" : "",
-  ].filter(Boolean);
-  return names.length > 0 ? names.join(", ") : "none";
-}
-
 const HEADER =
   "You are a Slack-based helper assistant. Follow the personality block for voice and tone in every reply. The behavior and output blocks define platform mechanics and override personality only when those mechanics conflict.";
 
@@ -500,31 +481,19 @@ function buildIdentitySection(): string {
 }
 
 function buildRuntimeSection(params: {
-  channelId?: string;
-  fastModelId?: string;
-  modelId?: string;
-  slackCapabilities?: {
-    canAddReactions?: boolean;
-    canCreateCanvas?: boolean;
-    canPostToChannel?: boolean;
-  };
-  thinkingLevel?: string;
-}): string {
+  conversationId?: string;
+  traceId?: string;
+}): string | null {
   const lines = [
-    `- version: ${escapeXml(getRuntimeMetadata().version ?? "unknown")}`,
-    params.modelId ? `- model: ${escapeXml(params.modelId)}` : "",
-    params.fastModelId ? `- fast_model: ${escapeXml(params.fastModelId)}` : "",
-    params.thinkingLevel
-      ? `- thinking: ${escapeXml(params.thinkingLevel)}`
+    params.conversationId
+      ? `- gen_ai.conversation.id: ${escapeXml(params.conversationId)}`
       : "",
-    params.channelId ? "- channel: slack" : "",
-    params.channelId
-      ? `- slack_capabilities: ${escapeXml(
-          formatSlackCapabilityNames(params.slackCapabilities),
-        )}`
-      : "",
-    `- sandbox_workspace: ${escapeXml(SANDBOX_WORKSPACE_ROOT)}`,
+    params.traceId ? `- trace_id: ${escapeXml(params.traceId)}` : "",
   ].filter(Boolean);
+
+  if (lines.length === 0) {
+    return null;
+  }
 
   return renderTagBlock("runtime", lines.join("\n"));
 }
@@ -535,7 +504,7 @@ function buildContextSection(params: {
   configuration?: Record<string, unknown>;
   invocation: SkillInvocation | null;
   turnState?: "fresh" | "resumed";
-}): string {
+}): string | null {
   const blocks: string[][] = [];
 
   if (JUNIOR_WORLD) {
@@ -593,6 +562,10 @@ function buildContextSection(params: {
   }
 
   const body = blocks.map((block) => block.join("\n")).join("\n\n");
+  if (!body) {
+    return null;
+  }
+
   return renderTagBlock("context", body);
 }
 
@@ -602,12 +575,20 @@ function buildCapabilitiesSection(params: {
   activeMcpCatalogs: ActiveMcpCatalogSummary[];
   invocation: SkillInvocation | null;
   toolGuidance?: ToolPromptContext[];
-}): string {
+}): string | null {
   const blocks: string[] = [];
-  blocks.push(
-    formatAvailableSkillsForPrompt(params.availableSkills, params.invocation),
+  const availableSkills = formatAvailableSkillsForPrompt(
+    params.availableSkills,
+    params.invocation,
   );
-  blocks.push(formatLoadedSkillsForPrompt(params.activeSkills));
+  if (availableSkills) {
+    blocks.push(availableSkills);
+  }
+
+  const loadedSkills = formatLoadedSkillsForPrompt(params.activeSkills);
+  if (loadedSkills) {
+    blocks.push(loadedSkills);
+  }
 
   const activeCatalogs = formatActiveMcpCatalogsForPrompt(
     params.activeMcpCatalogs,
@@ -626,6 +607,10 @@ function buildCapabilitiesSection(params: {
     blocks.push(renderTagBlock("providers", providerCatalog));
   }
 
+  if (blocks.length === 0) {
+    return null;
+  }
+
   return renderTagBlock("capabilities", blocks.join("\n\n"));
 }
 
@@ -635,15 +620,8 @@ type TurnContextPromptInput = {
   activeMcpCatalogs?: ActiveMcpCatalogSummary[];
   toolGuidance?: ToolPromptContext[];
   runtime?: {
-    channelId?: string;
-    fastModelId?: string;
-    modelId?: string;
-    slackCapabilities?: {
-      canAddReactions?: boolean;
-      canCreateCanvas?: boolean;
-      canPostToChannel?: boolean;
-    };
-    thinkingLevel?: string;
+    conversationId?: string;
+    traceId?: string;
   };
   invocation: SkillInvocation | null;
   requester?: {
@@ -702,7 +680,7 @@ export function buildTurnContextPrompt(params: TurnContextPromptInput): string {
     }),
     buildRuntimeSection(params.runtime ?? {}),
     `</${TURN_CONTEXT_TAG}>`,
-  ];
+  ].filter((section): section is string => Boolean(section));
 
   return sections.join("\n\n");
 }

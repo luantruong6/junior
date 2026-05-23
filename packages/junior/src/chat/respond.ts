@@ -556,10 +556,6 @@ export async function generateAssistantReply(
     const userTurnText = buildUserTurnText(
       userInput,
       promptConversationContext,
-      {
-        sessionContext: { conversationId: sessionConversationId },
-        turnContext: { traceId: getActiveTraceId() },
-      },
     );
     const { routerBlocks, userContentParts } = buildUserTurnInput({
       omittedImageAttachmentCount: context.omittedImageAttachmentCount ?? 0,
@@ -770,11 +766,8 @@ export async function generateAssistantReply(
       activeMcpCatalogs,
       toolGuidance,
       runtime: {
-        channelId: toolChannelId,
-        fastModelId: botConfig.fastModelId,
-        modelId: botConfig.modelId,
-        slackCapabilities: channelCapabilities,
-        thinkingLevel: thinkingSelection.thinkingLevel,
+        conversationId: spanContext.conversationId,
+        traceId: getActiveTraceId(),
       },
       invocation: skillInvocation,
       requester: context.requester,

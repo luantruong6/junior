@@ -18,9 +18,8 @@ describe("prompt builders", () => {
       invocation: null,
       requester: { userId: "U_ALPHA" },
       runtime: {
-        channelId: "C_ALPHA",
-        modelId: "model-alpha",
-        thinkingLevel: "medium",
+        conversationId: "conversation-alpha",
+        traceId: "trace-alpha",
       },
       turnState: "fresh",
     });
@@ -40,9 +39,7 @@ describe("prompt builders", () => {
       invocation: null,
       requester: { userId: "U_BETA" },
       runtime: {
-        channelId: "C_BETA",
-        modelId: "model-beta",
-        thinkingLevel: "high",
+        conversationId: "conversation-beta",
       },
       turnState: "resumed",
     });
@@ -55,6 +52,17 @@ describe("prompt builders", () => {
     expect(firstTurnContext).not.toContain("<assistant>");
     expect(firstTurnContext).not.toContain("<thread-participants>");
     expect(firstTurnContext).toContain("<requester>");
+    expect(firstTurnContext).toContain(
+      "- gen_ai.conversation.id: conversation-alpha",
+    );
+    expect(firstTurnContext).toContain("- trace_id: trace-alpha");
+    expect(firstTurnContext).not.toContain("- model:");
+    expect(firstTurnContext).not.toContain("- fast_model:");
+    expect(firstTurnContext).not.toContain("- channel:");
+    expect(firstTurnContext).not.toContain("- slack_capabilities:");
+    expect(firstTurnContext).not.toContain("- thinking:");
+    expect(firstTurnContext).not.toContain("- sandbox_workspace:");
+    expect(firstSystemPrompt).not.toContain("trace-alpha");
     expect(buildSystemPrompt()).toBe(firstSystemPrompt);
   });
 
@@ -68,6 +76,9 @@ describe("prompt builders", () => {
     });
 
     expect(turnContext).not.toContain("<requester>");
+    expect(turnContext).not.toContain("<context>");
+    expect(turnContext).not.toContain("<capabilities>");
+    expect(turnContext).not.toContain("<runtime>");
   });
 
   it("puts tool guidance in turn context, not the static system prompt", () => {

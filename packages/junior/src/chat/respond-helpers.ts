@@ -149,62 +149,28 @@ export function summarizeMessageText(text: string): string {
 }
 
 /**
- * Wrap the current user turn with self-describing marker blocks: background
- * first, current instruction last. Ordering matches long-context attention
- * guidance for Sonnet and GPT-5.
+ * Put prior thread text before the current instruction when no Pi history
+ * exists. These are top-level sibling blocks in the user message.
  */
 export function buildUserTurnText(
   userInput: string,
   conversationContext?: string,
-  metadata?: {
-    sessionContext?: { conversationId?: string };
-    turnContext?: { traceId?: string };
-  },
 ): string {
   const trimmedContext = conversationContext?.trim();
-  const conversationId = metadata?.sessionContext?.conversationId;
-  const traceId = metadata?.turnContext?.traceId;
 
-  if (!trimmedContext && !conversationId && !traceId) {
+  if (!trimmedContext) {
     return userInput;
   }
 
-  const sections: string[] = [];
-
-  if (trimmedContext) {
-    sections.push(
-      "<thread-background>",
-      trimmedContext,
-      "</thread-background>",
-      "",
-    );
-  }
-
-  if (conversationId) {
-    sections.push(
-      "<session-context>",
-      `- gen_ai.conversation.id: ${conversationId}`,
-      "</session-context>",
-      "",
-    );
-  }
-
-  if (traceId) {
-    sections.push(
-      "<turn-context>",
-      `- trace_id: ${traceId}`,
-      "</turn-context>",
-      "",
-    );
-  }
-
-  sections.push(
-    '<current-instruction priority="highest">',
+  return [
+    "<thread-background>",
+    trimmedContext,
+    "</thread-background>",
+    "",
+    "<current-instruction>",
     userInput,
     "</current-instruction>",
-  );
-
-  return sections.join("\n");
+  ].join("\n");
 }
 
 /** Encode a non-image attachment as base64 XML for the prompt. */
