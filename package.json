@@ -35,16 +35,26 @@
   "pnpm": {
     "peerDependencyRules": {
       "allowedVersions": {
+        "bash-tool>just-bash": ">=2.9.3",
         "vitest-evals>ai": ">=4",
         "vitest-evals>zod": ">=3"
       }
+    },
+    "overrides": {
+      "ai": "6.0.190",
+      "@swc/core": "1.15.33",
+      "linkify-it": "5.0.0",
+      "tinyexec": "1.1.2",
+      "tldts": "7.0.30",
+      "ws": "8.20.1",
+      "yaml": "^2.9.0"
     }
   },
   "devDependencies": {
-    "agent-browser": "^0.26.0",
-    "lint-staged": "^16.4.0",
+    "agent-browser": "^0.27.0",
+    "lint-staged": "^17.0.5",
     "prettier": "^3.8.3",
     "simple-git-hooks": "^2.13.1",
-    "tsx": "^4.21.0"
+    "tsx": "^4.22.3"
   }
 }
