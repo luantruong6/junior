@@ -8,7 +8,6 @@ import {
   worldPathCandidates,
 } from "@/chat/discovery";
 import { logInfo, logWarn } from "@/chat/logging";
-import { getPluginProviders } from "@/chat/plugins/registry";
 import { slackOutputPolicy } from "@/chat/slack/output";
 import {
   SANDBOX_DATA_ROOT,
@@ -161,9 +160,6 @@ function formatSkillEntry(skill: SkillMetadata): string[] {
   lines.push(`    <name>${escapeXml(skill.name)}</name>`);
   lines.push(`    <description>${escapeXml(skill.description)}</description>`);
   lines.push(`    <location>${escapeXml(skillLocation)}</location>`);
-  if (skill.pluginProvider) {
-    lines.push(`    <provider>${escapeXml(skill.pluginProvider)}</provider>`);
-  }
   lines.push("  </skill>");
   return lines;
 }
@@ -232,37 +228,6 @@ function formatLoadedSkillsForPrompt(skills: Skill[]): string | null {
     lines.push("  </skill>");
   }
   lines.push("</loaded-skills>");
-  return lines.join("\n");
-}
-
-function formatProviderCatalogForPrompt(): string | null {
-  const providers = getPluginProviders().map((plugin) => plugin.manifest);
-  if (providers.length === 0) {
-    return null;
-  }
-
-  const lines = [
-    "Config keys and default targets per provider; use after a skill is loaded. Run authenticated provider commands directly after resolving target defaults; let the runtime handle auth pauses/resumes.",
-  ];
-  for (const provider of providers) {
-    lines.push(`- provider: ${escapeXml(provider.name)}`);
-    lines.push(
-      `  - config_keys: ${
-        provider.configKeys.length > 0
-          ? escapeXml(provider.configKeys.join(", "))
-          : "none"
-      }`,
-    );
-    lines.push(
-      `  - default_context: ${
-        provider.target
-          ? escapeXml(
-              `${provider.target.type} via ${provider.target.configKey}`,
-            )
-          : "none"
-      }`,
-    );
-  }
   return lines.join("\n");
 }
 
@@ -465,7 +430,7 @@ function buildOutputSection(): string {
   return [
     openTag,
     "- Start with the answer or result, not internal process narration.",
-    "- Use Slack-flavored Markdown: **bold** section labels, `code`, [text](url) links, bullet lists, and fenced code blocks. No tables. When the answer primarily lists several URLs, show each URL bare instead of as a labeled link.",
+    "- Use Slack-flavored Markdown: **bold** section labels, `code`, [text](url) links, bullet lists, and fenced code blocks. No hash-prefixed headings and no tables. When the answer primarily lists several URLs, show each URL bare instead of as a labeled link.",
     "- Keep replies brief and scannable; use bullets or short code blocks when helpful, and one compact thread reply when it fits.",
     "- When a research or document-style answer would benefit from continuation, multiple sections, or future reference value, create a Slack canvas and keep the thread reply to one or two short sentences plus the link; do not recap the canvas contents.",
     "- Unless a successful Slack side-effect tool intentionally satisfied the request by itself, end every turn with a final user-facing markdown response.",
@@ -600,11 +565,6 @@ function buildCapabilitiesSection(params: {
   const toolGuidance = formatToolGuidanceForPrompt(params.toolGuidance ?? []);
   if (toolGuidance) {
     blocks.push(renderTagBlock("tool-guidance", toolGuidance));
-  }
-
-  const providerCatalog = formatProviderCatalogForPrompt();
-  if (providerCatalog) {
-    blocks.push(renderTagBlock("providers", providerCatalog));
   }
 
   if (blocks.length === 0) {

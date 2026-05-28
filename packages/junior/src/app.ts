@@ -12,11 +12,14 @@ import {
   setAgentPlugins,
   validateAgentPlugins,
 } from "@/chat/plugins/agent-hooks";
+import { createSchedulerPlugin } from "@/chat/scheduler/plugin";
 import type { PluginConfig } from "@/chat/plugins/types";
 import type { JuniorPlugin } from "@sentry/junior-plugin-api";
 import { GET as diagnosticsGET } from "@/handlers/diagnostics";
 import { GET as dashboardGET } from "@/handlers/diagnostics-dashboard";
 import { GET as healthGET } from "@/handlers/health";
+import { POST as agentDispatchPOST } from "@/handlers/agent-dispatch";
+import { GET as heartbeatGET } from "@/handlers/heartbeat";
 import { GET as mcpOauthCallbackGET } from "@/handlers/mcp-oauth-callback";
 import { GET as oauthCallbackGET } from "@/handlers/oauth-callback";
 import {
@@ -176,9 +179,10 @@ function pluginConfigFromAgentPlugins(
 /** Create a Hono app with all Junior routes. */
 export async function createApp(options?: JuniorAppOptions): Promise<Hono> {
   const configuredPlugins = options?.plugins;
-  const agentPlugins = isJuniorPluginArray(configuredPlugins)
-    ? configuredPlugins
-    : [];
+  const agentPlugins = [
+    createSchedulerPlugin(),
+    ...(isJuniorPluginArray(configuredPlugins) ? configuredPlugins : []),
+  ];
   const pluginConfig = isJuniorPluginArray(configuredPlugins)
     ? mergePluginConfig(
         await resolveVirtualPluginConfig(),
@@ -241,6 +245,14 @@ export async function createApp(options?: JuniorAppOptions): Promise<Hono> {
 
   app.post("/api/internal/turn-resume", (c) => {
     return turnResumePOST(c.req.raw, waitUntil);
+  });
+
+  app.post("/api/internal/agent-dispatch", (c) => {
+    return agentDispatchPOST(c.req.raw, waitUntil);
+  });
+
+  app.get("/api/internal/heartbeat", (c) => {
+    return heartbeatGET(c.req.raw, waitUntil);
   });
 
   app.post("/api/webhooks/:platform", (c) => {

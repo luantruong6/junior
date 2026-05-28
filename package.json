@@ -3,7 +3,7 @@
   "private": true,
   "packageManager": "pnpm@10.33.0",
   "scripts": {
-    "dev": "node scripts/dev-with-root-env.mjs",
+    "dev": "node scripts/dev-server.mjs",
     "dev:env": "pnpx vercel env pull .env.local --environment=development && pnpm run cloudflare:token",
     "cli": "node scripts/cli-with-root-env.mjs",
     "cloudflare:token": "node scripts/refresh-cloudflare-tunnel-token.mjs",
@@ -22,7 +22,7 @@
     "test:watch": "pnpm --filter @sentry/junior test:watch",
     "evals": "pnpm --filter @sentry/junior-evals evals",
     "evals:record": "pnpm --filter @sentry/junior-evals evals:record",
-    "typecheck": "pnpm --filter @sentry/junior typecheck && pnpm --filter @sentry/junior-example typecheck",
+    "typecheck": "pnpm --filter @sentry/junior typecheck && pnpm --filter @sentry/junior-testing typecheck && pnpm --filter @sentry/junior-example typecheck",
     "skills:check": "pnpm --filter @sentry/junior skills:check"
   },
   "simple-git-hooks": {

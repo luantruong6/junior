@@ -4,6 +4,7 @@ import {
   PluginAuthorizationPauseError,
   PluginCredentialFailureError,
 } from "@/chat/services/plugin-auth-orchestration";
+import { AuthorizationFlowDisabledError } from "@/chat/services/auth-pause";
 import type { Skill } from "@/chat/skills";
 
 const {
@@ -141,6 +142,63 @@ describe("createPluginAuthOrchestration", () => {
       "sentry",
       userTokenStore,
     );
+  });
+
+  it("returns a deterministic error instead of starting oauth when authorization is disabled", async () => {
+    startOAuthFlow.mockResolvedValue({
+      ok: true,
+      delivery: { channelId: "D123" },
+    });
+    const abortAgent = vi.fn();
+    const userTokenStore = {} as any;
+    const orchestration = createPluginAuthOrchestration(
+      {
+        requesterId: "U123",
+        userMessage: "check Sentry",
+        userTokenStore,
+        authorizationFlowMode: "disabled",
+      },
+      abortAgent,
+    );
+
+    await expect(
+      orchestration.handleCommandFailure({
+        activeSkill: sentrySkill,
+        command: "sentry issue list",
+        details: {
+          exit_code: 1,
+          stderr: "junior-auth-required provider=sentry",
+        },
+      }),
+    ).rejects.toBeInstanceOf(AuthorizationFlowDisabledError);
+
+    expect(startOAuthFlow).not.toHaveBeenCalled();
+    expect(unlinkProvider).not.toHaveBeenCalled();
+    expect(abortAgent).not.toHaveBeenCalled();
+  });
+
+  it("blocks oauth recovery when authorization is disabled and no requester is present", async () => {
+    const orchestration = createPluginAuthOrchestration(
+      {
+        userMessage: "<scheduled-task-run />",
+        authorizationFlowMode: "disabled",
+      },
+      vi.fn(),
+    );
+
+    await expect(
+      orchestration.handleCommandFailure({
+        activeSkill: sentrySkill,
+        command: "sentry issue list",
+        details: {
+          exit_code: 1,
+          stderr: "junior-auth-required provider=sentry",
+        },
+      }),
+    ).rejects.toBeInstanceOf(AuthorizationFlowDisabledError);
+
+    expect(startOAuthFlow).not.toHaveBeenCalled();
+    expect(unlinkProvider).not.toHaveBeenCalled();
   });
 
   it("unlinks the stored token only after oauth restart is launched", async () => {

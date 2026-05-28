@@ -38,6 +38,8 @@ export interface LogContext {
   slackUserName?: string;
   slackChannelId?: string;
   runId?: string;
+  actorType?: string;
+  actorId?: string;
   assistantUserName?: string;
   modelId?: string;
   skillName?: string;
@@ -382,6 +384,8 @@ function contextToAttributes(context: LogContext): LogAttributes {
     "enduser.id": context.slackUserId,
     "enduser.pseudo.id": context.slackUserName,
     "app.run.id": context.runId,
+    "app.actor.type": context.actorType,
+    "app.actor.id": context.actorId,
     "gen_ai.agent.name": context.assistantUserName,
     "gen_ai.request.model": context.modelId,
     "app.skill.name": context.skillName,
@@ -797,6 +801,14 @@ function numericConsoleToken(
   return typeof value === "number" ? `${label}=${value}` : undefined;
 }
 
+function stringConsoleToken(
+  label: string,
+  value: AttributeValue | undefined,
+): string | undefined {
+  const normalized = toOptionalString(value);
+  return normalized ? `${label}=${normalized}` : undefined;
+}
+
 function booleanConsoleToken(
   label: string,
   value: AttributeValue | undefined,
@@ -827,7 +839,9 @@ function getPrettyConsoleSummaryTokens(
   );
   pushPrettyConsoleToken(
     tokens,
-    toOptionalString(attributes["app.plugin.name"]) ?? undefined,
+    eventName.startsWith("trusted_plugin_heartbeat")
+      ? stringConsoleToken("plugin", attributes["app.plugin.name"])
+      : (toOptionalString(attributes["app.plugin.name"]) ?? undefined),
   );
   pushPrettyConsoleToken(
     tokens,
@@ -844,6 +858,10 @@ function getPrettyConsoleSummaryTokens(
   pushPrettyConsoleToken(
     tokens,
     numericConsoleToken("plugins", attributes["app.plugin.count"]),
+  );
+  pushPrettyConsoleToken(
+    tokens,
+    numericConsoleToken("dispatches", attributes["app.dispatch.count"]),
   );
   pushPrettyConsoleToken(
     tokens,

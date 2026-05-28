@@ -102,7 +102,11 @@ import {
 } from "@/chat/services/turn-checkpoint";
 import { createMcpAuthOrchestration } from "@/chat/services/mcp-auth-orchestration";
 import { createPluginAuthOrchestration } from "@/chat/services/plugin-auth-orchestration";
-import { AuthorizationPauseError } from "@/chat/services/auth-pause";
+import {
+  AuthorizationFlowDisabledError,
+  AuthorizationPauseError,
+  type AuthorizationFlowMode,
+} from "@/chat/services/auth-pause";
 
 // Re-export types for backward compatibility with existing consumers.
 export type { AssistantReply, AgentTurnDiagnostics };
@@ -127,14 +131,18 @@ export interface ReplyRequestContext {
     turnId?: string;
     runId?: string;
     channelId?: string;
+    teamId?: string;
     messageTs?: string;
     threadTs?: string;
     requesterId?: string;
+    actorType?: string;
+    actorId?: string;
   };
   toolChannelId?: string;
   conversationContext?: string;
   artifactState?: ThreadArtifactsState;
   pendingAuth?: ConversationPendingAuthState;
+  authorizationFlowMode?: AuthorizationFlowMode;
   configuration?: Record<string, unknown>;
   /** Durable Pi transcript for this conversation, excluding ephemeral turn context. */
   piMessages?: PiMessage[];
@@ -342,6 +350,8 @@ export async function generateAssistantReply(
     requesterId: context.correlation?.requesterId,
     channelId: context.correlation?.channelId,
     runId: context.correlation?.runId,
+    actorType: context.correlation?.actorType,
+    actorId: context.correlation?.actorId,
     assistantUserName: botConfig.userName,
     modelId: botConfig.modelId,
   };
@@ -369,6 +379,8 @@ export async function generateAssistantReply(
       slackUserId: context.correlation?.requesterId,
       slackChannelId: context.correlation?.channelId,
       runId: context.correlation?.runId,
+      actorType: context.correlation?.actorType,
+      actorId: context.correlation?.actorId,
       assistantUserName: botConfig.userName,
       modelId: botConfig.modelId,
     };
@@ -632,6 +644,7 @@ export async function generateAssistantReply(
         getMergedArtifactState: () =>
           mergeArtifactsState(context.artifactState ?? {}, artifactStatePatch),
         onPendingAuth: context.onAuthPending,
+        authorizationFlowMode: context.authorizationFlowMode,
       },
       () => agent?.abort(),
     );
@@ -646,6 +659,7 @@ export async function generateAssistantReply(
         channelConfiguration: context.channelConfiguration,
         currentPendingAuth: context.pendingAuth,
         onPendingAuth: context.onAuthPending,
+        authorizationFlowMode: context.authorizationFlowMode,
         userTokenStore,
       },
       () => agent?.abort(),
@@ -667,6 +681,8 @@ export async function generateAssistantReply(
       slackUserId: context.correlation?.requesterId,
       slackChannelId: context.correlation?.channelId,
       runId: context.correlation?.runId,
+      actorType: context.correlation?.actorType,
+      actorId: context.correlation?.actorId,
       assistantUserName: botConfig.userName,
       modelId: botConfig.modelId,
     });
@@ -738,6 +754,8 @@ export async function generateAssistantReply(
       {
         channelId: toolChannelId,
         channelCapabilities,
+        requester: context.requester,
+        teamId: context.correlation?.teamId,
         messageTs: context.correlation?.messageTs,
         threadTs: context.correlation?.threadTs,
         userText: userInput,
@@ -1203,6 +1221,9 @@ export async function generateAssistantReply(
     if (isRetryableTurnError(error)) {
       throw error;
     }
+    if (error instanceof AuthorizationFlowDisabledError) {
+      throw error;
+    }
 
     logException(
       error,
@@ -1212,6 +1233,8 @@ export async function generateAssistantReply(
         slackUserId: context.correlation?.requesterId,
         slackChannelId: context.correlation?.channelId,
         runId: context.correlation?.runId,
+        actorType: context.correlation?.actorType,
+        actorId: context.correlation?.actorId,
         assistantUserName: botConfig.userName,
         modelId: botConfig.modelId,
       },

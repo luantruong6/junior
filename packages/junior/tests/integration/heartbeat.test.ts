@@ -1,0 +1,677 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { defineJuniorPlugin } from "@sentry/junior-plugin-api";
+import { createHeartbeatContext } from "@/chat/agent-dispatch/context";
+import { recoverStaleDispatches } from "@/chat/agent-dispatch/heartbeat";
+import { createSchedulerPlugin } from "@/chat/scheduler/plugin";
+import { createStateSchedulerStore } from "@/chat/scheduler/store";
+import type { ScheduledTask } from "@/chat/scheduler/types";
+import {
+  createOrGetDispatch,
+  getDispatchRecord,
+  getDispatchStorageKey,
+  listIncompleteDispatchIds,
+  updateDispatchRecord,
+  withDispatchLock,
+} from "@/chat/agent-dispatch/store";
+import type { DispatchRecord } from "@/chat/agent-dispatch/types";
+import { disconnectStateAdapter, getStateAdapter } from "@/chat/state/adapter";
+import { setAgentPlugins } from "@/chat/plugins/agent-hooks";
+import { GET as heartbeat } from "@/handlers/heartbeat";
+import type { WaitUntilFn } from "@/handlers/types";
+
+vi.hoisted(() => {
+  process.env.JUNIOR_STATE_ADAPTER = "memory";
+});
+
+const TEST_NOW_MS = Date.parse("2026-05-26T12:05:00.000Z");
+const TEST_RUN_AT_MS = Date.parse("2026-05-26T12:00:00.000Z");
+
+function collectWaitUntil(tasks: Promise<unknown>[]): WaitUntilFn {
+  return (task) => {
+    tasks.push(typeof task === "function" ? task() : task);
+  };
+}
+
+function createTask(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
+  const nextRunAtMs = TEST_RUN_AT_MS;
+  return {
+    id: "sched_plugin_1",
+    createdAtMs: nextRunAtMs,
+    createdBy: { slackUserId: "U123" },
+    destination: {
+      platform: "slack",
+      teamId: "T123",
+      channelId: "C123",
+    },
+    nextRunAtMs,
+    schedule: {
+      description: "Once at noon",
+      kind: "one_off",
+      timezone: "UTC",
+    },
+    status: "active",
+    task: {
+      title: "Digest",
+      objective: "Post a digest.",
+      instructions: ["Summarize the latest state."],
+    },
+    updatedAtMs: nextRunAtMs,
+    version: 1,
+    ...overrides,
+  };
+}
+
+function createDailyTask(
+  overrides: Partial<ScheduledTask> = {},
+): ScheduledTask {
+  const nextRunAtMs = Date.parse("2026-05-24T12:00:00.000Z");
+  return createTask({
+    id: "sched_plugin_daily",
+    createdAtMs: nextRunAtMs,
+    nextRunAtMs,
+    schedule: {
+      description: "Daily at noon UTC",
+      kind: "recurring",
+      timezone: "UTC",
+      recurrence: {
+        frequency: "daily",
+        interval: 1,
+        startDate: "2026-05-24",
+        time: {
+          hour: 12,
+          minute: 0,
+        },
+      },
+    },
+    updatedAtMs: nextRunAtMs,
+    ...overrides,
+  });
+}
+
+describe("trusted plugin heartbeat", () => {
+  const originalFetch = global.fetch;
+
+  beforeEach(async () => {
+    vi.useFakeTimers({ now: TEST_NOW_MS });
+    process.env.JUNIOR_SCHEDULER_SECRET = "heartbeat-secret";
+    process.env.JUNIOR_BASE_URL = "https://junior.example.com";
+    process.env.JUNIOR_SECRET = "dispatch-secret";
+    setAgentPlugins([]);
+    await disconnectStateAdapter();
+  });
+
+  afterEach(async () => {
+    global.fetch = originalFetch;
+    setAgentPlugins([]);
+    await disconnectStateAdapter();
+    delete process.env.JUNIOR_SCHEDULER_SECRET;
+    delete process.env.CRON_SECRET;
+    delete process.env.JUNIOR_BASE_URL;
+    delete process.env.JUNIOR_SECRET;
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it("rejects unauthenticated heartbeat requests", async () => {
+    const waitUntilTasks: Promise<unknown>[] = [];
+    const response = await heartbeat(
+      new Request("https://example.invalid/api/internal/heartbeat"),
+      collectWaitUntil(waitUntilTasks),
+    );
+
+    expect(response.status).toBe(401);
+    expect(waitUntilTasks).toHaveLength(0);
+  });
+
+  it("runs trusted plugin heartbeat hooks", async () => {
+    const seen: number[] = [];
+    setAgentPlugins([
+      defineJuniorPlugin({
+        name: "scheduler",
+        hooks: {
+          heartbeat(ctx) {
+            seen.push(ctx.nowMs);
+          },
+        },
+      }),
+    ]);
+    const waitUntilTasks: Promise<unknown>[] = [];
+    const response = await heartbeat(
+      new Request("https://example.invalid/api/internal/heartbeat", {
+        headers: { authorization: "Bearer heartbeat-secret" },
+      }),
+      collectWaitUntil(waitUntilTasks),
+    );
+
+    expect(response.status).toBe(202);
+    await Promise.all(waitUntilTasks);
+    expect(seen).toHaveLength(1);
+  });
+
+  it("scopes dispatch lookup to the plugin that created it", async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response("Accepted", { status: 202 });
+    });
+    global.fetch = fetchMock as typeof fetch;
+
+    const schedulerCtx = createHeartbeatContext({
+      plugin: "scheduler",
+      nowMs: Date.parse("2026-05-26T12:00:00.000Z"),
+    });
+    const result = await schedulerCtx.agent.dispatch({
+      idempotencyKey: "run-1",
+      destination: {
+        platform: "slack",
+        teamId: "T123",
+        channelId: "C123",
+      },
+      input: "Run the scheduled task.",
+      metadata: { runId: "run-1" },
+    });
+
+    await expect(schedulerCtx.agent.get(result.id)).resolves.toEqual({
+      id: result.id,
+      status: "pending",
+    });
+    await expect(
+      createHeartbeatContext({
+        plugin: "other-plugin",
+        nowMs: Date.parse("2026-05-26T12:00:00.000Z"),
+      }).agent.get(result.id),
+    ).resolves.toBeUndefined();
+
+    await expect(getDispatchRecord(result.id)).resolves.toMatchObject({
+      input: "Run the scheduled task.",
+      destination: { channelId: "C123" },
+      metadata: { runId: "run-1" },
+    });
+  });
+
+  it("keeps plugin state isolated when plugin names and keys contain delimiters", async () => {
+    const first = createHeartbeatContext({
+      plugin: "scheduler",
+      nowMs: Date.parse("2026-05-26T12:00:00.000Z"),
+    });
+    const second = createHeartbeatContext({
+      plugin: "scheduler:run",
+      nowMs: Date.parse("2026-05-26T12:00:00.000Z"),
+    });
+
+    await first.state.set("run:1", "first");
+    await second.state.set("1", "second");
+
+    await expect(first.state.get("run:1")).resolves.toBe("first");
+    await expect(second.state.get("1")).resolves.toBe("second");
+  });
+
+  it("bounds dispatch fanout from one heartbeat context", async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response("Accepted", { status: 202 });
+    });
+    global.fetch = fetchMock as typeof fetch;
+
+    const ctx = createHeartbeatContext({
+      plugin: "scheduler",
+      nowMs: Date.parse("2026-05-26T12:00:00.000Z"),
+    });
+
+    for (let index = 0; index < 25; index += 1) {
+      await ctx.agent.dispatch({
+        idempotencyKey: `run-${index}`,
+        destination: {
+          platform: "slack",
+          teamId: "T123",
+          channelId: "C123",
+        },
+        input: "Run the scheduled task.",
+      });
+    }
+
+    await expect(
+      ctx.agent.dispatch({
+        idempotencyKey: "run-over-limit",
+        destination: {
+          platform: "slack",
+          teamId: "T123",
+          channelId: "C123",
+        },
+        input: "Run the scheduled task.",
+      }),
+    ).rejects.toThrow("Plugin heartbeat exceeded the dispatch limit");
+  });
+
+  it("does not count invalid dispatch requests against heartbeat fanout", async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response("Accepted", { status: 202 });
+    });
+    global.fetch = fetchMock as typeof fetch;
+
+    const ctx = createHeartbeatContext({
+      plugin: "scheduler",
+      nowMs: Date.parse("2026-05-26T12:00:00.000Z"),
+    });
+
+    for (let index = 0; index < 25; index += 1) {
+      await expect(
+        ctx.agent.dispatch({
+          idempotencyKey: `invalid-${index}`,
+          destination: {
+            platform: "slack",
+            teamId: "not-a-team",
+            channelId: "C123",
+          },
+          input: "Run the scheduled task.",
+        }),
+      ).rejects.toThrow("Dispatch destination teamId must be a Slack team id");
+    }
+
+    await expect(
+      ctx.agent.dispatch({
+        idempotencyKey: "valid-after-invalid",
+        destination: {
+          platform: "slack",
+          teamId: "T123",
+          channelId: "C123",
+        },
+        input: "Run the scheduled task.",
+      }),
+    ).resolves.toMatchObject({ status: "created" });
+  });
+
+  it("fails stale dispatches that exceed retry attempts", async () => {
+    const created = await createOrGetDispatch({
+      plugin: "scheduler",
+      nowMs: Date.parse("2026-05-26T12:00:00.000Z"),
+      options: {
+        idempotencyKey: "run-exhausted",
+        destination: {
+          platform: "slack",
+          teamId: "T123",
+          channelId: "C123",
+        },
+        input: "Run the scheduled task.",
+      },
+    });
+    await withDispatchLock(created.record.id, async (state) => {
+      const record = await state.get<DispatchRecord>(
+        getDispatchStorageKey(created.record.id),
+      );
+      if (!record) {
+        throw new Error("Expected dispatch record to exist");
+      }
+      await updateDispatchRecord(state, {
+        ...record,
+        attempt: record.maxAttempts,
+        lastCallbackAtMs: Date.parse("2026-05-26T12:00:00.000Z"),
+      });
+    });
+
+    await expect(
+      recoverStaleDispatches({
+        nowMs: Date.parse("2026-05-26T12:05:00.000Z"),
+      }),
+    ).resolves.toBe(0);
+    await expect(getDispatchRecord(created.record.id)).resolves.toMatchObject({
+      status: "failed",
+      errorMessage: "Dispatch exceeded retry attempts.",
+    });
+  });
+
+  it("removes terminal dispatches from the recovery index", async () => {
+    const created = await createOrGetDispatch({
+      plugin: "scheduler",
+      nowMs: Date.parse("2026-05-26T12:00:00.000Z"),
+      options: {
+        idempotencyKey: "run-terminal-index",
+        destination: {
+          platform: "slack",
+          teamId: "T123",
+          channelId: "C123",
+        },
+        input: "Run the scheduled task.",
+      },
+    });
+
+    await expect(listIncompleteDispatchIds()).resolves.toContain(
+      created.record.id,
+    );
+
+    await withDispatchLock(created.record.id, async (state) => {
+      const record = await state.get<DispatchRecord>(
+        getDispatchStorageKey(created.record.id),
+      );
+      if (!record) {
+        throw new Error("missing dispatch record");
+      }
+      await updateDispatchRecord(state, {
+        ...record,
+        status: "completed",
+      });
+    });
+
+    await expect(listIncompleteDispatchIds()).resolves.not.toContain(
+      created.record.id,
+    );
+  });
+
+  it("does not fail an active leased dispatch that reached max attempts", async () => {
+    const created = await createOrGetDispatch({
+      plugin: "scheduler",
+      nowMs: Date.parse("2026-05-26T12:00:00.000Z"),
+      options: {
+        idempotencyKey: "run-active-max-attempts",
+        destination: {
+          platform: "slack",
+          teamId: "T123",
+          channelId: "C123",
+        },
+        input: "Run the scheduled task.",
+      },
+    });
+    await withDispatchLock(created.record.id, async (state) => {
+      const record = await state.get<DispatchRecord>(
+        getDispatchStorageKey(created.record.id),
+      );
+      if (!record) {
+        throw new Error("Expected dispatch record to exist");
+      }
+      await updateDispatchRecord(state, {
+        ...record,
+        attempt: record.maxAttempts,
+        lastCallbackAtMs: Date.parse("2026-05-26T12:00:00.000Z"),
+        leaseExpiresAtMs: Date.parse("2026-05-26T12:10:00.000Z"),
+        status: "running",
+      });
+    });
+
+    await expect(
+      recoverStaleDispatches({
+        nowMs: Date.parse("2026-05-26T12:05:00.000Z"),
+      }),
+    ).resolves.toBe(0);
+    await expect(getDispatchRecord(created.record.id)).resolves.toMatchObject({
+      status: "running",
+      attempt: created.record.maxAttempts,
+    });
+  });
+
+  it("dispatches and reconciles scheduled runs from the scheduler plugin", async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response("Accepted", { status: 202 });
+    });
+    global.fetch = fetchMock as typeof fetch;
+    setAgentPlugins([createSchedulerPlugin()]);
+    const store = createStateSchedulerStore();
+    await store.saveTask(createTask());
+
+    const firstWaitUntilTasks: Promise<unknown>[] = [];
+    const firstResponse = await heartbeat(
+      new Request("https://example.invalid/api/internal/heartbeat", {
+        headers: { authorization: "Bearer heartbeat-secret" },
+      }),
+      collectWaitUntil(firstWaitUntilTasks),
+    );
+    expect(firstResponse.status).toBe(202);
+    await Promise.all(firstWaitUntilTasks);
+
+    const running = await store.getRun(`sched_plugin_1:${TEST_RUN_AT_MS}`);
+    expect(running).toMatchObject({
+      status: "running",
+      dispatchId: expect.any(String),
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await withDispatchLock(running!.dispatchId!, async (state) => {
+      const record = await state.get<DispatchRecord>(
+        getDispatchStorageKey(running!.dispatchId!),
+      );
+      if (!record) {
+        throw new Error("Expected dispatch record to exist");
+      }
+      await updateDispatchRecord(state, {
+        ...record,
+        resultMessageTs: "1700000000.000001",
+        status: "completed",
+      });
+    });
+
+    const secondWaitUntilTasks: Promise<unknown>[] = [];
+    const secondResponse = await heartbeat(
+      new Request("https://example.invalid/api/internal/heartbeat", {
+        headers: { authorization: "Bearer heartbeat-secret" },
+      }),
+      collectWaitUntil(secondWaitUntilTasks),
+    );
+    expect(secondResponse.status).toBe(202);
+    await Promise.all(secondWaitUntilTasks);
+
+    await expect(store.getRun(running!.id)).resolves.toMatchObject({
+      status: "completed",
+      resultMessageTs: "1700000000.000001",
+    });
+    await expect(store.getTask("sched_plugin_1")).resolves.toMatchObject({
+      lastRunAtMs: Date.parse("2026-05-26T12:00:00.000Z"),
+      status: "paused",
+    });
+  });
+
+  it("fails scheduled runs when their dispatch record disappeared", async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response("Accepted", { status: 202 });
+    });
+    global.fetch = fetchMock as typeof fetch;
+    setAgentPlugins([createSchedulerPlugin()]);
+    const store = createStateSchedulerStore();
+    await store.saveTask(createTask());
+
+    const firstWaitUntilTasks: Promise<unknown>[] = [];
+    const firstResponse = await heartbeat(
+      new Request("https://example.invalid/api/internal/heartbeat", {
+        headers: { authorization: "Bearer heartbeat-secret" },
+      }),
+      collectWaitUntil(firstWaitUntilTasks),
+    );
+    expect(firstResponse.status).toBe(202);
+    await Promise.all(firstWaitUntilTasks);
+
+    const running = await store.getRun(`sched_plugin_1:${TEST_RUN_AT_MS}`);
+    expect(running).toMatchObject({
+      status: "running",
+      dispatchId: expect.any(String),
+    });
+    const state = getStateAdapter();
+    await state.connect();
+    await state.delete(getDispatchStorageKey(running!.dispatchId!));
+
+    const secondWaitUntilTasks: Promise<unknown>[] = [];
+    const secondResponse = await heartbeat(
+      new Request("https://example.invalid/api/internal/heartbeat", {
+        headers: { authorization: "Bearer heartbeat-secret" },
+      }),
+      collectWaitUntil(secondWaitUntilTasks),
+    );
+    expect(secondResponse.status).toBe(202);
+    await Promise.all(secondWaitUntilTasks);
+
+    await expect(store.getRun(running!.id)).resolves.toMatchObject({
+      status: "failed",
+      errorMessage: "Scheduled task dispatch record is missing.",
+    });
+    await expect(store.getTask("sched_plugin_1")).resolves.toMatchObject({
+      status: "paused",
+    });
+  });
+
+  it("blocks malformed scheduled tasks without stopping the scheduler plugin heartbeat", async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response("Accepted", { status: 202 });
+    });
+    global.fetch = fetchMock as typeof fetch;
+    setAgentPlugins([createSchedulerPlugin()]);
+    const store = createStateSchedulerStore();
+    await store.saveTask({
+      ...createTask(),
+      id: "sched_plugin_malformed",
+      task: {
+        title: "Digest",
+        objective: undefined,
+        instructions: ["Summarize the latest state."],
+      } as unknown as ScheduledTask["task"],
+    });
+
+    const waitUntilTasks: Promise<unknown>[] = [];
+    const response = await heartbeat(
+      new Request("https://example.invalid/api/internal/heartbeat", {
+        headers: { authorization: "Bearer heartbeat-secret" },
+      }),
+      collectWaitUntil(waitUntilTasks),
+    );
+    expect(response.status).toBe(202);
+    await Promise.all(waitUntilTasks);
+
+    await expect(
+      store.getRun(`sched_plugin_malformed:${TEST_RUN_AT_MS}`),
+    ).resolves.toMatchObject({
+      status: "blocked",
+      errorMessage: expect.stringContaining(
+        "Scheduled task prompt could not be built",
+      ),
+    });
+    await expect(
+      store.getTask("sched_plugin_malformed"),
+    ).resolves.toMatchObject({
+      status: "blocked",
+      statusReason: expect.stringContaining(
+        "Scheduled task prompt could not be built",
+      ),
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("blocks scheduled runs with invalid dispatch destinations without stopping the heartbeat", async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response("Accepted", { status: 202 });
+    });
+    global.fetch = fetchMock as typeof fetch;
+    setAgentPlugins([createSchedulerPlugin()]);
+    const store = createStateSchedulerStore();
+    await store.saveTask({
+      ...createTask(),
+      id: "sched_plugin_bad_destination",
+      destination: {
+        platform: "slack",
+        teamId: "D_BAD_TEAM",
+        channelId: "D123",
+      },
+    });
+
+    const waitUntilTasks: Promise<unknown>[] = [];
+    const response = await heartbeat(
+      new Request("https://example.invalid/api/internal/heartbeat", {
+        headers: { authorization: "Bearer heartbeat-secret" },
+      }),
+      collectWaitUntil(waitUntilTasks),
+    );
+    expect(response.status).toBe(202);
+    await Promise.all(waitUntilTasks);
+
+    await expect(
+      store.getRun(`sched_plugin_bad_destination:${TEST_RUN_AT_MS}`),
+    ).resolves.toMatchObject({
+      status: "blocked",
+      errorMessage: expect.stringContaining(
+        "Scheduled task dispatch could not be created",
+      ),
+    });
+    await expect(
+      store.getTask("sched_plugin_bad_destination"),
+    ).resolves.toMatchObject({
+      status: "blocked",
+      statusReason: expect.stringContaining(
+        "Scheduled task dispatch could not be created",
+      ),
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("skips old recurring occurrences and advances to the next future run", async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response("Accepted", { status: 202 });
+    });
+    global.fetch = fetchMock as typeof fetch;
+    setAgentPlugins([createSchedulerPlugin()]);
+    const store = createStateSchedulerStore();
+    const task = createDailyTask();
+    await store.saveTask(task);
+
+    const waitUntilTasks: Promise<unknown>[] = [];
+    const response = await heartbeat(
+      new Request("https://example.invalid/api/internal/heartbeat", {
+        headers: { authorization: "Bearer heartbeat-secret" },
+      }),
+      collectWaitUntil(waitUntilTasks),
+    );
+    expect(response.status).toBe(202);
+    await Promise.all(waitUntilTasks);
+
+    await expect(
+      store.getRun(`${task.id}:${task.nextRunAtMs}`),
+    ).resolves.toMatchObject({
+      status: "skipped",
+      errorMessage: expect.stringContaining("more than 24 hours late"),
+    });
+    await expect(store.getTask(task.id)).resolves.toMatchObject({
+      status: "active",
+      nextRunAtMs: Date.parse("2026-05-27T12:00:00.000Z"),
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("dedupes equivalent old recurring tasks during heartbeat recovery", async () => {
+    const fetchMock = vi.fn(async () => {
+      return new Response("Accepted", { status: 202 });
+    });
+    global.fetch = fetchMock as typeof fetch;
+    setAgentPlugins([createSchedulerPlugin()]);
+    const store = createStateSchedulerStore();
+    const first = createDailyTask({
+      id: "sched_plugin_duplicate_a",
+      createdAtMs: Date.parse("2026-05-24T12:00:00.000Z"),
+    });
+    const duplicate = createDailyTask({
+      id: "sched_plugin_duplicate_b",
+      createdAtMs: Date.parse("2026-05-24T12:00:01.000Z"),
+    });
+    await store.saveTask(first);
+    await store.saveTask(duplicate);
+
+    const waitUntilTasks: Promise<unknown>[] = [];
+    const response = await heartbeat(
+      new Request("https://example.invalid/api/internal/heartbeat", {
+        headers: { authorization: "Bearer heartbeat-secret" },
+      }),
+      collectWaitUntil(waitUntilTasks),
+    );
+    expect(response.status).toBe(202);
+    await Promise.all(waitUntilTasks);
+
+    await expect(
+      store.getRun(`${duplicate.id}:${duplicate.nextRunAtMs}`),
+    ).resolves.toMatchObject({
+      status: "skipped",
+      errorMessage: expect.stringContaining(
+        "Duplicate stale scheduled task was skipped",
+      ),
+    });
+    await expect(store.getTask(first.id)).resolves.toMatchObject({
+      status: "active",
+      nextRunAtMs: Date.parse("2026-05-27T12:00:00.000Z"),
+    });
+    await expect(store.getTask(duplicate.id)).resolves.toMatchObject({
+      status: "paused",
+      nextRunAtMs: undefined,
+      statusReason: expect.stringContaining(first.id),
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});

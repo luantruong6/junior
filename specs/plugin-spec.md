@@ -3,7 +3,7 @@
 ## Metadata
 
 - Created: 2026-03-01
-- Last Edited: 2026-05-20
+- Last Edited: 2026-05-26
 
 ## Changelog
 
@@ -26,6 +26,7 @@
 - 2026-05-12: Clarified that credentialed provider HTTP traffic is authenticated through the sandbox egress proxy.
 - 2026-05-20: Added `PluginConfig` manifests for install-level plugin configuration.
 - 2026-05-25: Added explicit trusted app plugin registration for deterministic agent behavior at Junior-owned lifecycle boundaries.
+- 2026-05-26: Clarified that plugin-specific agent behavior must surface through skills, tools, schemas, and tool guidance, not core prompt/plugin catalog prose.
 
 ## Status
 
@@ -65,6 +66,7 @@ Define a plugin model where provider integrations are self-contained manifests t
 8. `loadSkill` activates the provider catalog and returns provider/count metadata once the MCP server is connected and `listTools` succeeds. If connection/listing needs MCP OAuth, `loadSkill` initiates the MCP auth pause and the resumed turn re-activates the catalog before the model continues. `searchMcpTools` returns focused descriptors, including input/output schema and annotations, for any available active-provider tool before `callMcpTool` executes it.
 9. Runtime setup belongs to `plugin.yaml`: CLI packages, system packages, postinstall commands, MCP endpoints/tool allowlists, credential delivery, command env, OAuth, and provider config keys are manifest declarations, not skill instructions.
 10. Skills consume the plugin-provided runtime surface. They must not instruct the agent to install packages, bootstrap CLIs, configure MCP servers, create credentials, or repair sandbox package installation as part of normal workflow.
+11. The core prompt must not teach the agent about specific installed plugins, provider names, plugin config keys, default targets, or plugin workflows. Model-visible plugin behavior must arrive through dynamic capability surfaces: skill names/descriptions, loaded skill bodies, native tool descriptions, tool schemas, `promptSnippet`, `promptGuidelines`, and searched MCP tool descriptors.
 
 ## Plugin directory structure
 
@@ -480,13 +482,7 @@ All existing functions (`getCapabilityProvider`, `isKnownCapability`, etc.) work
 for (const plugin of getPluginProviders()) {
   const { apiHeaders, commandEnv, credentials, name } = plugin.manifest;
   if (!credentials && !apiHeaders) continue;
-  brokersByProvider[name] = useTestBroker
-    ? new TestCredentialBroker({
-        provider: name,
-        // token-backed credentials add domains/env placeholder; header-only
-        // plugins add header transforms and optional command env.
-      })
-    : createPluginBroker(name, { userTokenStore });
+  brokersByProvider[name] = createPluginBroker(name, { userTokenStore });
 }
 ```
 
@@ -504,9 +500,12 @@ export function getOAuthProviderConfig(
 
 The OAuth callback route uses `getOAuthProviderConfig()` instead of accessing `OAUTH_PROVIDERS` directly.
 
-### Test credential override
+### Test and eval credentials
 
-`TestCredentialBroker` substitution in eval mode works the same — `factory.ts` checks `EVAL_ENABLE_TEST_CREDENTIALS=1` and substitutes regardless of source. For plugin-level `api-headers`, eval mode injects deterministic dummy header values instead of resolving deployment env vars. Plugin-level `command-env` resolves through the same non-secret command env path as production.
+Tests and evals seed credentials through the same stores and plugin env vars used
+by production paths. Sandbox HTTP fixtures may intercept credential-injected
+requests at the egress proxy boundary, but core broker selection does not switch
+to test-only credential behavior.
 
 ### Install-wide config defaults
 
@@ -532,6 +531,8 @@ Resolution precedence (highest wins):
 Plugin skills use the same `SKILL.md` format and frontmatter contract as existing skills.
 
 ### Skill/runtime boundary
+
+Plugin prompt behavior must be local to the capability that needs it. Plugin-backed skills may describe provider-specific workflows after the skill is loaded. Trusted plugin tools must have concise descriptions and, when needed, tool guidance that tells the agent when to use the tool, what not to target, and which user confirmation or context is required. The host must not add plugin-specific rescue rules to the core prompt to compensate for weak plugin descriptions.
 
 Plugin-backed skills may tell the model how to use available commands, MCP tools, command env, config defaults, and provider-specific query syntax. They may include troubleshooting for unavailable runtime surfaces only as diagnosis and escalation, for example “report that the GitHub plugin runtime dependency is unavailable.”
 
@@ -593,7 +594,6 @@ All existing security invariants from `security-policy.md` are preserved:
 | `CredentialBroker` interface and `CredentialLease` type | Shared contract                                |
 | `ProviderCredentialRouter`                              | Generic router                                 |
 | OAuth callback route (`/api/oauth/callback/[provider]`) | Shared HTTP handler                            |
-| `TestCredentialBroker`                                  | Eval infrastructure, not a plugin              |
 
 ## Example: adding a new provider (Linear)
 

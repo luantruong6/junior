@@ -19,6 +19,17 @@ export interface AgentPluginDecision {
   replaceInput(input: Record<string, unknown>): void;
 }
 
+export interface AgentPluginLogger {
+  error(message: string, metadata?: Record<string, unknown>): void;
+  info(message: string, metadata?: Record<string, unknown>): void;
+  warn(message: string, metadata?: Record<string, unknown>): void;
+}
+
+export interface AgentPluginContext {
+  log: AgentPluginLogger;
+  plugin: AgentPluginMetadata;
+}
+
 export interface AgentPluginSandbox {
   juniorRoot: string;
   root: string;
@@ -41,16 +52,14 @@ export interface AgentPluginSandbox {
   }): Promise<void>;
 }
 
-export interface SandboxPrepareHookContext {
-  plugin: AgentPluginMetadata;
+export interface SandboxPrepareHookContext extends AgentPluginContext {
   requester?: AgentPluginRequester;
   sandbox: AgentPluginSandbox;
 }
 
-export interface BeforeToolExecuteHookContext {
+export interface BeforeToolExecuteHookContext extends AgentPluginContext {
   decision: AgentPluginDecision;
   env: AgentPluginEnv;
-  plugin: AgentPluginMetadata;
   requester?: AgentPluginRequester;
   tool: {
     input: Record<string, unknown>;
@@ -58,9 +67,96 @@ export interface BeforeToolExecuteHookContext {
   };
 }
 
+export type AgentPluginToolExecute<TInput = unknown> = {
+  bivarianceHack(
+    input: TInput,
+    options: { experimental_context?: unknown },
+  ): Promise<unknown> | unknown;
+}["bivarianceHack"];
+
+export interface AgentPluginToolDefinition<TInput = unknown> {
+  annotations?: unknown;
+  description: string;
+  executionMode?: unknown;
+  inputSchema: unknown;
+  prepareArguments?: (args: unknown) => unknown;
+  promptGuidelines?: string[];
+  promptSnippet?: string;
+  execute?: AgentPluginToolExecute<TInput>;
+}
+
+export interface ToolRegistrationHookContext extends AgentPluginContext {
+  channelCapabilities?: {
+    canAddReactions: boolean;
+    canCreateCanvas: boolean;
+    canPostToChannel: boolean;
+  };
+  channelId?: string;
+  messageTs?: string;
+  requester?: AgentPluginRequester;
+  state: AgentPluginState;
+  teamId?: string;
+  threadTs?: string;
+  userText?: string;
+}
+
+export interface DispatchOptions {
+  destination: {
+    platform: "slack";
+    teamId: string;
+    channelId: string;
+  };
+  idempotencyKey: string;
+  input: string;
+  metadata?: Record<string, string>;
+}
+
+export interface DispatchResult {
+  id: string;
+  status: "created" | "already_exists";
+}
+
+export interface Dispatch {
+  errorMessage?: string;
+  id: string;
+  resultMessageTs?: string;
+  status:
+    | "pending"
+    | "running"
+    | "awaiting_resume"
+    | "completed"
+    | "failed"
+    | "blocked";
+}
+
+export interface AgentPluginState {
+  delete(key: string): Promise<void>;
+  get<T = unknown>(key: string): Promise<T | undefined>;
+  set(key: string, value: unknown, ttlMs?: number): Promise<void>;
+}
+
+export interface HeartbeatHookContext extends AgentPluginContext {
+  agent: {
+    dispatch(options: DispatchOptions): Promise<DispatchResult>;
+    get(id: string): Promise<Dispatch | undefined>;
+  };
+  nowMs: number;
+  state: AgentPluginState;
+}
+
+export interface HeartbeatResult {
+  dispatchCount?: number;
+}
+
 export interface AgentPluginHooks {
   sandboxPrepare?(ctx: SandboxPrepareHookContext): Promise<void> | void;
   beforeToolExecute?(ctx: BeforeToolExecuteHookContext): Promise<void> | void;
+  tools?(
+    ctx: ToolRegistrationHookContext,
+  ): Record<string, AgentPluginToolDefinition>;
+  heartbeat?(
+    ctx: HeartbeatHookContext,
+  ): Promise<HeartbeatResult | void> | HeartbeatResult | void;
 }
 
 export interface JuniorPluginConfig {

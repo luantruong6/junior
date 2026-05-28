@@ -7,6 +7,12 @@ describe("juniorVercelConfig", () => {
 
     expect(config.framework).toBe("nitro");
     expect(config.buildCommand).toBe("pnpm build");
+    expect(config.crons).toEqual([
+      {
+        path: "/api/internal/heartbeat",
+        schedule: "* * * * *",
+      },
+    ]);
   });
 
   it("omits buildCommand when set to null", () => {
