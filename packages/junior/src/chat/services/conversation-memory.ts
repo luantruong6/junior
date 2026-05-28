@@ -7,10 +7,13 @@ import type {
 } from "@/chat/state/conversation";
 import { toOptionalString } from "@/chat/coerce";
 import { logWarn, setSpanAttributes } from "@/chat/logging";
+import {
+  calculateContextCompactionTargetTokens,
+  estimateTextTokens,
+  getConversationContextCompactionTriggerTokens,
+} from "@/chat/services/context-budget";
 import { escapeXml } from "@/chat/xml";
 
-const CONTEXT_COMPACTION_TRIGGER_TOKENS = 9000;
-const CONTEXT_COMPACTION_TARGET_TOKENS = 7000;
 const CONTEXT_MIN_LIVE_MESSAGES = 12;
 const CONTEXT_COMPACTION_BATCH_SIZE = 24;
 const CONTEXT_MAX_COMPACTIONS = 16;
@@ -41,10 +44,6 @@ export function generateConversationId(
 
 export function normalizeConversationText(text: string): string {
   return text.trim().replace(/\s+/g, " ").slice(0, CONTEXT_MAX_MESSAGE_CHARS);
-}
-
-function estimateTokenCount(text: string): number {
-  return Math.ceil(text.length / 4);
 }
 
 function buildImageContextSuffix(
@@ -95,7 +94,7 @@ export function updateConversationStats(
   conversation: ThreadConversationState,
 ): void {
   const contextText = buildConversationContext(conversation);
-  conversation.stats.estimatedContextTokens = estimateTokenCount(
+  conversation.stats.estimatedContextTokens = estimateTextTokens(
     contextText ?? "",
   );
   conversation.stats.totalMessageCount = conversation.messages.length;
@@ -373,8 +372,10 @@ async function compactConversationIfNeededWithDeps(
     "app.context_tokens_estimated": estimatedTokens,
   });
 
+  const triggerTokens = getConversationContextCompactionTriggerTokens();
+  const targetTokens = calculateContextCompactionTargetTokens(triggerTokens);
   while (
-    estimatedTokens > CONTEXT_COMPACTION_TRIGGER_TOKENS &&
+    estimatedTokens > triggerTokens &&
     conversation.messages.length > CONTEXT_MIN_LIVE_MESSAGES
   ) {
     const compactCount = Math.min(
@@ -406,10 +407,12 @@ async function compactConversationIfNeededWithDeps(
     estimatedTokens = conversation.stats.estimatedContextTokens;
     setSpanAttributes({
       "app.compaction_messages_covered": compactCount,
+      "app.compaction.trigger_tokens": triggerTokens,
+      "app.compaction.target_tokens": targetTokens,
       "app.context_tokens_estimated": estimatedTokens,
     });
 
-    if (estimatedTokens <= CONTEXT_COMPACTION_TARGET_TOKENS) {
+    if (estimatedTokens <= targetTokens) {
       break;
     }
   }

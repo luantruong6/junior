@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { PiMessage } from "@/chat/pi/messages";
 import {
   getPersistedThreadState,
+  persistThreadState,
   persistThreadStateById,
 } from "@/chat/runtime/thread-state";
 import { coerceThreadConversationState } from "@/chat/state/conversation";
@@ -329,5 +330,185 @@ describe("Slack behavior: message content", () => {
     expect(calls).toHaveLength(2);
     expect(calls[1]?.contextConversation ?? "").toContain("budget by Friday");
     expect(calls[1]?.piMessages).toEqual(expectedHistory);
+  });
+
+  it("auto compacts oversized reusable Pi history before the next turn", async () => {
+    const calls: CapturedCall[] = [];
+    const priorMessages: PiMessage[] = [
+      {
+        role: "user",
+        content: [{ type: "text", text: "old context ".repeat(5_000) }],
+        timestamp: 1,
+      },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "old answer ".repeat(1_000) }],
+        timestamp: 2,
+      },
+    ] as PiMessage[];
+    const thread = createTestThread({ id: "slack:C_BEHAVIOR:1700005005.000" });
+    await upsertAgentTurnSessionCheckpoint({
+      conversationId: thread.id,
+      sessionId: "turn-large-history",
+      sliceId: 1,
+      state: "completed",
+      piMessages: priorMessages,
+    });
+    const conversation = coerceThreadConversationState({});
+    conversation.processing.lastSessionId = "turn-large-history";
+    await persistThreadState(thread, { conversation });
+
+    const { slackAdapter, slackRuntime } = createTestChatRuntime({
+      services: {
+        contextCompactor: {
+          completeText: async () =>
+            ({
+              text: "Compacted summary: old context is still relevant.",
+            }) as never,
+          autoCompactionTriggerTokens: 100,
+        },
+        replyExecutor: {
+          generateAssistantReply: async (prompt, context) => {
+            calls.push({
+              prompt,
+              contextConversation: context?.conversationContext,
+              piMessages: context?.piMessages,
+            });
+            return {
+              text: "Done.",
+              diagnostics: {
+                assistantMessageCount: 1,
+                modelId: "fake-agent-model",
+                outcome: "success",
+                toolCalls: [],
+                toolErrorCount: 0,
+                toolResultCount: 0,
+                usedPrimaryText: true,
+              },
+            };
+          },
+        },
+      },
+    });
+
+    await slackRuntime.handleNewMention(
+      thread,
+      createTestMessage({
+        id: "m-content-auto-compact",
+        text: "<@U_APP> continue",
+        isMention: true,
+        threadId: thread.id,
+        author: { userId: "U_TESTER" },
+      }),
+    );
+
+    expect(calls).toHaveLength(1);
+    const compactingStatusIndex = slackAdapter.statusCalls.findIndex((call) =>
+      call.loadingMessages?.includes("Compacting context"),
+    );
+    expect(compactingStatusIndex).toBeGreaterThanOrEqual(0);
+    expect(
+      slackAdapter.statusCalls.findIndex(
+        (call, index) =>
+          index > compactingStatusIndex &&
+          Boolean(call.text) &&
+          !call.loadingMessages?.includes("Compacting context"),
+      ),
+    ).toBeGreaterThan(compactingStatusIndex);
+    expect(calls[0]?.piMessages?.length).toBeLessThan(priorMessages.length + 1);
+    expect(JSON.stringify(calls[0]?.piMessages)).toContain(
+      "Context handoff summary",
+    );
+    expect(JSON.stringify(calls[0]?.piMessages)).toContain(
+      "old context is still relevant",
+    );
+  });
+
+  it("keeps active-turn Pi history instead of compacting older completed history", async () => {
+    const calls: CapturedCall[] = [];
+    const activeMessages: PiMessage[] = [
+      {
+        role: "user",
+        content: [{ type: "text", text: "active checkpoint tool context" }],
+        timestamp: 3,
+      },
+    ] as PiMessage[];
+    const priorMessages: PiMessage[] = [
+      {
+        role: "user",
+        content: [{ type: "text", text: "older context ".repeat(5_000) }],
+        timestamp: 1,
+      },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "older answer ".repeat(1_000) }],
+        timestamp: 2,
+      },
+    ] as PiMessage[];
+    const thread = createTestThread({ id: "slack:C_BEHAVIOR:1700005006.000" });
+    await upsertAgentTurnSessionCheckpoint({
+      conversationId: thread.id,
+      sessionId: "turn-older-completed",
+      sliceId: 1,
+      state: "completed",
+      piMessages: priorMessages,
+    });
+    await upsertAgentTurnSessionCheckpoint({
+      conversationId: thread.id,
+      sessionId: "turn-active-crashed",
+      sliceId: 1,
+      state: "running",
+      piMessages: activeMessages,
+    });
+    const conversation = coerceThreadConversationState({});
+    conversation.processing.activeTurnId = "turn-active-crashed";
+    conversation.processing.lastSessionId = "turn-older-completed";
+    await persistThreadState(thread, { conversation });
+
+    const { slackRuntime } = createTestChatRuntime({
+      services: {
+        contextCompactor: {
+          completeText: async () => {
+            throw new Error("active checkpoint history should not compact");
+          },
+          autoCompactionTriggerTokens: 100,
+        },
+        replyExecutor: {
+          generateAssistantReply: async (prompt, context) => {
+            calls.push({
+              prompt,
+              contextConversation: context?.conversationContext,
+              piMessages: context?.piMessages,
+            });
+            return {
+              text: "Done.",
+              diagnostics: {
+                assistantMessageCount: 1,
+                modelId: "fake-agent-model",
+                outcome: "success",
+                toolCalls: [],
+                toolErrorCount: 0,
+                toolResultCount: 0,
+                usedPrimaryText: true,
+              },
+            };
+          },
+        },
+      },
+    });
+
+    await slackRuntime.handleNewMention(
+      thread,
+      createTestMessage({
+        id: "m-content-active-checkpoint",
+        text: "<@U_APP> continue",
+        isMention: true,
+        threadId: thread.id,
+        author: { userId: "U_TESTER" },
+      }),
+    );
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.piMessages).toEqual(activeMessages);
   });
 });

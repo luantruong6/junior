@@ -39,6 +39,7 @@ export interface BotConfig {
   fastModelId: string;
   loadingMessages: string[];
   modelId: string;
+  modelContextWindowTokens?: number;
   visionModelId?: string;
   turnTimeoutMs: number;
   userName: string;
@@ -138,6 +139,22 @@ function parseAdvisorThinkingLevel(
   );
 }
 
+function parseOptionalPositiveInteger(
+  envName: string,
+  rawValue: string | undefined,
+): number | undefined {
+  const trimmed = toOptionalTrimmed(rawValue);
+  if (trimmed === undefined) {
+    return undefined;
+  }
+
+  const value = Number.parseInt(trimmed, 10);
+  if (!Number.isSafeInteger(value) || value <= 0 || String(value) !== trimmed) {
+    throw new Error(`${envName} must be a positive integer`);
+  }
+  return value;
+}
+
 // Compile-time assertion: `getModel`'s second generic is constrained to
 // `keyof (typeof MODELS)[TProvider]`, so a stale default becomes a tsc error.
 const DEFAULT_MODEL_ID = getModel("vercel-ai-gateway", "openai/gpt-5.4").id;
@@ -172,6 +189,10 @@ function readBotConfig(env: NodeJS.ProcessEnv): BotConfig {
   return {
     userName: env.JUNIOR_BOT_NAME ?? "junior",
     modelId: validateGatewayModelId(env.AI_MODEL) ?? DEFAULT_MODEL_ID,
+    modelContextWindowTokens: parseOptionalPositiveInteger(
+      "AI_MODEL_CONTEXT_WINDOW_TOKENS",
+      env.AI_MODEL_CONTEXT_WINDOW_TOKENS,
+    ),
     fastModelId:
       validateGatewayModelId(env.AI_FAST_MODEL ?? env.AI_MODEL) ??
       DEFAULT_FAST_MODEL_ID,

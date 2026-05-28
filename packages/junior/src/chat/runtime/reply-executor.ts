@@ -41,13 +41,17 @@ import {
   generateConversationId,
   updateConversationStats,
 } from "@/chat/services/conversation-memory";
+import type { ContextCompactor } from "@/chat/services/context-compaction";
 import { applyPendingAuthUpdate } from "@/chat/services/pending-auth";
 import {
   countPotentialImageAttachments,
   hasPotentialImageAttachment,
   isVisionEnabled,
 } from "@/chat/services/vision-context";
-import { createSlackAdapterAssistantStatusSession } from "@/chat/slack/assistant-thread/status";
+import {
+  createSlackAdapterAssistantStatusSession,
+  type AssistantStatusSpec,
+} from "@/chat/slack/assistant-thread/status";
 import { buildSlackReplyFooter } from "@/chat/slack/footer";
 import { maybeUpdateAssistantTitle } from "@/chat/slack/assistant-thread/title";
 import { appendSlackLegacyAttachmentText } from "@/chat/slack/legacy-attachments";
@@ -105,15 +109,20 @@ function buildCanvasRecoveryReply(canvasUrl: string) {
   return `I created the canvas, but the turn was interrupted before I could finish the thread reply: ${canvasUrl}`;
 }
 
+interface LoadedPiMessagesForTurn {
+  compactionSessionId?: string;
+  piMessages?: PiMessage[];
+}
+
 async function loadPiMessagesForTurn(args: {
   conversationId?: string;
   activeTurnId?: string;
   lastSessionId?: string;
   fallback: PiMessage[];
-}): Promise<PiMessage[] | undefined> {
+}): Promise<LoadedPiMessagesForTurn> {
   const fallback = args.fallback.length > 0 ? [...args.fallback] : undefined;
   if (!args.conversationId) {
-    return fallback;
+    return { piMessages: fallback };
   }
 
   if (args.activeTurnId) {
@@ -122,26 +131,34 @@ async function loadPiMessagesForTurn(args: {
       args.activeTurnId,
     );
     if (checkpoint?.piMessages.length) {
-      return stripRuntimeTurnContext(
-        trimTrailingAssistantMessages(checkpoint.piMessages),
-      );
+      return {
+        piMessages: stripRuntimeTurnContext(
+          trimTrailingAssistantMessages(checkpoint.piMessages),
+        ),
+      };
     }
   }
 
   if (!args.lastSessionId) {
-    return fallback;
+    return { piMessages: fallback };
   }
 
   const checkpoint = await getAgentTurnSessionCheckpoint(
     args.conversationId,
     args.lastSessionId,
   );
-  return checkpoint?.state === "completed" && checkpoint.piMessages.length > 0
-    ? stripRuntimeTurnContext(checkpoint.piMessages)
-    : fallback;
+  if (checkpoint?.state === "completed" && checkpoint.piMessages.length > 0) {
+    return {
+      compactionSessionId: args.lastSessionId,
+      piMessages: stripRuntimeTurnContext(checkpoint.piMessages),
+    };
+  }
+
+  return { piMessages: fallback };
 }
 
 export interface ReplyExecutorServices {
+  contextCompactor: ContextCompactor;
   generateAssistantReply: typeof generateAssistantReplyImpl;
   generateThreadTitle: ConversationMemoryService["generateThreadTitle"];
   getAwaitingTurnContinuationRequest: (args: {
@@ -452,18 +469,14 @@ export function createReplyToThread(deps: ReplyExecutorDeps) {
           !isVisionEnabled() && hasPotentialImageAttachment(message.attachments)
             ? countPotentialImageAttachments(message.attachments)
             : 0;
-        const piMessages = await loadPiMessagesForTurn({
-          conversationId,
-          activeTurnId,
-          lastSessionId: lastSessionIdForHistory,
-          fallback: preparedState.conversation.piMessages,
-        });
-
         const status = createSlackAdapterAssistantStatusSession({
           channelId: assistantThreadContext?.channelId,
           threadTs: assistantThreadContext?.threadTs,
           getSlackAdapter: deps.getSlackAdapter,
         });
+        const compactingStatus: AssistantStatusSpec = {
+          text: "Compacting context",
+        };
         const postThreadReply = async (
           payload: Parameters<typeof thread.post>[0],
           stage: PlannedSlackReplyStage,
@@ -486,25 +499,61 @@ export function createReplyToThread(deps: ReplyExecutorDeps) {
             throw error;
           }
         };
-        status.start();
-        const assistantTitleTask = maybeUpdateAssistantTitle({
-          assistantThreadContext,
-          assistantUserName: botConfig.userName,
-          artifacts: preparedState.artifacts,
-          channelId,
-          conversation: preparedState.conversation,
-          generateThreadTitle: deps.services.generateThreadTitle,
-          getSlackAdapter: deps.getSlackAdapter,
-          modelId: botConfig.fastModelId,
-          requesterId: message.author.userId,
-          runId,
-          threadId,
-        });
         let persistedAtLeastOnce = false;
         let shouldPersistFailureState = true;
         let latestArtifacts = preparedState.artifacts;
 
         try {
+          const loadedPiMessages = await loadPiMessagesForTurn({
+            conversationId,
+            activeTurnId,
+            lastSessionId: lastSessionIdForHistory,
+            fallback: preparedState.conversation.piMessages,
+          });
+          let piMessages = loadedPiMessages.piMessages;
+          if (
+            conversationId &&
+            loadedPiMessages.compactionSessionId &&
+            piMessages?.length
+          ) {
+            const compaction =
+              await deps.services.contextCompactor.maybeCompact({
+                conversation: preparedState.conversation,
+                conversationContext:
+                  preparedState.routingContext ??
+                  preparedState.conversationContext,
+                conversationId,
+                metadata: {
+                  threadId,
+                  requesterId: message.author.userId,
+                  channelId,
+                  runId,
+                },
+                onCompactionStart: () => status.start(compactingStatus),
+                previousSessionId: loadedPiMessages.compactionSessionId,
+              });
+            if (compaction.compacted) {
+              piMessages = compaction.piMessages;
+              await persistThreadState(thread, {
+                conversation: preparedState.conversation,
+              });
+            }
+          }
+
+          status.start();
+          const assistantTitleTask = maybeUpdateAssistantTitle({
+            assistantThreadContext,
+            assistantUserName: botConfig.userName,
+            artifacts: preparedState.artifacts,
+            channelId,
+            conversation: preparedState.conversation,
+            generateThreadTitle: deps.services.generateThreadTitle,
+            getSlackAdapter: deps.getSlackAdapter,
+            modelId: botConfig.fastModelId,
+            requesterId: message.author.userId,
+            runId,
+            threadId,
+          });
           const toolChannelId =
             preparedState.artifacts.assistantContextChannelId ?? channelId;
           let reply = await deps.services.generateAssistantReply(userText, {
