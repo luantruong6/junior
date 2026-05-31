@@ -4,6 +4,8 @@ import { HighlightedCode } from "../code";
 import {
   detectLanguage,
   detectOutputLanguage,
+  transcriptRoleKind,
+  type TranscriptRoleKind,
   formatBytes,
   formatMessageOffset,
   formatMessageTimestamp,
@@ -70,17 +72,6 @@ function turnMarkerClass(
     status === "failed" && "border-rose-300 bg-rose-300",
     status === "idle" && "border-[#beaaff]/70 bg-[#beaaff]/50",
   );
-}
-
-type TranscriptRoleKind = "assistant" | "other" | "system" | "tool" | "user";
-
-function transcriptRoleKind(role: string): TranscriptRoleKind {
-  const normalized = role.toLowerCase();
-  if (normalized === "assistant") return "assistant";
-  if (normalized === "user") return "user";
-  if (normalized === "system") return "system";
-  if (normalized.includes("tool")) return "tool";
-  return "other";
 }
 
 function transcriptRoleLabel(role: string, turn: ConversationTurn): string {
@@ -376,8 +367,9 @@ function TranscriptMessageView(props: {
   const offset = formatMessageOffset(props.turn, props.message.timestamp);
   const renderedParts = groupTranscriptParts(props.message.parts);
   const rawText = messageRawText(props.message);
+  const role = props.message.role;
   const totalRenderedChildren = renderedParts.reduce(
-    (count, part) => count + countRenderedTranscriptChildren(part),
+    (count, part) => count + countRenderedTranscriptChildren(part, role),
     0,
   );
   let seenRenderedChildren = 0;
@@ -411,13 +403,14 @@ function TranscriptMessageView(props: {
         <div className="grid min-w-0 gap-2">
           {renderedParts.map((part, index) => {
             const firstChildIndex = seenRenderedChildren;
-            seenRenderedChildren += countRenderedTranscriptChildren(part);
+            seenRenderedChildren += countRenderedTranscriptChildren(part, role);
             return (
               <TranscriptPartView
                 firstChildIndex={firstChildIndex}
                 key={index}
                 lastChildIndex={totalRenderedChildren - 1}
                 part={part}
+                role={role}
               />
             );
           })}
@@ -431,6 +424,7 @@ function TranscriptPartView(props: {
   firstChildIndex: number;
   lastChildIndex: number;
   part: RenderedTranscriptPart;
+  role?: string;
 }) {
   if (props.part.kind === "tool") {
     return (
@@ -444,6 +438,7 @@ function TranscriptPartView(props: {
       <TranscriptText
         firstChildIndex={props.firstChildIndex}
         lastChildIndex={props.lastChildIndex}
+        role={props.role}
         text={part.text ?? ""}
       />
     );

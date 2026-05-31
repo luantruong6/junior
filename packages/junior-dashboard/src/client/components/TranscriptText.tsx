@@ -3,15 +3,18 @@ import {
   HighlightedCode,
   StructuredMarkup,
 } from "../code";
-import { canRenderStructuredMarkup, parseMarkdownBlocks } from "../format";
+import { canRenderStructuredMarkup, parseMarkdownBlocks, transcriptRoleKind } from "../format";
 
 /** Render transcript markdown/code blocks with structured markup expansion. */
 export function TranscriptText(props: {
   firstChildIndex: number;
   lastChildIndex: number;
+  role?: string;
   text: string;
 }) {
-  const blocks = parseMarkdownBlocks(props.text);
+  const blocks = parseMarkdownBlocks(props.text, {
+    outputOnly: transcriptRoleKind(props.role ?? "") === "assistant",
+  });
   let seenChildren = props.firstChildIndex;
 
   return (
