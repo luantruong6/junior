@@ -104,6 +104,17 @@ export function formatMs(value: number | undefined): string {
   return `${minutes}m ${remainingSeconds}s`;
 }
 
+/** Format aggregate runtime across turn summaries when duration data exists. */
+export function formatDurationTotal(
+  durations: Array<number | undefined>,
+): string {
+  const total = durations.reduce<number | undefined>((sum, value) => {
+    if (typeof value !== "number" || !Number.isFinite(value)) return sum;
+    return (sum ?? 0) + Math.max(0, Math.floor(value));
+  }, undefined);
+  return total === undefined ? "" : formatMs(total);
+}
+
 /** Format transcript event timestamps independently from turn start offsets. */
 export function formatMessageTimestamp(value: number | undefined): string {
   if (typeof value !== "number" || !Number.isFinite(value))
@@ -151,6 +162,25 @@ function formatNumber(value: number | undefined): string {
   return `${formatted}${suffix}`;
 }
 
+function getFiniteTokenCount(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.max(0, Math.floor(value))
+    : undefined;
+}
+
+function getUsageComponentTotal(usage: TurnUsage): number | undefined {
+  return [
+    usage.inputTokens,
+    usage.outputTokens,
+    usage.cachedInputTokens,
+    usage.cacheCreationTokens,
+  ].reduce<number | undefined>((sum, value) => {
+    const count = getFiniteTokenCount(value);
+    if (count === undefined) return sum;
+    return (sum ?? 0) + count;
+  }, undefined);
+}
+
 /** Format byte counts in lowercase compact units for transcript metadata. */
 export function formatBytes(value: number | undefined): string {
   if (typeof value !== "number" || !Number.isFinite(value)) return "0b";
@@ -174,9 +204,36 @@ function transcriptSource(turn: ConversationTurn) {
     : (turn.transcriptMetadata ?? []);
 }
 
+function isConversationMessageRole(role: string): boolean {
+  const normalized = role.toLowerCase();
+  return normalized === "user" || normalized === "assistant";
+}
+
+function hasTextPart(
+  message: Pick<ConversationTurn["transcript"][number], "parts" | "role">,
+): boolean {
+  return message.parts.some((part) => {
+    if (part.type !== "text") return false;
+    if (part.redacted) return true;
+    return typeof part.text === "string" && part.text.trim().length > 0;
+  });
+}
+
+function isConversationMessage(
+  message: Pick<ConversationTurn["transcript"][number], "parts" | "role">,
+): boolean {
+  if (!isConversationMessageRole(message.role)) return false;
+  if (message.role.toLowerCase() === "assistant") return hasTextPart(message);
+  return message.parts.length > 0;
+}
+
 /** Count visible or redacted message records for a turn. */
 export function turnMessageCount(turn: ConversationTurn): number {
-  return turn.transcriptMessageCount ?? transcriptSource(turn).length;
+  const source = transcriptSource(turn);
+  if (source.length > 0) {
+    return source.filter(isConversationMessage).length;
+  }
+  return turn.transcriptMessageCount ?? 0;
 }
 
 /** Count tool calls from visible transcripts or safe redacted metadata. */
@@ -190,26 +247,24 @@ export function turnToolCallCount(turn: ConversationTurn): number {
 
 function totalUsageTokens(usage: TurnUsage | undefined): number | undefined {
   if (!usage) return undefined;
-  if (
-    typeof usage.totalTokens === "number" &&
-    Number.isFinite(usage.totalTokens)
-  ) {
-    return usage.totalTokens;
-  }
-  return [
-    usage.inputTokens,
-    usage.outputTokens,
-    usage.cachedInputTokens,
-    usage.cacheCreationTokens,
-  ].reduce<number | undefined>((sum, value) => {
-    if (typeof value !== "number" || !Number.isFinite(value)) return sum;
-    return (sum ?? 0) + Math.max(0, Math.floor(value));
-  }, undefined);
+  return (
+    getUsageComponentTotal(usage) ?? getFiniteTokenCount(usage.totalTokens)
+  );
 }
 
 /** Format known token counters without estimating per-message usage. */
 export function formatTokenTotal(usage: TurnUsage | undefined): string {
   const total = totalUsageTokens(usage);
+  return total === undefined ? "" : `${formatNumber(total)} tokens`;
+}
+
+/** Format the aggregate token count across conversation turns. */
+export function formatUsageTotal(usages: Array<TurnUsage | undefined>): string {
+  const total = usages.reduce<number | undefined>((sum, usage) => {
+    const tokens = totalUsageTokens(usage);
+    if (tokens === undefined) return sum;
+    return (sum ?? 0) + tokens;
+  }, undefined);
   return total === undefined ? "" : `${formatNumber(total)} tokens`;
 }
 
