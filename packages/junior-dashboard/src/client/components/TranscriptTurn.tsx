@@ -359,11 +359,91 @@ function turnMeta(turn: ConversationTurn): string[] {
   ].filter((value) => value && value !== "none");
 }
 
+/**
+ * Render the system prompt as a collapsed disclosure. Uses the same
+ * groupTranscriptParts → TranscriptPartView → TranscriptText pipeline as every
+ * other message so XML tag collapsing, syntax highlighting, and copy behaviour
+ * stay consistent. detectLanguage returns "xml" for the system prompt once the
+ * block-level XML heuristic in format.ts fires.
+ */
+function SystemMessageView(props: {
+  message: TranscriptMessage;
+  turn: ConversationTurn;
+  view: TranscriptViewMode;
+}) {
+  const [open, setOpen] = useState(false);
+  const rawText = messageRawText(props.message);
+  const role = props.message.role;
+  const byteCount = new TextEncoder().encode(rawText).byteLength;
+  const renderedParts = groupTranscriptParts(props.message.parts);
+  const totalRenderedChildren = renderedParts.reduce(
+    (count, part) => count + countRenderedTranscriptChildren(part, role),
+    0,
+  );
+  let seenRenderedChildren = 0;
+
+  return (
+    <details
+      className={transcriptMessageClass(role)}
+      onToggle={(event) => {
+        if (event.currentTarget !== event.target) return;
+        setOpen(event.currentTarget.open);
+      }}
+      open={open}
+    >
+      <summary className="list-none cursor-pointer">
+        <div className={transcriptRoleClass(role)}>
+          <span className={transcriptRoleLabelClass(role)}>
+            {transcriptRoleLabel(role, props.turn)}
+          </span>
+          {open ? null : (
+            <span className="font-mono text-[0.78rem] text-[#888]">
+              {formatBytes(byteCount)}
+            </span>
+          )}
+        </div>
+      </summary>
+      {props.view === "raw" ? (
+        <HighlightedCode
+          code={rawText || "{}"}
+          language={detectLanguage(rawText)}
+        />
+      ) : (
+        <div className="grid min-w-0 gap-2">
+          {renderedParts.map((part, index) => {
+            const firstChildIndex = seenRenderedChildren;
+            seenRenderedChildren += countRenderedTranscriptChildren(part, role);
+            return (
+              <TranscriptPartView
+                firstChildIndex={firstChildIndex}
+                key={index}
+                lastChildIndex={totalRenderedChildren - 1}
+                part={part}
+                role={role}
+              />
+            );
+          })}
+        </div>
+      )}
+    </details>
+  );
+}
+
 function TranscriptMessageView(props: {
   message: TranscriptMessage;
   turn: ConversationTurn;
   view: TranscriptViewMode;
 }) {
+  if (transcriptRoleKind(props.message.role) === "system") {
+    return (
+      <SystemMessageView
+        message={props.message}
+        turn={props.turn}
+        view={props.view}
+      />
+    );
+  }
+
   const offset = formatMessageOffset(props.turn, props.message.timestamp);
   const renderedParts = groupTranscriptParts(props.message.parts);
   const rawText = messageRawText(props.message);
