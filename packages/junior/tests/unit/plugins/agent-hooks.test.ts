@@ -2,6 +2,8 @@ import { defineJuniorPlugin } from "@sentry/junior-plugin-api";
 import { describe, expect, it } from "vitest";
 import {
   createAgentPluginHookRunner,
+  getAgentPluginRoutes,
+  getAgentPluginSlackConversationLink,
   getAgentPluginTools,
   setAgentPlugins,
 } from "@/chat/plugins/agent-hooks";
@@ -161,6 +163,140 @@ describe("agent plugin hooks", () => {
           },
         ),
       ).toThrow('Trusted plugin tool "loadSkill" conflicts with a core tool');
+    } finally {
+      setAgentPlugins(previous);
+    }
+  });
+
+  it("collects route handlers from configured plugins", async () => {
+    const previous = setAgentPlugins([
+      defineJuniorPlugin({
+        name: "agent-demo",
+        hooks: {
+          routes() {
+            return [
+              {
+                path: "/demo",
+                handler: () => new Response("demo"),
+              },
+            ];
+          },
+        },
+      }),
+    ]);
+    try {
+      const routes = getAgentPluginRoutes();
+
+      expect(routes).toHaveLength(1);
+      expect(routes[0]?.pluginName).toBe("agent-demo");
+      expect(routes[0]?.path).toBe("/demo");
+      const response = await routes[0]!.handler(
+        new Request("http://localhost/demo"),
+      );
+      await expect(response.text()).resolves.toBe("demo");
+    } finally {
+      setAgentPlugins(previous);
+    }
+  });
+
+  it("rejects invalid route methods from configured plugins", () => {
+    const previous = setAgentPlugins([
+      defineJuniorPlugin({
+        name: "agent-demo",
+        hooks: {
+          routes() {
+            return [
+              {
+                method: "TRACE" as never,
+                path: "/demo",
+                handler: () => new Response("demo"),
+              },
+            ];
+          },
+        },
+      }),
+    ]);
+    try {
+      expect(() => getAgentPluginRoutes()).toThrow(
+        'Trusted plugin route "/demo" from plugin "agent-demo" has invalid method "TRACE"',
+      );
+    } finally {
+      setAgentPlugins(previous);
+    }
+  });
+
+  it("rejects routes that combine ALL with explicit methods", () => {
+    const previous = setAgentPlugins([
+      defineJuniorPlugin({
+        name: "agent-demo",
+        hooks: {
+          routes() {
+            return [
+              {
+                method: ["ALL", "GET"],
+                path: "/demo",
+                handler: () => new Response("demo"),
+              },
+            ];
+          },
+        },
+      }),
+    ]);
+    try {
+      expect(() => getAgentPluginRoutes()).toThrow(
+        'Trusted plugin route "/demo" from plugin "agent-demo" must not combine ALL with explicit methods',
+      );
+    } finally {
+      setAgentPlugins(previous);
+    }
+  });
+
+  it("rejects route paths that mix ALL and explicit method registrations", () => {
+    const previous = setAgentPlugins([
+      defineJuniorPlugin({
+        name: "agent-demo",
+        hooks: {
+          routes() {
+            return [
+              {
+                method: "ALL",
+                path: "/demo",
+                handler: () => new Response("demo"),
+              },
+              {
+                method: "GET",
+                path: "/demo",
+                handler: () => new Response("demo"),
+              },
+            ];
+          },
+        },
+      }),
+    ]);
+    try {
+      expect(() => getAgentPluginRoutes()).toThrow(
+        'Trusted plugin route "/demo" conflicts with an ALL route for the same path',
+      );
+    } finally {
+      setAgentPlugins(previous);
+    }
+  });
+
+  it("rejects unsafe Slack conversation links from configured plugins", () => {
+    const previous = setAgentPlugins([
+      defineJuniorPlugin({
+        name: "agent-demo",
+        hooks: {
+          slackConversationLink() {
+            return { url: "javascript:alert(1)" };
+          },
+        },
+      }),
+    ]);
+    try {
+      expect(() => getAgentPluginSlackConversationLink("slack:C1:123")).toThrow(
+        'Trusted plugin "agent-demo" slackConversationLink must return an absolute http(s) URL',
+      );
     } finally {
       setAgentPlugins(previous);
     }
