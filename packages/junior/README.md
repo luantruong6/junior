@@ -25,7 +25,11 @@ export default app;
 
 Run `junior init my-bot` to scaffold a complete project including `vercel.json` for Vercel deployment.
 
-Use `juniorNitro({ plugins: { packages: [...] } })` in `nitro.config.ts` to declare which plugin packages to bundle and load at runtime. Packages with trusted runtime hooks, such as `@sentry/junior-github`, also need to be registered in app code with `createApp({ plugins: [...] })`.
+Use `defineJuniorPlugins([...])` in a runtime-safe plugin module, then point
+`juniorNitro({ plugins: "./plugins" })` at that module. `createApp()` reads the
+same enabled set from Nitro's virtual module. Manifest-only packages use
+package-name strings; trusted factories such as `githubPlugin()` register their
+manifest and in-process hooks together.
 
 ## Full docs
 

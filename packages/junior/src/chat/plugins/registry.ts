@@ -5,7 +5,7 @@ import type { CredentialBroker } from "@/chat/credentials/broker";
 import { pluginRoots } from "@/chat/discovery";
 import { logInfo, logWarn, setSpanAttributes } from "@/chat/logging";
 import { createGitHubAppBroker } from "./auth/github-app-broker";
-import { parsePluginManifest } from "./manifest";
+import { parseInlinePluginManifest, parsePluginManifest } from "./manifest";
 import { createOAuthBearerBroker } from "./auth/oauth-bearer-broker";
 import { createApiHeadersBroker } from "./auth/api-headers-broker";
 import {
@@ -14,8 +14,9 @@ import {
   normalizePluginPackageNames,
 } from "./package-discovery";
 import type {
+  InlinePluginManifestDefinition,
   PluginBrokerDeps,
-  PluginConfig,
+  PluginCatalogConfig,
   PluginDefinition,
   OAuthProviderConfig,
   PluginRuntimeDependency,
@@ -33,13 +34,15 @@ interface LoadedPluginState {
 }
 
 interface PluginCatalogSource {
+  inlineManifests: InlinePluginManifestDefinition[];
   manifestRoots: string[];
   packagedSkillRoots: string[];
+  packagedContent: InstalledPluginPackageContent;
   signature: string;
 }
 
 let loadedPluginState: LoadedPluginState | undefined;
-let pluginConfig: PluginConfig | undefined;
+let pluginConfig: PluginCatalogConfig | undefined;
 
 function getLoggedPluginNames(): Set<string> {
   const globalState = globalThis as typeof globalThis & {
@@ -72,11 +75,10 @@ function providerDomains(manifest: PluginDefinition["manifest"]): string[] {
 
 function registerPluginManifest(
   state: LoadedPluginState,
-  raw: string,
+  manifest: PluginDefinition["manifest"],
   pluginDir: string,
+  skillsDir?: string,
 ): void {
-  const manifest = parsePluginManifest(raw, pluginDir, pluginConfig);
-
   if (state.pluginsByName.has(manifest.name)) {
     throw new Error(`Duplicate plugin name "${manifest.name}"`);
   }
@@ -93,7 +95,7 @@ function registerPluginManifest(
     const owner = state.domainToPlugin.get(domain);
     if (owner) {
       throw new Error(
-        `Duplicate provider domain "${domain}" in plugin "${manifest.name}" already declared by plugin "${owner}". Use plugins.manifests in PluginConfig to change one plugin's domains or credentials.`,
+        `Duplicate provider domain "${domain}" in plugin "${manifest.name}" already declared by plugin "${owner}". Use plugins.manifests in PluginCatalogConfig to change one plugin's domains or credentials.`,
       );
     }
   }
@@ -101,7 +103,7 @@ function registerPluginManifest(
   const definition: PluginDefinition = {
     manifest,
     dir: pluginDir,
-    skillsDir: path.join(pluginDir, "skills"),
+    ...(skillsDir ? { skillsDir } : {}),
   };
 
   state.pluginDefinitions.push(definition);
@@ -116,6 +118,20 @@ function registerPluginManifest(
   for (const domain of providerDomains(manifest)) {
     state.domainToPlugin.set(domain, manifest.name);
   }
+}
+
+function registerYamlPluginManifest(
+  state: LoadedPluginState,
+  raw: string,
+  pluginDir: string,
+): void {
+  const manifest = parsePluginManifest(raw, pluginDir, pluginConfig);
+  registerPluginManifest(
+    state,
+    manifest,
+    pluginDir,
+    path.join(pluginDir, "skills"),
+  );
 }
 
 function normalizePluginRoots(roots: string[]): string[] {
@@ -143,10 +159,14 @@ function getPluginCatalogSource(): PluginCatalogSource {
   ]);
   const packagedSkillRoots = normalizePluginRoots(packagedContent.skillRoots);
 
+  const inlineManifests = pluginConfig?.inlineManifests ?? [];
   return {
+    inlineManifests,
     manifestRoots,
     packagedSkillRoots,
+    packagedContent,
     signature: JSON.stringify({
+      inlineManifests,
       manifestRoots,
       packagedSkillRoots,
       packageNames: [...packagedContent.packageNames].sort(),
@@ -155,14 +175,17 @@ function getPluginCatalogSource(): PluginCatalogSource {
   };
 }
 
-function normalizePluginConfig(
-  config: PluginConfig | undefined,
-): PluginConfig | undefined {
+function normalizePluginCatalogConfig(
+  config: PluginCatalogConfig | undefined,
+): PluginCatalogConfig | undefined {
   if (!config) {
     return undefined;
   }
 
   return {
+    inlineManifests: config.inlineManifests
+      ? structuredClone(config.inlineManifests)
+      : undefined,
     packages: normalizePluginPackageNames(config.packages),
     ...(config.manifests
       ? { manifests: structuredClone(config.manifests) }
@@ -170,19 +193,50 @@ function normalizePluginConfig(
   };
 }
 
-function clonePluginConfig(
-  config: PluginConfig | undefined,
-): PluginConfig | undefined {
+function clonePluginCatalogConfig(
+  config: PluginCatalogConfig | undefined,
+): PluginCatalogConfig | undefined {
   if (!config) {
     return undefined;
   }
 
   return {
+    ...(config.inlineManifests
+      ? { inlineManifests: structuredClone(config.inlineManifests) }
+      : {}),
     packages: [...(config.packages ?? [])],
     ...(config.manifests
       ? { manifests: structuredClone(config.manifests) }
       : {}),
   };
+}
+
+function packageContentByName(
+  packagedContent: InstalledPluginPackageContent,
+  packageName: string,
+): { dir: string; hasSkillsDir: boolean } | undefined {
+  return packagedContent.packages.find((pkg) => pkg.name === packageName);
+}
+
+function registerInlineManifests(
+  state: LoadedPluginState,
+  source: PluginCatalogSource,
+): void {
+  for (const definition of source.inlineManifests) {
+    const pkg = definition.packageName
+      ? packageContentByName(source.packagedContent, definition.packageName)
+      : undefined;
+    const dir = pkg?.dir ?? process.cwd();
+    const skillsDir = pkg?.hasSkillsDir
+      ? path.join(pkg.dir, "skills")
+      : undefined;
+    const manifest = parseInlinePluginManifest(
+      definition.manifest,
+      dir,
+      pluginConfig,
+    );
+    registerPluginManifest(state, manifest, dir, skillsDir);
+  }
 }
 
 function discoverConfiguredPluginPackageContent(): InstalledPluginPackageContent {
@@ -199,6 +253,8 @@ function buildLoadedPluginState(
   for (const skillRoot of source.packagedSkillRoots) {
     state.packageSkillRoots.add(skillRoot);
   }
+
+  registerInlineManifests(state, source);
 
   const roots = source.manifestRoots;
   for (const pluginsRoot of roots) {
@@ -229,7 +285,7 @@ function buildLoadedPluginState(
       }
       if (hasRootManifest) {
         const rawRootManifest = readFileSync(manifestPath, "utf8");
-        registerPluginManifest(state, rawRootManifest, pluginsRoot);
+        registerYamlPluginManifest(state, rawRootManifest, pluginsRoot);
         continue;
       }
     }
@@ -266,7 +322,7 @@ function buildLoadedPluginState(
         continue; // No manifest — skip
       }
 
-      registerPluginManifest(state, raw, pluginDir);
+      registerYamlPluginManifest(state, raw, pluginDir);
     }
   }
 
@@ -299,7 +355,9 @@ function logLoadedPlugins(state: LoadedPluginState): void {
         "app.plugin.config_key_count": plugin.manifest.configKeys.length,
         "app.plugin.has_mcp": Boolean(plugin.manifest.mcp),
         "file.directory": plugin.dir,
-        "app.file.skill_directory": plugin.skillsDir,
+        ...(plugin.skillsDir
+          ? { "app.file.skill_directory": plugin.skillsDir }
+          : {}),
       },
       "Loaded plugin",
     );
@@ -321,11 +379,11 @@ function ensurePluginsLoaded(): LoadedPluginState {
 // --- Sync exports ---
 
 /** Set install-wide plugin configuration and return the previous value for rollback. */
-export function setPluginConfig(
-  config: PluginConfig | undefined,
-): PluginConfig | undefined {
-  const previousConfig = clonePluginConfig(pluginConfig);
-  pluginConfig = normalizePluginConfig(config);
+export function setPluginCatalogConfig(
+  config: PluginCatalogConfig | undefined,
+): PluginCatalogConfig | undefined {
+  const previousConfig = clonePluginCatalogConfig(pluginConfig);
+  pluginConfig = normalizePluginCatalogConfig(config);
   return previousConfig;
 }
 
@@ -455,7 +513,9 @@ export function getPluginSkillRoots(): string[] {
   const state = ensurePluginsLoaded();
   return [
     ...new Set([
-      ...state.pluginDefinitions.map((plugin) => plugin.skillsDir),
+      ...state.pluginDefinitions.flatMap((plugin) =>
+        plugin.skillsDir ? [plugin.skillsDir] : [],
+      ),
       ...state.packageSkillRoots,
     ]),
   ];
@@ -468,6 +528,9 @@ export function getPluginForSkillPath(
   const resolvedSkillPath = path.resolve(skillPath);
 
   return state.pluginDefinitions.find((plugin) => {
+    if (!plugin.skillsDir) {
+      return false;
+    }
     const resolvedSkillsDir = path.resolve(plugin.skillsDir);
     return (
       resolvedSkillPath === resolvedSkillsDir ||

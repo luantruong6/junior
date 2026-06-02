@@ -157,8 +157,9 @@ export interface PluginManifestConfig {
   } | null;
 }
 
-/** Install-level plugin package list and manifest configuration. */
-export interface PluginConfig {
+/** Install-level plugin package list and manifest override catalog. */
+export interface PluginCatalogConfig {
+  inlineManifests?: InlinePluginManifestDefinition[];
   packages?: string[];
   manifests?: Record<string, PluginManifestConfig>;
 }
@@ -170,5 +171,10 @@ export interface PluginBrokerDeps {
 export interface PluginDefinition {
   manifest: PluginManifest;
   dir: string;
-  skillsDir: string;
+  skillsDir?: string;
+}
+
+export interface InlinePluginManifestDefinition {
+  manifest: PluginManifest;
+  packageName?: string;
 }

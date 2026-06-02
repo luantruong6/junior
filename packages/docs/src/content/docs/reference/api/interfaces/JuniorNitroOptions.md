@@ -5,7 +5,7 @@ prev: false
 title: "JuniorNitroOptions"
 ---
 
-Defined in: [nitro.ts:11](https://github.com/getsentry/junior/blob/main/packages/junior/src/nitro.ts#L11)
+Defined in: [nitro.ts:33](https://github.com/getsentry/junior/blob/main/packages/junior/src/nitro.ts#L33)
 
 ## Properties
 
@@ -13,7 +13,7 @@ Defined in: [nitro.ts:11](https://github.com/getsentry/junior/blob/main/packages
 
 > `optional` **cwd?**: `string`
 
-Defined in: [nitro.ts:12](https://github.com/getsentry/junior/blob/main/packages/junior/src/nitro.ts#L12)
+Defined in: [nitro.ts:34](https://github.com/getsentry/junior/blob/main/packages/junior/src/nitro.ts#L34)
 
 ***
 
@@ -21,7 +21,7 @@ Defined in: [nitro.ts:12](https://github.com/getsentry/junior/blob/main/packages
 
 > `optional` **includeFiles?**: `string`[]
 
-Defined in: [nitro.ts:22](https://github.com/getsentry/junior/blob/main/packages/junior/src/nitro.ts#L22)
+Defined in: [nitro.ts:44](https://github.com/getsentry/junior/blob/main/packages/junior/src/nitro.ts#L44)
 
 Extra file patterns to copy into the server output for files that the
 bundler cannot trace (e.g. dynamically imported providers).
@@ -34,14 +34,14 @@ module resolution. Example: `"@earendil-works/pi-ai/dist/providers/*.js"`
 
 > `optional` **maxDuration?**: `number`
 
-Defined in: [nitro.ts:13](https://github.com/getsentry/junior/blob/main/packages/junior/src/nitro.ts#L13)
+Defined in: [nitro.ts:35](https://github.com/getsentry/junior/blob/main/packages/junior/src/nitro.ts#L35)
 
 ***
 
 ### plugins?
 
-> `optional` **plugins?**: `PluginConfig`
+> `optional` **plugins?**: `JuniorNitroPluginSource`
 
-Defined in: [nitro.ts:15](https://github.com/getsentry/junior/blob/main/packages/junior/src/nitro.ts#L15)
+Defined in: [nitro.ts:37](https://github.com/getsentry/junior/blob/main/packages/junior/src/nitro.ts#L37)
 
-Plugin packages and manifest overrides bundled into the app.
+Plugin catalog set or runtime-safe plugin module. Direct sets must not include trusted hooks.

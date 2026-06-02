@@ -23,14 +23,12 @@ pnpm add @sentry/junior @sentry/junior-linear
 
 ## Runtime setup
 
-List the plugin in `juniorNitro({ plugins: { packages: [...] } })`:
+Add the package name to the plugin set exported from `plugins.ts`:
 
-```ts title="nitro.config.ts"
-juniorNitro({
-  plugins: {
-    packages: ["@sentry/junior-linear"],
-  },
-});
+```ts title="plugins.ts"
+import { defineJuniorPlugins } from "@sentry/junior";
+
+export const plugins = defineJuniorPlugins(["@sentry/junior-linear"]);
 ```
 
 ## Auth model
