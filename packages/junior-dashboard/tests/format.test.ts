@@ -1,14 +1,24 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  buildConversations,
   canRenderStructuredMarkup,
+  conversationDisplayTitle,
+  conversationIdentityMeta,
+  conversationRequesterLabel,
+  formatConversationDuration,
   formatDurationTotal,
-  formatTokenTotal,
+  formatDurationTick,
+  formatTurnDuration,
   formatUsageTotal,
   parseMarkdownBlocks,
+  requesterLabel,
+  summarizeMessages,
+  summarizeToolCalls,
+  summarizeUsage,
   turnMessageCount,
 } from "../src/client/format";
-import type { ConversationTurn } from "../src/client/types";
+import type { ConversationTurn, Session } from "../src/client/types";
 
 describe("dashboard token formatting", () => {
   it("sums turn usage for conversation totals", () => {
@@ -26,19 +36,24 @@ describe("dashboard token formatting", () => {
     ).toBe("205 tokens");
   });
 
-  it("uses component counters for token totals when present", () => {
-    expect(
-      formatTokenTotal({
-        cachedInputTokens: 10,
-        inputTokens: 20,
-        outputTokens: 30,
-        totalTokens: 999,
-      }),
-    ).toBe("60 tokens");
-  });
-
   it("sums turn runtime when duration data exists", () => {
     expect(formatDurationTotal([1_000, 2_500, undefined])).toBe("3.5s");
+  });
+
+  it("rounds long chart duration ticks to whole minutes", () => {
+    expect(formatDurationTick(17 * 60_000 + 38_000)).toBe("18m");
+    expect(formatDurationTick(9 * 60_000 + 38_000)).toBe("9m 38s");
+    expect(formatDurationTick(9 * 60_000 + 59_900)).toBe("10m");
+  });
+
+  it("formats turn duration from start to completion time", () => {
+    expect(
+      formatTurnDuration({
+        completedAt: "2026-01-01T00:02:00.000Z",
+        lastSeenAt: "2026-01-01T00:05:00.000Z",
+        startedAt: "2026-01-01T00:00:00.000Z",
+      }),
+    ).toBe("2m 0s");
   });
 
   it("counts conversational transcript messages instead of tool events", () => {
@@ -71,6 +86,296 @@ describe("dashboard token formatting", () => {
     } as ConversationTurn;
 
     expect(turnMessageCount(turn)).toBe(2);
+  });
+
+  it("summarizes tooltip metrics from visible transcripts", () => {
+    const turn = {
+      id: "turn-1",
+      requesterIdentity: { fullName: "alice" },
+      status: "completed",
+      transcriptAvailable: true,
+      transcript: [
+        {
+          role: "user",
+          parts: [{ type: "text", text: "run search" }],
+        },
+        {
+          role: "assistant",
+          timestamp: 1_000,
+          parts: [{ type: "tool_call", id: "call-1", name: "search" }],
+        },
+        {
+          role: "toolResult",
+          timestamp: 2_500,
+          parts: [{ type: "tool_result", id: "call-1", name: "search" }],
+        },
+        {
+          role: "assistant",
+          parts: [{ type: "text", text: "done" }],
+        },
+      ],
+    } as ConversationTurn;
+
+    expect(summarizeToolCalls([turn])).toEqual({
+      items: [{ count: 1, name: "search", totalDurationMs: 1_500 }],
+      total: 1,
+    });
+    expect(summarizeMessages([turn])).toEqual({
+      items: [
+        { author: "alice", bytes: 10 },
+        { author: "Junior", bytes: 4 },
+      ],
+      total: 2,
+    });
+    expect(
+      summarizeUsage([
+        { cachedInputTokens: 2, inputTokens: 3, outputTokens: 5 },
+        { totalTokens: 7 },
+      ]),
+    ).toMatchObject({
+      cachedInputTokens: 2,
+      inputTokens: 3,
+      outputTokens: 5,
+      providerTotalTokens: 7,
+      totalTokens: 17,
+    });
+  });
+
+  it("does not match tool durations across different turns", () => {
+    const turns = [
+      {
+        id: "turn-1",
+        status: "completed",
+        transcriptAvailable: true,
+        transcript: [
+          {
+            role: "assistant",
+            timestamp: 1_000,
+            parts: [{ type: "tool_call", name: "search" }],
+          },
+        ],
+      },
+      {
+        id: "turn-2",
+        status: "completed",
+        transcriptAvailable: true,
+        transcript: [
+          {
+            role: "toolResult",
+            timestamp: 2_000,
+            parts: [{ type: "tool_result", name: "search" }],
+          },
+        ],
+      },
+    ] as ConversationTurn[];
+
+    expect(summarizeToolCalls(turns)).toEqual({
+      items: [{ count: 1, name: "search" }],
+      total: 1,
+    });
+  });
+
+  it("does not match id-bearing tool calls to name-only results", () => {
+    const turn = {
+      id: "turn-1",
+      status: "completed",
+      transcriptAvailable: true,
+      transcript: [
+        {
+          role: "assistant",
+          timestamp: 1_000,
+          parts: [{ type: "tool_call", id: "call-1", name: "search" }],
+        },
+        {
+          role: "assistant",
+          timestamp: 1_200,
+          parts: [{ type: "tool_call", id: "call-2", name: "search" }],
+        },
+        {
+          role: "toolResult",
+          timestamp: 1_800,
+          parts: [{ type: "tool_result", name: "search" }],
+        },
+      ],
+    } as ConversationTurn;
+
+    expect(summarizeToolCalls([turn])).toEqual({
+      items: [{ count: 2, name: "search" }],
+      total: 2,
+    });
+  });
+
+  it("does not infer tool durations for unnamed calls and results", () => {
+    const turn = {
+      id: "turn-1",
+      status: "completed",
+      transcriptAvailable: true,
+      transcript: [
+        {
+          role: "assistant",
+          timestamp: 1_000,
+          parts: [{ type: "tool_call" }],
+        },
+        {
+          role: "toolResult",
+          timestamp: 2_000,
+          parts: [{ type: "tool_result" }],
+        },
+      ],
+    } as ConversationTurn;
+
+    expect(summarizeToolCalls([turn])).toEqual({
+      items: [{ count: 1, name: "unknown" }],
+      total: 1,
+    });
+  });
+
+  it("does not synthesize conversation titles from requester display names", () => {
+    const sessions: Session[] = [
+      {
+        channel: "C1",
+        conversationId: "slack:C1:123",
+        id: "turn-1",
+        lastProgressAt: "2026-06-01T10:05:00.000Z",
+        lastSeenAt: "2026-06-01T10:05:00.000Z",
+        requesterIdentity: {
+          slackUserId: "U1",
+          slackUserName: "Alice Reviewer",
+        },
+        startedAt: "2026-06-01T10:00:00.000Z",
+        status: "completed",
+        surface: "slack",
+        title: "Turn turn-1",
+      },
+    ];
+    const [conversation] = buildConversations(sessions);
+
+    expect(conversationDisplayTitle(conversation)).toBe("Public Channel");
+    expect(conversationIdentityMeta(conversation, conversation?.id)).toBe(
+      "Alice Reviewer · slack:C1:123",
+    );
+  });
+
+  it("does not render a fake identity line before route data exists", () => {
+    expect(conversationIdentityMeta(undefined, undefined)).toBe("");
+  });
+
+  it("keeps Slack display names with spaces as requester labels", () => {
+    expect(
+      requesterLabel({ slackUserId: "U1", slackUserName: "Alice Reviewer" }),
+    ).toBe("Alice Reviewer");
+  });
+
+  it("keeps meaningful conversation titles that start with turn", () => {
+    const [conversation] = buildConversations([
+      {
+        channel: "C1",
+        channelName: "engineering",
+        conversationId: "slack:C1:123",
+        id: "turn-1",
+        lastProgressAt: "2026-06-01T10:05:00.000Z",
+        lastSeenAt: "2026-06-01T10:05:00.000Z",
+        startedAt: "2026-06-01T10:00:00.000Z",
+        status: "completed",
+        surface: "slack",
+        title: "Turn around the API design",
+      },
+    ]);
+
+    expect(conversationDisplayTitle(conversation)).toBe(
+      "Turn around the API design",
+    );
+  });
+
+  it("uses the newest available conversation title", () => {
+    const [conversation] = buildConversations([
+      {
+        conversationId: "slack:C1:123",
+        conversationTitle: "Older title",
+        id: "turn-1",
+        lastProgressAt: "2026-06-01T10:05:00.000Z",
+        lastSeenAt: "2026-06-01T10:05:00.000Z",
+        startedAt: "2026-06-01T10:00:00.000Z",
+        status: "completed",
+        surface: "slack",
+        title: "Turn turn-1",
+      },
+      {
+        conversationId: "slack:C1:123",
+        conversationTitle: "Newer title",
+        id: "turn-2",
+        lastProgressAt: "2026-06-01T11:05:00.000Z",
+        lastSeenAt: "2026-06-01T11:05:00.000Z",
+        startedAt: "2026-06-01T11:00:00.000Z",
+        status: "completed",
+        surface: "slack",
+        title: "Turn turn-2",
+      },
+    ]);
+
+    expect(conversationDisplayTitle(conversation)).toBe("Newer title");
+  });
+
+  it("keeps requester labels even when the title matches", () => {
+    const sessions: Session[] = [
+      {
+        channel: "C1",
+        channelName: "alice",
+        conversationId: "slack:C1:123",
+        conversationTitle: "Alice",
+        id: "turn-1",
+        lastProgressAt: "2026-06-01T10:05:00.000Z",
+        lastSeenAt: "2026-06-01T10:05:00.000Z",
+        requesterIdentity: {
+          fullName: "alice",
+          slackUserId: "U1",
+        },
+        startedAt: "2026-06-01T10:00:00.000Z",
+        status: "completed",
+        surface: "slack",
+        title: "Turn turn-1",
+      },
+    ];
+    const [conversation] = buildConversations(sessions);
+
+    expect(conversationRequesterLabel(conversation)).toBe("alice");
+    expect(conversationIdentityMeta(conversation, conversation?.id)).toBe(
+      "alice · slack:C1:123",
+    );
+  });
+
+  it("formats conversation spans with the compact conversation duration rules", () => {
+    const [conversation] = buildConversations([
+      {
+        conversationId: "slack:C1:123",
+        id: "turn-1",
+        lastProgressAt: "2026-06-01T10:02:29.000Z",
+        lastSeenAt: "2026-06-01T10:02:29.000Z",
+        startedAt: "2026-06-01T10:00:00.000Z",
+        status: "completed",
+        surface: "slack",
+        title: "Turn turn-1",
+      },
+    ]);
+
+    expect(formatConversationDuration(conversation!)).toBe("2m");
+  });
+
+  it("does not invent conversation spans without a valid end time", () => {
+    const [conversation] = buildConversations([
+      {
+        conversationId: "slack:C1:123",
+        id: "turn-1",
+        lastProgressAt: "2026-06-01T10:02:29.000Z",
+        lastSeenAt: "not-a-date",
+        startedAt: "2026-06-01T10:00:00.000Z",
+        status: "completed",
+        surface: "slack",
+        title: "Turn turn-1",
+      },
+    ]);
+
+    expect(formatConversationDuration(conversation!)).toBe("none");
   });
 });
 

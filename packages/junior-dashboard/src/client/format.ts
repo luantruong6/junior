@@ -8,9 +8,12 @@ import type {
   RequesterIdentity,
   Session,
   SessionFilter,
+  TranscriptMessage,
+  TranscriptPart,
   TurnUsage,
   VisualStatus,
 } from "./types";
+import { sameToolInvocation } from "./toolInvocations";
 
 let dashboardTimeZone = "America/Los_Angeles";
 
@@ -24,7 +27,7 @@ function displayTimeZone(): string {
 }
 
 function isActiveSession(session: Session): boolean {
-  return session.status === "active" || session.status === "running";
+  return session.status === "active";
 }
 
 /** Identify turn summaries that should appear in failed conversation filters. */
@@ -99,9 +102,20 @@ export function formatMs(value: number | undefined): string {
   if (ms < 1000) return `${ms}ms`;
   const seconds = ms / 1000;
   if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)}s`;
-  const minutes = Math.floor(seconds / 60);
-  const remainingSeconds = Math.round(seconds % 60);
+  const roundedSeconds = Math.round(seconds);
+  const minutes = Math.floor(roundedSeconds / 60);
+  const remainingSeconds = roundedSeconds % 60;
   return `${minutes}m ${remainingSeconds}s`;
+}
+
+/** Format chart duration ticks without long labels wrapping on the Y axis. */
+export function formatDurationTick(value: number | undefined): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "none";
+  const ms = Math.max(0, Math.floor(value));
+  if (Math.round(ms / 1000) >= 10 * 60) {
+    return `${Math.round(ms / (60 * 1000))}m`;
+  }
+  return formatMs(ms);
 }
 
 /** Format aggregate runtime across turn summaries when duration data exists. */
@@ -250,66 +264,261 @@ export function turnMessageCount(turn: ConversationTurn): number {
   return turn.transcriptMessageCount ?? 0;
 }
 
-/** Count tool calls from visible transcripts or safe redacted metadata. */
-export function turnToolCallCount(turn: ConversationTurn): number {
-  return transcriptSource(turn).reduce((count, message) => {
-    return (
-      count + message.parts.filter((part) => part.type === "tool_call").length
-    );
-  }, 0);
+export type ToolCallSummaryItem = {
+  count: number;
+  name: string;
+  totalDurationMs?: number;
+};
+
+export type ToolCallSummary = {
+  items: ToolCallSummaryItem[];
+  total: number;
+};
+
+type PendingToolCall = {
+  id?: string;
+  name: string;
+  timestamp?: number;
+};
+
+function toolCallName(part: TranscriptPart): string {
+  return part.name ?? part.id ?? "unknown";
 }
 
-function totalUsageTokens(usage: TurnUsage | undefined): number | undefined {
-  if (!usage) return undefined;
-  return (
-    getUsageComponentTotal(usage) ?? getFiniteTokenCount(usage.totalTokens)
-  );
+function findPendingToolCallIndex(
+  calls: PendingToolCall[],
+  result: TranscriptPart,
+): number {
+  for (let index = calls.length - 1; index >= 0; index -= 1) {
+    if (sameToolInvocation(calls[index]!, result)) {
+      return index;
+    }
+  }
+  return -1;
 }
 
-/** Format known token counters without estimating per-message usage. */
-export function formatTokenTotal(usage: TurnUsage | undefined): string {
-  const total = totalUsageTokens(usage);
-  return total === undefined ? "" : `${formatNumber(total)} tokens`;
+/** Summarize tool calls and matched result durations from transcript metadata. */
+export function summarizeToolCalls(
+  turns: ConversationTurn[],
+  limit = 5,
+): ToolCallSummary {
+  const byName = new Map<string, ToolCallSummaryItem>();
+  let total = 0;
+
+  for (const turn of turns) {
+    const pending: PendingToolCall[] = [];
+    for (const message of transcriptSource(turn)) {
+      for (const part of message.parts) {
+        if (part.type === "tool_call") {
+          const name = toolCallName(part);
+          const item = byName.get(name) ?? { count: 0, name };
+          item.count += 1;
+          byName.set(name, item);
+          pending.push({
+            ...(part.id ? { id: part.id } : {}),
+            name,
+            ...(typeof message.timestamp === "number"
+              ? { timestamp: message.timestamp }
+              : {}),
+          });
+          total += 1;
+          continue;
+        }
+
+        if (part.type !== "tool_result") continue;
+        const pendingIndex = findPendingToolCallIndex(pending, part);
+        if (pendingIndex < 0) continue;
+        const [call] = pending.splice(pendingIndex, 1);
+        if (
+          !call ||
+          typeof call.timestamp !== "number" ||
+          typeof message.timestamp !== "number" ||
+          message.timestamp < call.timestamp
+        ) {
+          continue;
+        }
+        const item = byName.get(call.name);
+        if (!item) continue;
+        item.totalDurationMs =
+          (item.totalDurationMs ?? 0) + (message.timestamp - call.timestamp);
+      }
+    }
+  }
+
+  const items = [...byName.values()]
+    .sort(
+      (left, right) =>
+        right.count - left.count ||
+        (right.totalDurationMs ?? 0) - (left.totalDurationMs ?? 0) ||
+        left.name.localeCompare(right.name),
+    )
+    .slice(0, limit);
+
+  return { items, total };
+}
+
+export type MessageSummaryItem = {
+  author: string;
+  bytes: number;
+};
+
+export type MessageSummary = {
+  items: MessageSummaryItem[];
+  total: number;
+};
+
+function transcriptMessageAuthor(
+  turn: ConversationTurn,
+  message: TranscriptMessage,
+): string {
+  const kind = transcriptRoleKind(message.role);
+  if (kind === "assistant") return "Junior";
+  if (kind === "user") {
+    return requesterLabel(turn.requesterIdentity) ?? "User";
+  }
+  if (kind === "system") return "System";
+  if (kind === "tool") return "Tool";
+  return message.role || "Unknown";
+}
+
+function transcriptPartBytes(part: TranscriptPart): number {
+  if (typeof part.bytes === "number" && Number.isFinite(part.bytes)) {
+    return Math.max(0, Math.floor(part.bytes));
+  }
+  if (
+    typeof part.inputSizeBytes === "number" &&
+    Number.isFinite(part.inputSizeBytes)
+  ) {
+    return Math.max(0, Math.floor(part.inputSizeBytes));
+  }
+  if (
+    typeof part.outputSizeBytes === "number" &&
+    Number.isFinite(part.outputSizeBytes)
+  ) {
+    return Math.max(0, Math.floor(part.outputSizeBytes));
+  }
+  return new TextEncoder().encode(
+    stringifyPartValue(part.text ?? part.input ?? part.output ?? part),
+  ).byteLength;
+}
+
+/** Summarize conversational messages by author and serialized size. */
+export function summarizeMessages(turns: ConversationTurn[]): MessageSummary {
+  const items: MessageSummaryItem[] = [];
+
+  for (const turn of turns) {
+    for (const message of transcriptSource(turn)) {
+      if (!isConversationMessage(message)) continue;
+      items.push({
+        author: transcriptMessageAuthor(turn, message),
+        bytes: message.parts.reduce(
+          (sum, part) => sum + transcriptPartBytes(part),
+          0,
+        ),
+      });
+    }
+  }
+
+  return { items, total: items.length };
+}
+
+/** Format raw counts with the dashboard's compact number rules. */
+export function formatCompactNumber(value: number | undefined): string {
+  return formatNumber(value);
+}
+
+export type TokenUsageSummary = {
+  cachedInputTokens?: number;
+  cacheCreationTokens?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  providerTotalTokens?: number;
+  totalTokens: number;
+};
+
+function addOptionalCount(
+  left: number | undefined,
+  right: number | undefined,
+): number | undefined {
+  return right === undefined ? left : (left ?? 0) + right;
+}
+
+/** Summarize token usage without double-counting provider total fields. */
+export function summarizeUsage(
+  usages: Array<TurnUsage | undefined>,
+): TokenUsageSummary | undefined {
+  const summary: TokenUsageSummary = { totalTokens: 0 };
+
+  for (const usage of usages) {
+    if (!usage) continue;
+
+    const componentTotal = getUsageComponentTotal(usage);
+    if (componentTotal !== undefined) {
+      summary.totalTokens += componentTotal;
+      summary.inputTokens = addOptionalCount(
+        summary.inputTokens,
+        getFiniteTokenCount(usage.inputTokens),
+      );
+      summary.outputTokens = addOptionalCount(
+        summary.outputTokens,
+        getFiniteTokenCount(usage.outputTokens),
+      );
+      summary.cachedInputTokens = addOptionalCount(
+        summary.cachedInputTokens,
+        getFiniteTokenCount(usage.cachedInputTokens),
+      );
+      summary.cacheCreationTokens = addOptionalCount(
+        summary.cacheCreationTokens,
+        getFiniteTokenCount(usage.cacheCreationTokens),
+      );
+      continue;
+    }
+
+    const providerTotal = getFiniteTokenCount(usage.totalTokens);
+    if (providerTotal !== undefined) {
+      summary.totalTokens += providerTotal;
+      summary.providerTotalTokens =
+        (summary.providerTotalTokens ?? 0) + providerTotal;
+    }
+  }
+
+  return summary.totalTokens > 0 ? summary : undefined;
+}
+
+/** Format a summarized token counter for compact metadata. */
+export function formatTokenSummary(
+  summary: TokenUsageSummary | undefined,
+): string {
+  return summary ? `${formatNumber(summary.totalTokens)} tokens` : "";
 }
 
 /** Format the aggregate token count across conversation turns. */
 export function formatUsageTotal(usages: Array<TurnUsage | undefined>): string {
-  const total = usages.reduce<number | undefined>((sum, usage) => {
-    const tokens = totalUsageTokens(usage);
-    if (tokens === undefined) return sum;
-    return (sum ?? 0) + tokens;
-  }, undefined);
-  return total === undefined ? "" : `${formatNumber(total)} tokens`;
+  return formatTokenSummary(summarizeUsage(usages));
 }
 
-/** Format known token counters with available input/output detail. */
-export function formatUsage(usage: TurnUsage | undefined): string {
-  const total = totalUsageTokens(usage);
-  if (total === undefined) return "";
-  const pieces = [
-    usage?.inputTokens !== undefined
-      ? `${formatNumber(usage.inputTokens)} in`
-      : undefined,
-    usage?.outputTokens !== undefined
-      ? `${formatNumber(usage.outputTokens)} out`
-      : undefined,
-    usage?.cachedInputTokens !== undefined
-      ? `${formatNumber(usage.cachedInputTokens)} cached`
-      : undefined,
-    usage?.cacheCreationTokens !== undefined
-      ? `${formatNumber(usage.cacheCreationTokens)} cache-write`
-      : undefined,
-  ].filter(Boolean);
-  return pieces.length > 0
-    ? `${formatNumber(total)} tokens (${pieces.join(" / ")})`
-    : `${formatNumber(total)} tokens`;
+/** Keep turn duration displays aligned on elapsed transcript time. */
+export function turnElapsedDurationMs(
+  turn: Pick<ConversationTurn, "completedAt" | "lastSeenAt" | "startedAt">,
+): number | undefined {
+  const start = parseTime(turn.startedAt);
+  const end = parseTime(turn.completedAt ?? turn.lastSeenAt);
+  if (start == null || end == null || end < start) return undefined;
+  return Math.max(0, end - start);
+}
+
+/** Format elapsed turn time for chart dots and transcript metadata. */
+export function formatTurnDuration(
+  turn: Pick<ConversationTurn, "completedAt" | "lastSeenAt" | "startedAt">,
+): string {
+  return formatMs(turnElapsedDurationMs(turn));
 }
 
 /** Format a conversation span from first turn start to latest activity. */
 export function formatConversationDuration(conversation: Conversation): string {
   const start = parseTime(conversation.startedAt);
-  const end = parseTime(conversation.lastSeenAt) ?? Date.now();
-  if (start == null || end < start) return "none";
+  const end = parseTime(conversation.lastSeenAt);
+  if (start == null || end == null || end < start) return "none";
   const seconds = Math.max(1, Math.round((end - start) / 1000));
   if (seconds < 60) return `${seconds}s`;
   const minutes = Math.round(seconds / 60);
@@ -319,7 +528,7 @@ export function formatConversationDuration(conversation: Conversation): string {
 
 /** Resolve the owning conversation id for a turn/session summary. */
 export function conversationIdForSession(session: Session): string {
-  return session.conversationId || session.id;
+  return session.conversationId;
 }
 
 function compareTimeDesc(a: string | undefined, b: string | undefined): number {
@@ -330,7 +539,27 @@ function compareTimeAsc(a: string | undefined, b: string | undefined): number {
   return (parseTime(a) ?? 0) - (parseTime(b) ?? 0);
 }
 
+function isGenericTurnTitle(title: string, conversationId: string): boolean {
+  const normalized = title.trim();
+  return (
+    normalized.length === 0 ||
+    normalized === conversationId ||
+    /^Turn\s+\S+$/i.test(normalized) ||
+    /^Awaiting\s+\w+\s+resume$/i.test(normalized)
+  );
+}
+
+function meaningfulConversationTitle(
+  conversation: Conversation,
+): string | undefined {
+  return isGenericTurnTitle(conversation.title, conversation.id)
+    ? undefined
+    : conversation.title;
+}
+
 function getConversationTitle(conversation: Conversation): string {
+  const title = meaningfulConversationTitle(conversation);
+  if (title) return title;
   if (conversation.surface === "slack") {
     return (
       slackLocationLabel(conversation, { includeId: false }) ??
@@ -351,15 +580,18 @@ export function conversationDisplayTitle(
 /** Prefer stable requester identifiers while keeping Slack ids as a last resort. */
 export function requesterLabel(
   requester: RequesterIdentity | undefined,
-  fallback: string | undefined,
 ): string | undefined {
-  return (
-    requester?.email ??
-    requester?.slackUserName ??
-    requester?.fullName ??
-    fallback ??
-    requester?.slackUserId
-  );
+  const email = requester?.email?.trim() || undefined;
+  const fullName = requester?.fullName?.trim() || undefined;
+  const slackUserName = requester?.slackUserName?.trim() || undefined;
+  return email ?? fullName ?? slackUserName ?? requester?.slackUserId;
+}
+
+/** Derive the conversation owner label from structured requester identity. */
+export function conversationRequesterLabel(
+  conversation: Conversation | undefined,
+): string | undefined {
+  return requesterLabel(conversation?.requesterIdentity);
 }
 
 /** Format the owner and permalink id line shared by conversation rows and headers. */
@@ -367,20 +599,15 @@ export function conversationIdentityMeta(
   conversation: Conversation | undefined,
   conversationId: string | undefined,
 ): string {
-  const id = conversationId ?? "missing conversation id";
-  const owner = requesterLabel(
-    conversation?.requesterIdentity,
-    conversation?.requester,
-  );
+  const id = conversationId ?? conversation?.id;
+  const owner = conversationRequesterLabel(conversation);
+  if (!id) return owner ?? "";
   return owner ? `${owner} · ${id}` : id;
 }
 
 /** Convert Slack channel ids and names into user-facing location labels. */
 export function slackLocationLabel(
-  input: Pick<
-    Session,
-    "channel" | "channelName" | "requester" | "requesterIdentity"
-  >,
+  input: Pick<Session, "channel" | "channelName">,
   options: { includeId?: boolean } = {},
 ): string | undefined {
   const channelId = input.channel;
@@ -675,12 +902,10 @@ export function buildConversations(sessions: Session[]): Conversation[] {
       const sortedTurns = [...turns].sort((a, b) =>
         compareTimeAsc(a.startedAt, b.startedAt),
       );
-      const newest = [...turns].sort((a, b) =>
-        compareTimeDesc(
-          a.lastSeenAt ?? a.startedAt,
-          b.lastSeenAt ?? b.startedAt,
-        ),
-      )[0]!;
+      const recentTurns = [...turns].sort((a, b) =>
+        compareTimeDesc(a.lastSeenAt, b.lastSeenAt),
+      );
+      const newest = recentTurns[0]!;
       const oldest = sortedTurns.reduce((current, next) =>
         (parseTime(next.startedAt) ?? Number.MAX_SAFE_INTEGER) <
         (parseTime(current.startedAt) ?? Number.MAX_SAFE_INTEGER)
@@ -694,28 +919,25 @@ export function buildConversations(sessions: Session[]): Conversation[] {
           : sortedTurns.some(isFailedSession)
             ? "failed"
             : newest.status;
-      const requesterTurn =
-        sortedTurns.find((turn) => turn.requesterIdentity) ??
-        sortedTurns.find((turn) => turn.requester);
+      const requesterTurn = sortedTurns.find((turn) => turn.requesterIdentity);
+      const conversationTitle = recentTurns.find(
+        (turn) => turn.conversationTitle,
+      )?.conversationTitle;
 
       return {
         channel: newest.channel,
-        channelName: sortedTurns.find((turn) => turn.channelName)?.channelName,
-        conversationTitle: sortedTurns.find((turn) => turn.conversationTitle)
-          ?.conversationTitle,
+        channelName: recentTurns.find((turn) => turn.channelName)?.channelName,
+        conversationTitle,
         id,
+        lastProgressAt: newest.lastProgressAt,
         lastSeenAt: newest.lastSeenAt,
-        requester: requesterLabel(
-          requesterTurn?.requesterIdentity,
-          requesterTurn?.requester,
-        ),
         requesterIdentity: requesterTurn?.requesterIdentity,
         sentryConversationUrl: newest.sentryConversationUrl,
         sentryTraceUrl: newest.sentryTraceUrl,
         startedAt: oldest.startedAt,
         status,
         surface: newest.surface,
-        title: newest.title || id,
+        title: newest.title,
         traceId: newest.traceId,
         turns: sortedTurns,
       };

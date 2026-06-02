@@ -55,27 +55,57 @@ export interface RuntimeInfoReport {
   packagedContent: ReturnType<typeof getPluginPackageContent>;
 }
 
+export type DashboardSessionStatus =
+  | "active"
+  | "completed"
+  | "failed"
+  | "hung"
+  | "superseded";
+
+export type DashboardSurface = "slack" | "api" | "scheduler" | "internal";
+
+export interface DashboardTurnUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  cachedInputTokens?: number;
+  cacheCreationTokens?: number;
+  totalTokens?: number;
+}
+
+export interface DashboardRequesterIdentity {
+  email?: string;
+  fullName?: string;
+  slackUserId?: string;
+  slackUserName?: string;
+}
+
 export interface DashboardSessionReport {
   conversationTitle?: string;
   cumulativeDurationMs?: number;
-  cumulativeUsage?: AgentTurnUsage;
+  cumulativeUsage?: DashboardTurnUsage;
   conversationId: string;
   id: string;
-  status: "active" | "completed" | "failed" | "hung" | "superseded";
+  status: DashboardSessionStatus;
   startedAt: string;
   lastSeenAt: string;
   lastProgressAt: string;
   completedAt?: string;
-  surface?: "slack" | "api" | "scheduler" | "internal";
-  title?: string;
-  requester?: string;
-  requesterIdentity?: AgentTurnRequester;
+  surface: DashboardSurface;
+  title: string;
+  requesterIdentity?: DashboardRequesterIdentity;
   channel?: string;
   channelName?: string;
   sentryConversationUrl?: string;
   sentryTraceUrl?: string;
   traceId?: string;
 }
+
+export type DashboardTranscriptPartType =
+  | "text"
+  | "thinking"
+  | "tool_call"
+  | "tool_result"
+  | "unknown";
 
 export interface DashboardTranscriptPart {
   bytes?: number;
@@ -93,13 +123,22 @@ export interface DashboardTranscriptPart {
   outputSizeChars?: number;
   outputType?: string;
   redacted?: boolean;
+  sourceType?: string;
   text?: string;
-  type: string;
+  type: DashboardTranscriptPartType;
 }
+
+export type DashboardTranscriptRole =
+  | "assistant"
+  | "system"
+  | "tool"
+  | "toolResult"
+  | "unknown"
+  | "user";
 
 export interface DashboardTranscriptMessage {
   parts: DashboardTranscriptPart[];
-  role: string;
+  role: DashboardTranscriptRole;
   timestamp?: number;
 }
 
@@ -200,9 +239,7 @@ function statusFromCheckpoint(
   return state;
 }
 
-function surfaceFromConversationId(
-  conversationId: string,
-): DashboardSessionReport["surface"] {
+function surfaceFromConversationId(conversationId: string): DashboardSurface {
   return parseSlackThreadId(conversationId) ? "slack" : "internal";
 }
 
@@ -211,18 +248,6 @@ function titleFromSummary(summary: AgentTurnSessionSummary): string {
     return `Awaiting ${summary.resumeReason} resume`;
   }
   return `Turn ${summary.sessionId}`;
-}
-
-function requesterLabel(
-  requester: AgentTurnRequester | undefined,
-): string | undefined {
-  if (!requester) return undefined;
-  return (
-    requester.email ??
-    requester.slackUserName ??
-    requester.fullName ??
-    requester.slackUserId
-  );
 }
 
 function safePrivateLabel(summary: AgentTurnSessionSummary): string {
@@ -238,6 +263,49 @@ function safePrivateLabel(summary: AgentTurnSessionSummary): string {
   return "Private Channel";
 }
 
+function requesterIdentityReport(
+  requester: AgentTurnRequester | undefined,
+): DashboardRequesterIdentity | undefined {
+  if (!requester) return undefined;
+  const identity: DashboardRequesterIdentity = {
+    ...(requester.email !== undefined ? { email: requester.email } : {}),
+    ...(requester.fullName !== undefined
+      ? { fullName: requester.fullName }
+      : {}),
+    ...(requester.slackUserId !== undefined
+      ? { slackUserId: requester.slackUserId }
+      : {}),
+    ...(requester.slackUserName !== undefined
+      ? { slackUserName: requester.slackUserName }
+      : {}),
+  };
+  return Object.keys(identity).length > 0 ? identity : undefined;
+}
+
+function turnUsageReport(
+  usage: AgentTurnUsage | undefined,
+): DashboardTurnUsage | undefined {
+  if (!usage) return undefined;
+  const report: DashboardTurnUsage = {
+    ...(usage.inputTokens !== undefined
+      ? { inputTokens: usage.inputTokens }
+      : {}),
+    ...(usage.outputTokens !== undefined
+      ? { outputTokens: usage.outputTokens }
+      : {}),
+    ...(usage.cachedInputTokens !== undefined
+      ? { cachedInputTokens: usage.cachedInputTokens }
+      : {}),
+    ...(usage.cacheCreationTokens !== undefined
+      ? { cacheCreationTokens: usage.cacheCreationTokens }
+      : {}),
+    ...(usage.totalTokens !== undefined
+      ? { totalTokens: usage.totalTokens }
+      : {}),
+  };
+  return Object.keys(report).length > 0 ? report : undefined;
+}
+
 function sessionReportFromSummary(
   summary: AgentTurnSessionSummary,
 ): DashboardSessionReport {
@@ -249,13 +317,14 @@ function sessionReportFromSummary(
     privacy !== "public" ? safePrivateLabel(summary) : undefined;
   const conversationTitle = privateLabel ?? summary.conversationTitle;
   const channelName = privateLabel ?? summary.channelName;
-  const requester = requesterLabel(summary.requester);
   const sentryConversationUrl = buildSentryConversationUrl(
     summary.conversationId,
   );
   const sentryTraceUrl = summary.traceId
     ? buildSentryTraceUrl(summary.traceId)
     : undefined;
+  const requesterIdentity = requesterIdentityReport(summary.requester);
+  const cumulativeUsage = turnUsageReport(summary.cumulativeUsage);
   return {
     conversationId: summary.conversationId,
     ...(conversationTitle ? { conversationTitle } : {}),
@@ -270,13 +339,10 @@ function sessionReportFromSummary(
     ...(summary.cumulativeDurationMs !== undefined
       ? { cumulativeDurationMs: summary.cumulativeDurationMs }
       : {}),
-    ...(summary.cumulativeUsage
-      ? { cumulativeUsage: summary.cumulativeUsage }
-      : {}),
+    ...(cumulativeUsage ? { cumulativeUsage } : {}),
     surface: surfaceFromConversationId(summary.conversationId),
     title: titleFromSummary(summary),
-    ...(requester ? { requester } : {}),
-    ...(summary.requester ? { requesterIdentity: summary.requester } : {}),
+    ...(requesterIdentity ? { requesterIdentity } : {}),
     ...(slackThread ? { channel: slackThread.channelId } : {}),
     ...(channelName ? { channelName } : {}),
     ...(sentryConversationUrl ? { sentryConversationUrl } : {}),
@@ -345,7 +411,8 @@ function normalizeTranscriptPart(part: unknown): DashboardTranscriptPart {
   }
 
   return {
-    type: rawType,
+    type: "unknown",
+    ...(rawType !== "unknown" ? { sourceType: rawType } : {}),
     output: part,
   };
 }
@@ -381,7 +448,7 @@ function normalizeTranscriptMessage(
 ): DashboardTranscriptMessage {
   const record = message as unknown as Record<string, unknown>;
   const content = record.content;
-  const role = typeof record.role === "string" ? record.role : "unknown";
+  const role = transcriptRole(record.role);
   return {
     role,
     ...(typeof record.timestamp === "number"
@@ -394,6 +461,16 @@ function normalizeTranscriptMessage(
           ? content.map(normalizeTranscriptPart)
           : [normalizeTranscriptPart(content)],
   };
+}
+
+function transcriptRole(role: unknown): DashboardTranscriptRole {
+  return role === "assistant" ||
+    role === "system" ||
+    role === "tool" ||
+    role === "toolResult" ||
+    role === "user"
+    ? role
+    : "unknown";
 }
 
 function serializedChars(value: unknown): number {
@@ -468,8 +545,9 @@ function redactTranscriptPart(
     };
   }
   return {
-    type: part.type,
+    type: "unknown",
     redacted: true,
+    ...(part.sourceType ? { sourceType: part.sourceType } : {}),
     ...redactedPayloadFields("output", part.output ?? part.input ?? part.text),
   };
 }
@@ -486,9 +564,8 @@ function redactTranscriptMessage(
   };
 }
 
-function isConversationMessageRole(role: string): boolean {
-  const normalized = role.toLowerCase();
-  return normalized === "user" || normalized === "assistant";
+function isConversationMessageRole(role: DashboardTranscriptRole): boolean {
+  return role === "user" || role === "assistant";
 }
 
 function hasTextPart(message: DashboardTranscriptMessage): boolean {
@@ -501,7 +578,7 @@ function hasTextPart(message: DashboardTranscriptMessage): boolean {
 
 function isConversationMessage(message: DashboardTranscriptMessage): boolean {
   if (!isConversationMessageRole(message.role)) return false;
-  if (message.role.toLowerCase() === "assistant") return hasTextPart(message);
+  if (message.role === "assistant") return hasTextPart(message);
   return message.parts.length > 0;
 }
 

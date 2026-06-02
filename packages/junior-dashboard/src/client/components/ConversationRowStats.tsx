@@ -16,10 +16,11 @@ export function ConversationRowStats(props: {
   const runtime = formatDurationTotal(
     props.conversation.turns.map((turn) => turn.cumulativeDurationMs),
   );
+  const turnCount = props.conversation.turns.length;
   const primaryStats = [
-    `${props.conversation.turns.length} turns`,
+    `${turnCount} ${turnCount === 1 ? "turn" : "turns"}`,
     tokens,
-    runtime ? `${runtime} runtime` : undefined,
+    runtime ? `${runtime} runtime` : "",
   ].filter(Boolean);
   const secondaryStats = [
     props.timeLabel,

@@ -1,22 +1,57 @@
 import { countStructuredBlockChildren } from "../code";
-import { parseMarkdownBlocks, stringifyPartValue, transcriptRoleKind } from "../format";
+import {
+  parseMarkdownBlocks,
+  stringifyPartValue,
+  transcriptRoleKind,
+} from "../format";
+import { sameToolInvocation } from "../toolInvocations";
 import type { TranscriptMessage, TranscriptPart } from "../types";
+
+type RenderedToolPart =
+  | { call: TranscriptPart; kind: "tool"; result?: TranscriptPart }
+  | { call?: undefined; kind: "tool"; result: TranscriptPart };
 
 export type RenderedTranscriptPart =
   | { kind: "part"; part: TranscriptPart }
-  | { kind: "tool"; call?: TranscriptPart; result?: TranscriptPart };
+  | RenderedToolPart;
 
 type RenderedTranscriptEntry =
   | { kind: "message"; message: TranscriptMessage }
+  | RenderedThinkingEntry
   | RenderedToolEntry;
 
-type RenderedToolEntry = {
-  call?: TranscriptPart;
-  kind: "tool";
-  result?: TranscriptPart;
-  resultTimestamp?: number;
+type RenderedThinkingEntry = {
+  kind: "thinking";
+  part: TranscriptPart;
   timestamp?: number;
 };
+
+type RenderedToolEntry =
+  | {
+      call: TranscriptPart;
+      kind: "tool";
+      result?: TranscriptPart;
+      resultTimestamp?: number;
+      timestamp?: number;
+    }
+  | {
+      call?: undefined;
+      kind: "tool";
+      result: TranscriptPart;
+      resultTimestamp?: number;
+      timestamp?: never;
+    };
+
+type RenderedToolCallEntry = Extract<
+  RenderedToolEntry,
+  { call: TranscriptPart }
+>;
+
+function isRenderedToolCallEntry(
+  entry: RenderedTranscriptEntry,
+): entry is RenderedToolCallEntry {
+  return entry.kind === "tool" && entry.call !== undefined;
+}
 
 export type TranscriptViewMode = "raw" | "rich";
 
@@ -28,17 +63,12 @@ function isToolResult(part: TranscriptPart): boolean {
   return part.type === "tool_result";
 }
 
-function isString(value: string | undefined): value is string {
-  return typeof value === "string" && value.length > 0;
+function isThinking(part: TranscriptPart): boolean {
+  return part.type === "thinking";
 }
 
-function sameToolInvocation(
-  call: TranscriptPart,
-  result: TranscriptPart,
-): boolean {
-  if (call.id && result.id) return call.id === result.id;
-  if (call.name && result.name) return call.name === result.name;
-  return false;
+function isString(value: string | undefined): value is string {
+  return typeof value === "string" && value.length > 0;
 }
 
 /** Group inline transcript parts so matching tool calls/results render together. */
@@ -83,11 +113,11 @@ export function groupTranscriptParts(
 function findToolEntry(
   entries: RenderedTranscriptEntry[],
   result: TranscriptPart,
-): RenderedToolEntry | undefined {
+): RenderedToolCallEntry | undefined {
   for (let index = entries.length - 1; index >= 0; index -= 1) {
     const entry = entries[index]!;
-    if (entry.kind !== "tool" || entry.result) continue;
-    if (!entry.call || sameToolInvocation(entry.call, result)) {
+    if (!isRenderedToolCallEntry(entry) || entry.result) continue;
+    if (sameToolInvocation(entry.call, result)) {
       return entry;
     }
   }
@@ -135,6 +165,16 @@ export function groupTranscriptMessages(
             resultTimestamp: message.timestamp,
           });
         }
+        continue;
+      }
+
+      if (isThinking(part)) {
+        flushMessage();
+        entries.push({
+          kind: "thinking",
+          part,
+          timestamp: message.timestamp,
+        });
         continue;
       }
 
