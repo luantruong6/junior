@@ -83,7 +83,8 @@ Define how Junior maps registered plugin provider domains to host-managed creden
 - When a GitHub App lease is issued for a system actor, runtime must send an explicit read-only permissions body instead of inheriting the installation's default permissions.
 - If GitHub App `credentials.system-read-permissions` is declared, runtime requests only those scopes plus `metadata`, all at `read`.
 - If no system read permissions are declared, runtime reads the installation permission envelope and requests only the safe default read subset that the installation actually has: `metadata`, `contents`, `issues`, `pull_requests`, `checks`, `statuses`, and `actions`.
-- Provider `401`/`403` responses discard the cached sandbox egress lease so resumed auth can mint from current provider state.
+- Provider `401`/`403` responses discard the cached sandbox egress lease so the next request re-issues from current provider state.
+- When an upstream `401` is received for a request where Junior injected an OAuth bearer credential, the proxy replaces the raw provider response body with the `junior-auth-required provider=<name> 401 unauthorized` sentinel. Plugin auth orchestration reads this sentinel, unlinks the stored token, and starts the private OAuth reconnect flow. `403` responses (permission denied for a valid token) pass through raw.
 
 ## Sentry profile
 
