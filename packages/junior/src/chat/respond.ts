@@ -79,6 +79,7 @@ import {
 import type { SandboxWorkspace } from "@/chat/sandbox/workspace";
 import { shouldEmitDevAgentTrace } from "@/chat/runtime/dev-agent-trace";
 import type { AssistantStatusSpec } from "@/chat/slack/assistant-thread/status";
+import type { SlackConversationContext } from "@/chat/slack/conversation-context";
 import { createAgentTools } from "@/chat/tools/agent-tools";
 import { mergeArtifactsState } from "@/chat/runtime/thread-state";
 import { RetryableTurnError, isRetryableTurnError } from "@/chat/runtime/turn";
@@ -88,7 +89,7 @@ import {
   getSessionIdentifiers,
   hasRuntimeTurnContext,
   isAssistantMessage,
-  refreshRuntimeTurnContext,
+  prependMissingRuntimeTurnContext,
   summarizeMessageText,
   toObservablePromptPart,
   upsertActiveSkill,
@@ -187,6 +188,7 @@ export interface ReplyRequestContext {
     fullName?: string;
     email?: string;
   };
+  slackConversation?: SlackConversationContext;
   correlation?: {
     conversationId?: string;
     threadId?: string;
@@ -959,21 +961,23 @@ export async function generateAssistantReply(
       turnMcpToolManager.getActiveToolCatalog(),
     );
     baseInstructions = buildSystemPrompt();
-    const includeSessionContext =
-      resumedFromSessionRecord || !hasRuntimeTurnContext(priorPiMessages ?? []);
-    const turnContextPrompt = buildTurnContextPrompt({
-      availableSkills,
-      activeMcpCatalogs,
-      includeSessionContext,
-      toolGuidance,
-      runtime: {
-        conversationId: spanContext.conversationId,
-      },
-      invocation: skillInvocation,
-      requester: context.requester,
-      artifactState: context.artifactState,
-      configuration: configurationValues,
-    });
+    const needsBootstrapContext = !hasRuntimeTurnContext(priorPiMessages ?? []);
+    const turnContextPrompt = needsBootstrapContext
+      ? buildTurnContextPrompt({
+          availableSkills,
+          activeMcpCatalogs,
+          includeSessionContext: true,
+          toolGuidance,
+          runtime: {
+            conversationId: spanContext.conversationId,
+            slackConversation: context.slackConversation,
+          },
+          invocation: skillInvocation,
+          requester: context.requester,
+          artifactState: context.artifactState,
+          configuration: configurationValues,
+        })
+      : null;
     const turnContextParts: UserTurnContentPart[] = turnContextPrompt
       ? [{ type: "text", text: turnContextPrompt }]
       : [];
@@ -1129,7 +1133,7 @@ export async function generateAssistantReply(
     try {
       if (resumedFromSessionRecord) {
         agent.state.messages = turnContextPrompt
-          ? refreshRuntimeTurnContext(
+          ? prependMissingRuntimeTurnContext(
               existingSessionRecord!.piMessages,
               turnContextPrompt,
             )

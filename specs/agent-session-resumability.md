@@ -3,7 +3,7 @@
 ## Metadata
 
 - Created: 2026-03-05
-- Last Edited: 2026-05-30
+- Last Edited: 2026-06-03
 
 ## Purpose
 
@@ -263,6 +263,15 @@ If a future runtime feature needs state at resume time, first ask whether it can
 be recomputed by reducing the session log plus loading external resources by
 pointer. If yes, do not persist it. If not, represent it as a minimal session-log
 event or define the projection/filtering rule.
+
+Slack conversation type/name supplied in the first runtime-context block is
+bootstrap prompt material already recorded in the Pi user message. Timeout and
+OAuth resumes must not persist a second copy or re-send the original prompt
+context; existing runtime-context blocks in projected Pi history must be left
+unchanged before calling `continue()`. If a pause is captured before `prompt()`
+has sent bootstrap context, the runtime may attach that missing block once to
+the stored user boundary; that is first-prompt construction, not replacement of
+an existing block.
 
 ### Compaction Projection
 

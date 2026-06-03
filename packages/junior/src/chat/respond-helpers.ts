@@ -274,7 +274,7 @@ function isRuntimeTurnContextPart(part: unknown, marker: string): boolean {
   );
 }
 
-function replaceRuntimeTurnContext(
+function prependRuntimeTurnContext(
   message: PiMessage,
   turnContextPrompt: string,
 ): PiMessage | undefined {
@@ -283,32 +283,32 @@ function replaceRuntimeTurnContext(
     return undefined;
   }
 
-  const marker = turnContextPrompt.split("\n", 1)[0];
   const contextIndex = content.findIndex((part) =>
-    isRuntimeTurnContextPart(part, marker),
+    isRuntimeTurnContextPart(part, RUNTIME_TURN_CONTEXT_START),
   );
-  if (contextIndex < 0) {
+  if (contextIndex >= 0) {
     return undefined;
   }
 
-  const nextContent = [...content];
-  nextContent[contextIndex] = {
-    ...(nextContent[contextIndex] as object),
-    text: turnContextPrompt,
-  };
   return {
     ...message,
-    content: nextContent,
+    content: [{ type: "text", text: turnContextPrompt }, ...content],
   } as PiMessage;
 }
 
-/** Refresh volatile runtime context in session history before continuing Pi. */
-export function refreshRuntimeTurnContext(
+/**
+ * Add bootstrap context only for stored boundaries captured before prompt().
+ */
+export function prependMissingRuntimeTurnContext(
   messages: PiMessage[],
   turnContextPrompt: string,
 ): PiMessage[] {
-  for (let index = 0; index < messages.length; index += 1) {
-    const updated = replaceRuntimeTurnContext(
+  if (hasRuntimeTurnContext(messages)) {
+    return messages;
+  }
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const updated = prependRuntimeTurnContext(
       messages[index],
       turnContextPrompt,
     );
@@ -318,20 +318,6 @@ export function refreshRuntimeTurnContext(
 
     const nextMessages = [...messages];
     nextMessages[index] = updated;
-    return nextMessages;
-  }
-
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const content = getUserMessageContent(messages[index]);
-    if (!content) {
-      continue;
-    }
-
-    const nextMessages = [...messages];
-    nextMessages[index] = {
-      ...messages[index],
-      content: [{ type: "text", text: turnContextPrompt }, ...content],
-    } as PiMessage;
     return nextMessages;
   }
 
