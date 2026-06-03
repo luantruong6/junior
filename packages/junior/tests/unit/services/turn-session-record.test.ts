@@ -205,6 +205,63 @@ describe("persistAuthPauseSessionRecord", () => {
     });
   });
 
+  it("fails timeout sessions instead of scheduling beyond the slice cap", async () => {
+    const {
+      AGENT_TURN_TIMEOUT_RESUME_MAX_SLICES,
+      persistTimeoutSessionRecord,
+    } = await import("@/chat/services/turn-session-record");
+    const { getAgentTurnSessionRecord, upsertAgentTurnSessionRecord } =
+      await import("@/chat/state/turn-session");
+
+    const piMessages: PiMessage[] = [
+      {
+        role: "user",
+        content: [{ type: "text", text: "keep trying" }],
+        timestamp: 1,
+      },
+    ];
+
+    await upsertAgentTurnSessionRecord({
+      conversationId: "conversation-timeout-cap",
+      sessionId: "turn-timeout-cap",
+      sliceId: AGENT_TURN_TIMEOUT_RESUME_MAX_SLICES,
+      state: "awaiting_resume",
+      piMessages,
+      resumeReason: "timeout",
+      cumulativeDurationMs: 12_000,
+    });
+
+    await expect(
+      persistTimeoutSessionRecord({
+        conversationId: "conversation-timeout-cap",
+        sessionId: "turn-timeout-cap",
+        currentSliceId: AGENT_TURN_TIMEOUT_RESUME_MAX_SLICES,
+        currentDurationMs: 3_000,
+        messages: piMessages,
+        errorMessage: "timed out again",
+        logContext: {
+          modelId: "test-model",
+        },
+      }),
+    ).resolves.toMatchObject({
+      state: "failed",
+      sliceId: AGENT_TURN_TIMEOUT_RESUME_MAX_SLICES,
+      cumulativeDurationMs: 15_000,
+      errorMessage: expect.stringContaining("slice limit"),
+      piMessages,
+    });
+
+    await expect(
+      getAgentTurnSessionRecord("conversation-timeout-cap", "turn-timeout-cap"),
+    ).resolves.toMatchObject({
+      state: "failed",
+      sliceId: AGENT_TURN_TIMEOUT_RESUME_MAX_SLICES,
+      cumulativeDurationMs: 15_000,
+      errorMessage: expect.stringContaining("slice limit"),
+      piMessages,
+    });
+  });
+
   it("falls back to the last stored safe boundary when auth pause captures a non-continuable tail", async () => {
     const { persistAuthPauseSessionRecord } =
       await import("@/chat/services/turn-session-record");
@@ -454,25 +511,29 @@ describe("persistAuthPauseSessionRecord", () => {
       } as PiMessage,
     ];
 
-    await persistRunningSessionRecord({
-      conversationId: "conversation-1",
-      sessionId: "turn-1",
-      sliceId: 1,
-      messages: userBoundary,
-      logContext: {
-        modelId: "test-model",
-      },
-    });
+    await expect(
+      persistRunningSessionRecord({
+        conversationId: "conversation-1",
+        sessionId: "turn-1",
+        sliceId: 1,
+        messages: userBoundary,
+        logContext: {
+          modelId: "test-model",
+        },
+      }),
+    ).resolves.toBe(true);
 
-    await persistRunningSessionRecord({
-      conversationId: "conversation-1",
-      sessionId: "turn-1",
-      sliceId: 1,
-      messages: unsafeAssistantBoundary,
-      logContext: {
-        modelId: "test-model",
-      },
-    });
+    await expect(
+      persistRunningSessionRecord({
+        conversationId: "conversation-1",
+        sessionId: "turn-1",
+        sliceId: 1,
+        messages: unsafeAssistantBoundary,
+        logContext: {
+          modelId: "test-model",
+        },
+      }),
+    ).resolves.toBe(false);
 
     let sessionRecord = await getAgentTurnSessionRecord(
       "conversation-1",
@@ -483,21 +544,56 @@ describe("persistAuthPauseSessionRecord", () => {
       piMessages: userBoundary,
     });
 
-    await persistRunningSessionRecord({
-      conversationId: "conversation-1",
-      sessionId: "turn-1",
-      sliceId: 1,
-      messages: toolResultBoundary,
-      logContext: {
-        modelId: "test-model",
-      },
-    });
+    await expect(
+      persistRunningSessionRecord({
+        conversationId: "conversation-1",
+        sessionId: "turn-1",
+        sliceId: 1,
+        messages: toolResultBoundary,
+        logContext: {
+          modelId: "test-model",
+        },
+      }),
+    ).resolves.toBe(true);
 
     sessionRecord = await getAgentTurnSessionRecord("conversation-1", "turn-1");
     expect(sessionRecord).toMatchObject({
       state: "running",
       piMessages: toolResultBoundary,
     });
+  });
+
+  it("reports running record storage failures", async () => {
+    vi.doMock("@/chat/state/turn-session", async (importOriginal) => {
+      const actual =
+        await importOriginal<typeof import("@/chat/state/turn-session")>();
+      return {
+        ...actual,
+        upsertAgentTurnSessionRecord: vi.fn(async () => {
+          throw new Error("storage unavailable");
+        }),
+      };
+    });
+    const { persistRunningSessionRecord } =
+      await import("@/chat/services/turn-session-record");
+
+    await expect(
+      persistRunningSessionRecord({
+        conversationId: "conversation-storage-failure",
+        sessionId: "turn-storage-failure",
+        sliceId: 1,
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "text", text: "help me" }],
+            timestamp: 1,
+          },
+        ],
+        logContext: {
+          modelId: "test-model",
+        },
+      }),
+    ).resolves.toBe(false);
   });
 
   it("promotes the latest running record when timeout capture has no messages", async () => {

@@ -110,6 +110,45 @@ describe("buildTurnResult", () => {
     expect(reply.diagnostics.usedPrimaryText).toBe(true);
   });
 
+  it("keeps assistant text across steered user messages", () => {
+    const reply = buildTurnResult({
+      newMessages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "first request" }],
+        },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "Initial answer." }],
+          stopReason: "stop",
+        },
+        {
+          role: "user",
+          content: [{ type: "text", text: "actually do this instead" }],
+        },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "Updated answer." }],
+          stopReason: "stop",
+        },
+      ],
+      userInput: "first request",
+      replyFiles: [],
+      artifactStatePatch: {},
+      toolCalls: [],
+      generatedFileCount: 0,
+      shouldTrace: false,
+      spanContext: {},
+      thinkingSelection,
+    });
+
+    expect(reply.text).toBe(
+      ["Initial answer.", "Updated answer."].join("\n\n"),
+    );
+    expect(reply.diagnostics.outcome).toBe("success");
+    expect(reply.diagnostics.assistantMessageCount).toBe(2);
+  });
+
   it("removes leaked thinking blocks from terminal assistant text", () => {
     const reply = buildTurnResult({
       newMessages: [

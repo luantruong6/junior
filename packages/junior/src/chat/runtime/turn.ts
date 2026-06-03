@@ -61,6 +61,39 @@ export function isRetryableTurnError(
   return error.reason === reason;
 }
 
+/** Error indicating the turn paused voluntarily at a safe continuation boundary. */
+export class CooperativeTurnYieldError extends Error {
+  readonly code = "cooperative_turn_yield";
+
+  constructor(message = "Agent turn yielded at a safe boundary") {
+    super(message);
+    this.name = "CooperativeTurnYieldError";
+  }
+}
+
+export function isCooperativeTurnYieldError(
+  error: unknown,
+): error is CooperativeTurnYieldError {
+  return error instanceof CooperativeTurnYieldError;
+}
+
+/** Error indicating durable turn input could not be committed by the worker owner. */
+export class TurnInputCommitLostError extends Error {
+  readonly code = "turn_input_commit_lost";
+
+  constructor(message = "Turn input commit lost its durable owner") {
+    super(message);
+    this.name = "TurnInputCommitLostError";
+  }
+}
+
+/** Return whether an error means the durable worker lost input ownership. */
+export function isTurnInputCommitLostError(
+  error: unknown,
+): error is TurnInputCommitLostError {
+  return error instanceof TurnInputCommitLostError;
+}
+
 // ---------------------------------------------------------------------------
 // Turn lifecycle mutations
 // ---------------------------------------------------------------------------

@@ -12,6 +12,8 @@ import {
 } from "@/chat/respond-helpers";
 import { addAgentTurnUsage, type AgentTurnUsage } from "@/chat/usage";
 
+export const AGENT_TURN_TIMEOUT_RESUME_MAX_SLICES = 48;
+
 export interface TurnSessionContext {
   conversationId?: string;
   sessionId?: string;
@@ -132,9 +134,9 @@ export async function persistRunningSessionRecord(args: {
   loadedSkillNames?: string[];
   logContext: SessionRecordLogContext;
   requester?: AgentTurnRequester;
-}): Promise<void> {
+}): Promise<boolean> {
   if (args.messages.length === 0 || !isContinuableBoundary(args.messages)) {
-    return;
+    return false;
   }
 
   try {
@@ -159,10 +161,11 @@ export async function persistRunningSessionRecord(args: {
       ...((args.requester ?? latestSessionRecord?.requester)
         ? { requester: args.requester ?? latestSessionRecord?.requester }
         : {}),
-      ...(getActiveTraceId() ?? latestSessionRecord?.traceId
+      ...((getActiveTraceId() ?? latestSessionRecord?.traceId)
         ? { traceId: getActiveTraceId() ?? latestSessionRecord?.traceId }
         : {}),
     });
+    return true;
   } catch (recordError) {
     logSessionRecordError(
       recordError,
@@ -173,6 +176,7 @@ export async function persistRunningSessionRecord(args: {
       },
       "Failed to persist running turn session record",
     );
+    return false;
   }
 }
 
@@ -217,7 +221,7 @@ export async function persistCompletedSessionRecord(args: {
       ...((args.requester ?? latestSessionRecord?.requester)
         ? { requester: args.requester ?? latestSessionRecord?.requester }
         : {}),
-      ...(getActiveTraceId() ?? latestSessionRecord?.traceId
+      ...((getActiveTraceId() ?? latestSessionRecord?.traceId)
         ? { traceId: getActiveTraceId() ?? latestSessionRecord?.traceId }
         : {}),
     });
@@ -290,7 +294,7 @@ export async function persistAuthPauseSessionRecord(args: {
       ...((args.requester ?? latestSessionRecord?.requester)
         ? { requester: args.requester ?? latestSessionRecord?.requester }
         : {}),
-      ...(getActiveTraceId() ?? latestSessionRecord?.traceId
+      ...((getActiveTraceId() ?? latestSessionRecord?.traceId)
         ? { traceId: getActiveTraceId() ?? latestSessionRecord?.traceId }
         : {}),
     });
@@ -311,7 +315,7 @@ export async function persistAuthPauseSessionRecord(args: {
 
 /**
  * Persist a timeout session record at the last safe boundary. Returns the durable
- * record when persistence succeeds so callers can enqueue a continuation.
+ * record so callers can distinguish scheduled continuations from terminal caps.
  */
 export async function persistTimeoutSessionRecord(args: {
   channelName?: string;
@@ -340,6 +344,109 @@ export async function persistTimeoutSessionRecord(args: {
     if (piMessages.length === 0 || !isContinuableBoundary(piMessages)) {
       return undefined;
     }
+    const cumulativeDurationMs = addDurationMs(
+      latestSessionRecord?.cumulativeDurationMs,
+      args.currentDurationMs,
+    );
+    const cumulativeUsage = addAgentTurnUsage(
+      latestSessionRecord?.cumulativeUsage,
+      args.currentUsage,
+    );
+    if (nextSliceId > AGENT_TURN_TIMEOUT_RESUME_MAX_SLICES) {
+      return await upsertAgentTurnSessionRecord({
+        ...((args.channelName ?? latestSessionRecord?.channelName)
+          ? {
+              channelName: args.channelName ?? latestSessionRecord?.channelName,
+            }
+          : {}),
+        conversationId: args.conversationId,
+        cumulativeDurationMs,
+        cumulativeUsage,
+        sessionId: args.sessionId,
+        sliceId: args.currentSliceId,
+        state: "failed",
+        piMessages,
+        ...(args.loadedSkillNames
+          ? { loadedSkillNames: args.loadedSkillNames }
+          : {}),
+        resumeReason: "timeout",
+        resumedFromSliceId: latestSessionRecord?.resumedFromSliceId,
+        errorMessage: `Turn exceeded timeout resume slice limit (${AGENT_TURN_TIMEOUT_RESUME_MAX_SLICES})`,
+        ...((args.requester ?? latestSessionRecord?.requester)
+          ? { requester: args.requester ?? latestSessionRecord?.requester }
+          : {}),
+        ...((getActiveTraceId() ?? latestSessionRecord?.traceId)
+          ? { traceId: getActiveTraceId() ?? latestSessionRecord?.traceId }
+          : {}),
+      });
+    }
+    return await upsertAgentTurnSessionRecord({
+      ...((args.channelName ?? latestSessionRecord?.channelName)
+        ? { channelName: args.channelName ?? latestSessionRecord?.channelName }
+        : {}),
+      conversationId: args.conversationId,
+      cumulativeDurationMs,
+      cumulativeUsage,
+      sessionId: args.sessionId,
+      sliceId: nextSliceId,
+      state: "awaiting_resume",
+      piMessages,
+      ...(args.loadedSkillNames
+        ? { loadedSkillNames: args.loadedSkillNames }
+        : {}),
+      resumeReason: "timeout",
+      resumedFromSliceId: args.currentSliceId,
+      errorMessage: args.errorMessage,
+      ...((args.requester ?? latestSessionRecord?.requester)
+        ? { requester: args.requester ?? latestSessionRecord?.requester }
+        : {}),
+      ...((getActiveTraceId() ?? latestSessionRecord?.traceId)
+        ? { traceId: getActiveTraceId() ?? latestSessionRecord?.traceId }
+        : {}),
+    });
+  } catch (recordError) {
+    logSessionRecordError(
+      recordError,
+      "agent_turn_timeout_resume_session_record_failed",
+      args,
+      {
+        "app.ai.resume_from_slice_id": args.currentSliceId,
+        "app.ai.resume_next_slice_id": nextSliceId,
+      },
+      "Failed to persist timeout session record before scheduling resume",
+    );
+    return undefined;
+  }
+}
+
+/**
+ * Persist a cooperative-yield boundary without advancing timeout slice counts.
+ */
+export async function persistYieldSessionRecord(args: {
+  channelName?: string;
+  conversationId: string;
+  sessionId: string;
+  currentSliceId: number;
+  currentDurationMs?: number;
+  currentUsage?: AgentTurnUsage;
+  messages: PiMessage[];
+  loadedSkillNames?: string[];
+  errorMessage: string;
+  logContext: SessionRecordLogContext;
+  requester?: AgentTurnRequester;
+}): Promise<AgentTurnSessionRecord | undefined> {
+  try {
+    const latestSessionRecord = await getAgentTurnSessionRecord(
+      args.conversationId,
+      args.sessionId,
+    );
+    const piMessages = resumableBoundary(
+      args.messages,
+      latestSessionRecord?.piMessages,
+    );
+    if (piMessages.length === 0 || !isContinuableBoundary(piMessages)) {
+      return undefined;
+    }
     return await upsertAgentTurnSessionRecord({
       ...((args.channelName ?? latestSessionRecord?.channelName)
         ? { channelName: args.channelName ?? latestSessionRecord?.channelName }
@@ -354,32 +461,31 @@ export async function persistTimeoutSessionRecord(args: {
         args.currentUsage,
       ),
       sessionId: args.sessionId,
-      sliceId: nextSliceId,
+      sliceId: args.currentSliceId,
       state: "awaiting_resume",
       piMessages,
       ...(args.loadedSkillNames
         ? { loadedSkillNames: args.loadedSkillNames }
         : {}),
-      resumeReason: "timeout",
-      resumedFromSliceId: args.currentSliceId,
+      resumeReason: "yield",
+      resumedFromSliceId: latestSessionRecord?.resumedFromSliceId,
       errorMessage: args.errorMessage,
       ...((args.requester ?? latestSessionRecord?.requester)
         ? { requester: args.requester ?? latestSessionRecord?.requester }
         : {}),
-      ...(getActiveTraceId() ?? latestSessionRecord?.traceId
+      ...((getActiveTraceId() ?? latestSessionRecord?.traceId)
         ? { traceId: getActiveTraceId() ?? latestSessionRecord?.traceId }
         : {}),
     });
   } catch (recordError) {
     logSessionRecordError(
       recordError,
-      "agent_turn_timeout_resume_session_record_failed",
+      "agent_turn_yield_session_record_failed",
       args,
       {
-        "app.ai.resume_from_slice_id": args.currentSliceId,
-        "app.ai.resume_next_slice_id": nextSliceId,
+        "app.ai.resume_slice_id": args.currentSliceId,
       },
-      "Failed to persist timeout session record before scheduling resume",
+      "Failed to persist cooperative yield session record",
     );
     return undefined;
   }

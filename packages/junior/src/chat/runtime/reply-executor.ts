@@ -27,7 +27,10 @@ import {
 } from "@/chat/slack/reply";
 import { buildSlackOutputMessage } from "@/chat/slack/output";
 import { getSlackErrorObservabilityAttributes } from "@/chat/slack/errors";
-import { generateAssistantReply as generateAssistantReplyImpl } from "@/chat/respond";
+import {
+  generateAssistantReply as generateAssistantReplyImpl,
+  type ReplySteeringMessage,
+} from "@/chat/respond";
 import { shouldEmitDevAgentTrace } from "@/chat/runtime/dev-agent-trace";
 import {
   getAssistantThreadContext,
@@ -41,6 +44,7 @@ import {
 } from "@/chat/runtime/thread-context";
 import { persistThreadState } from "@/chat/runtime/thread-state";
 import { buildDeliveredTurnStatePatch } from "@/chat/runtime/delivered-turn-state";
+import { getTurnRequestDeadline } from "@/chat/runtime/request-deadline";
 import { completeAuthPauseTurn } from "@/chat/runtime/auth-pause-state";
 import type { PreparedTurnState } from "@/chat/runtime/turn-preparation";
 import {
@@ -79,18 +83,19 @@ import { appendSlackLegacyAttachmentText } from "@/chat/slack/legacy-attachments
 import { type ThreadArtifactsState } from "@/chat/state/artifacts";
 import { lookupSlackUser } from "@/chat/slack/user";
 import type { TurnContinuationRequest } from "@/chat/services/timeout-resume";
-import { canScheduleTurnTimeoutResume } from "@/chat/services/timeout-resume";
-import { isRetryableTurnError } from "@/chat/runtime/turn";
+import {
+  isCooperativeTurnYieldError,
+  isRetryableTurnError,
+} from "@/chat/runtime/turn";
 import { buildDeterministicTurnId } from "@/chat/runtime/turn";
 import { markTurnClosed, markTurnFailed } from "@/chat/runtime/turn";
 import { startActiveTurn } from "@/chat/runtime/turn";
 import { isRedundantReactionAckText } from "@/chat/services/reply-delivery-plan";
-import { deleteSlackMessage, postSlackMessage } from "@/chat/slack/outbound";
+import { deleteSlackMessage } from "@/chat/slack/outbound";
 import {
   finalizeFailedTurnReply,
   getAgentTurnDiagnosticsAttributes,
 } from "@/chat/services/turn-failure-response";
-import { buildSlackTurnContinuationNotice } from "@/chat/slack/turn-continuation-notice";
 import { buildAuthPauseResponse } from "@/chat/services/auth-pause-response";
 import { maybeApplyProviderDefaultConfigRequest } from "@/chat/services/provider-default-config";
 import type { PiMessage } from "@/chat/pi/messages";
@@ -265,9 +270,16 @@ export function createReplyToThread(deps: ReplyExecutorDeps) {
     options: {
       beforeFirstResponsePost?: () => Promise<void>;
       explicitMention?: boolean;
+      onInputCommitted?: () => Promise<void>;
       onToolInvocation?: (invocation: TurnToolInvocation) => void;
+      onTurnCompleted?: () => Promise<void>;
+      onTurnStatePersisted?: () => Promise<void>;
       preparedState?: PreparedTurnState;
       queuedMessages?: QueuedTurnMessage[];
+      drainSteeringMessages?: (
+        inject: (messages: QueuedTurnMessage[]) => Promise<void>,
+      ) => Promise<QueuedTurnMessage[]>;
+      shouldYield?: () => boolean;
     } = {},
   ) {
     if (message.author.isMe) {
@@ -305,6 +317,7 @@ export function createReplyToThread(deps: ReplyExecutorDeps) {
       },
       async () => {
         const strippedUserText = stripLeadingBotMention(message.text, {
+          botUserId: deps.getSlackAdapter().botUserId,
           stripLeadingSlackMentionToken:
             options.explicitMention || Boolean(message.isMention),
         });
@@ -366,41 +379,6 @@ export function createReplyToThread(deps: ReplyExecutorDeps) {
           beforeFirstResponsePostCalled = true;
           await options.beforeFirstResponsePost?.();
         };
-        const postTurnContinuationNotice = async (): Promise<void> => {
-          try {
-            await beforeFirstResponsePost();
-            const notice = buildSlackTurnContinuationNotice({ conversationId });
-            const shouldUseSlackFooter =
-              Boolean(notice.blocks?.length) &&
-              Boolean(channelId && threadTs) &&
-              (thread.adapter as { name?: string } | undefined)?.name ===
-                "slack";
-            if (shouldUseSlackFooter && channelId && threadTs) {
-              await postSlackMessage({
-                channelId,
-                threadTs,
-                ...notice,
-              });
-              return;
-            }
-
-            await thread.post(buildSlackOutputMessage(notice.text));
-          } catch (error) {
-            logException(
-              error,
-              "slack_turn_continuation_notice_post_failed",
-              turnTraceContext,
-              {
-                "app.slack.reply_stage":
-                  "thread_reply_turn_continuation_notice",
-                ...(messageTs ? { "messaging.message.id": messageTs } : {}),
-                ...getSlackErrorObservabilityAttributes(error),
-              },
-              "Failed to post turn continuation notice",
-            );
-            throw error;
-          }
-        };
         const postAuthPauseNotice = async (): Promise<void> => {
           try {
             await beforeFirstResponsePost();
@@ -421,7 +399,16 @@ export function createReplyToThread(deps: ReplyExecutorDeps) {
             );
           }
         };
-        const activeTurnId = preparedState.conversation.processing.activeTurnId;
+        let activeTurnId = preparedState.conversation.processing.activeTurnId;
+        if (preparedState.userMessageAlreadyReplied) {
+          await persistThreadState(thread, {
+            conversation: preparedState.conversation,
+          });
+          await options.onTurnStatePersisted?.();
+          await options.onInputCommitted?.();
+          await options.onTurnCompleted?.();
+          return;
+        }
         if (conversationId && activeTurnId) {
           const resumeRequest =
             await deps.services.getAwaitingTurnContinuationRequest({
@@ -447,19 +434,43 @@ export function createReplyToThread(deps: ReplyExecutorDeps) {
               throw error;
             }
 
-            await postTurnContinuationNotice();
-            markConversationMessage(
-              preparedState.conversation,
-              preparedState.userMessageId,
-              {
-                replied: true,
-                skippedReason: undefined,
-              },
-            );
             await persistThreadState(thread, {
               conversation: preparedState.conversation,
             });
+            await options.onTurnStatePersisted?.();
+            await options.onInputCommitted?.();
             return;
+          }
+
+          const sessionRecord = await getAgentTurnSessionRecord(
+            conversationId,
+            activeTurnId,
+          );
+          if (sessionRecord?.state === "awaiting_resume") {
+            if (sessionRecord.resumeReason === "auth") {
+              await persistThreadState(thread, {
+                conversation: preparedState.conversation,
+              });
+              await options.onTurnStatePersisted?.();
+              await options.onInputCommitted?.();
+              return;
+            }
+
+            await failAgentTurnSessionRecord({
+              conversationId,
+              expectedVersion: sessionRecord.version,
+              sessionId: activeTurnId,
+              errorMessage:
+                "Awaiting turn continuation metadata could not be materialized",
+            });
+            markTurnFailed({
+              conversation: preparedState.conversation,
+              nowMs: Date.now(),
+              sessionId: activeTurnId,
+              markConversationMessage,
+              updateConversationStats,
+            });
+            activeTurnId = undefined;
           }
         }
         const configReply = await maybeApplyProviderDefaultConfigRequest({
@@ -494,6 +505,8 @@ export function createReplyToThread(deps: ReplyExecutorDeps) {
           await persistThreadState(thread, {
             conversation: preparedState.conversation,
           });
+          await options.onTurnStatePersisted?.();
+          await options.onInputCommitted?.();
           return;
         }
         startActiveTurn({
@@ -542,6 +555,7 @@ export function createReplyToThread(deps: ReplyExecutorDeps) {
         await persistThreadState(thread, {
           conversation: preparedState.conversation,
         });
+        await options.onTurnStatePersisted?.();
 
         const resolvedUserName =
           message.author.userName ?? fallbackIdentity?.userName;
@@ -660,6 +674,52 @@ export function createReplyToThread(deps: ReplyExecutorDeps) {
           });
           const toolChannelId =
             preparedState.artifacts.assistantContextChannelId ?? channelId;
+          const resolveSteeringMessages = async (
+            queuedMessages: QueuedTurnMessage[],
+          ): Promise<ReplySteeringMessage[]> => {
+            return await Promise.all(
+              queuedMessages.map(async (queued) => {
+                const attachments = queued.message.attachments;
+                return {
+                  text: queued.userText,
+                  timestampMs: queued.message.metadata.dateSent.getTime(),
+                  omittedImageAttachmentCount:
+                    !isVisionEnabled() &&
+                    hasPotentialImageAttachment(attachments)
+                      ? countPotentialImageAttachments(attachments)
+                      : 0,
+                  userAttachments: await deps.resolveUserAttachments(
+                    attachments,
+                    {
+                      threadId,
+                      requesterId: queued.message.author.userId,
+                      channelId,
+                      runId,
+                      conversation: preparedState.conversation,
+                      messageTs: getSlackMessageTs(queued.message),
+                    },
+                  ),
+                };
+              }),
+            );
+          };
+          const drainSteeringMessages = options.drainSteeringMessages
+            ? async (
+                inject: (messages: ReplySteeringMessage[]) => Promise<void>,
+              ): Promise<ReplySteeringMessage[]> => {
+                let injectedMessages: ReplySteeringMessage[] | undefined;
+                const drained = await options.drainSteeringMessages!(
+                  async (queuedMessages) => {
+                    injectedMessages =
+                      await resolveSteeringMessages(queuedMessages);
+                    await inject(injectedMessages);
+                  },
+                );
+                return (
+                  injectedMessages ?? (await resolveSteeringMessages(drained))
+                );
+              }
+            : undefined;
           let reply = await deps.services.generateAssistantReply(
             effectiveUserText,
             {
@@ -682,6 +742,7 @@ export function createReplyToThread(deps: ReplyExecutorDeps) {
               omittedImageAttachmentCount,
               userAttachments,
               slackConversation,
+              turnDeadlineAtMs: getTurnRequestDeadline()?.deadlineAtMs,
               correlation: {
                 conversationId,
                 threadId,
@@ -723,6 +784,9 @@ export function createReplyToThread(deps: ReplyExecutorDeps) {
               },
               onStatus: (nextStatus) => status.update(nextStatus),
               onToolInvocation: options.onToolInvocation,
+              onInputCommitted: options.onInputCommitted,
+              drainSteeringMessages,
+              shouldYield: options.shouldYield,
             },
           );
           const diagnosticsContext = {
@@ -884,7 +948,13 @@ export function createReplyToThread(deps: ReplyExecutorDeps) {
               "Agent turn completed",
             );
           }
+          await options.onTurnCompleted?.();
         } catch (error) {
+          if (isCooperativeTurnYieldError(error)) {
+            shouldPersistFailureState = false;
+            throw error;
+          }
+
           if (
             isRetryableTurnError(error, "mcp_auth_resume") ||
             isRetryableTurnError(error, "plugin_auth_resume")
@@ -906,12 +976,10 @@ export function createReplyToThread(deps: ReplyExecutorDeps) {
             const conversationIdForResume = error.metadata?.conversationId;
             const sessionIdForResume = error.metadata?.sessionId;
             const version = error.metadata?.version;
-            const nextSliceId = error.metadata?.sliceId;
             if (
               conversationIdForResume &&
               sessionIdForResume &&
-              typeof version === "number" &&
-              canScheduleTurnTimeoutResume(nextSliceId)
+              typeof version === "number"
             ) {
               try {
                 await deps.services.scheduleTurnTimeoutResume({
@@ -934,24 +1002,7 @@ export function createReplyToThread(deps: ReplyExecutorDeps) {
                 shouldPersistFailureState = true;
                 throw scheduleError;
               }
-              await postTurnContinuationNotice();
               return;
-            } else if (
-              conversationIdForResume &&
-              sessionIdForResume &&
-              typeof version === "number"
-            ) {
-              logWarn(
-                "agent_turn_timeout_resume_slice_limit_reached",
-                turnTraceContext,
-                {
-                  ...(messageTs ? { "messaging.message.id": messageTs } : {}),
-                  ...(typeof nextSliceId === "number"
-                    ? { "app.ai.resume_slice_id": nextSliceId }
-                    : {}),
-                },
-                "Skipped automatic timeout resume because the turn exceeded the slice limit",
-              );
             } else {
               logWarn(
                 "agent_turn_timeout_resume_metadata_missing",

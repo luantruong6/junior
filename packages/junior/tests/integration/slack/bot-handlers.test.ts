@@ -1,9 +1,13 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { JuniorRuntimeServiceOverrides } from "@/chat/app/services";
 import { makeAssistantStatus } from "@/chat/slack/assistant-thread/status";
 import { getSlackInterruptionMarker } from "@/chat/slack/output";
 import { RetryableTurnError } from "@/chat/runtime/turn";
-import { buildTurnContinuationResponse } from "@/chat/services/turn-continuation-response";
+import { disconnectStateAdapter } from "@/chat/state/adapter";
+import {
+  getAgentTurnSessionRecord,
+  upsertAgentTurnSessionRecord,
+} from "@/chat/state/turn-session";
 import {
   getCapturedSlackApiCalls,
   resetSlackApiMockState,
@@ -54,6 +58,7 @@ function createRuntime(
 
 function createAwaitingContinuationState(args: {
   activeSessionId: string;
+  replied?: boolean;
   userMessageId?: string;
   userText?: string;
 }) {
@@ -75,6 +80,9 @@ function createAwaitingContinuationState(args: {
           author: {
             userId: "U-test",
           },
+          ...(args.replied === undefined
+            ? {}
+            : { meta: { replied: args.replied } }),
         },
       ],
       processing: {
@@ -93,12 +101,27 @@ function createAwaitingContinuationState(args: {
   };
 }
 
+function turnPiMessages(text: string) {
+  return [
+    {
+      role: "user" as const,
+      content: [{ type: "text" as const, text }],
+      timestamp: 1,
+    },
+  ];
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 describe("bot handlers (integration)", () => {
-  afterEach(() => {
+  beforeEach(async () => {
+    await disconnectStateAdapter();
+  });
+
+  afterEach(async () => {
     resetSlackApiMockState();
     vi.restoreAllMocks();
+    await disconnectStateAdapter();
   });
 
   it("handleNewMention: posts reply from generateAssistantReply", async () => {
@@ -151,6 +174,85 @@ describe("bot handlers (integration)", () => {
       return false;
     });
     expect(hasReply).toBe(true);
+  });
+
+  it("does not replay a message that already has a delivered reply", async () => {
+    const conversationId = "slack:C_REPLAY:1700000000.000";
+    const generateAssistantReply = vi.fn();
+    const { slackRuntime } = createRuntime({
+      services: {
+        replyExecutor: {
+          generateAssistantReply,
+        },
+      },
+    });
+    const thread = createTestThread({
+      id: conversationId,
+      state: {
+        conversation: {
+          schemaVersion: 1,
+          backfill: {
+            completedAtMs: 1,
+            source: "recent_messages",
+          },
+          compactions: [],
+          piMessages: [],
+          messages: [
+            {
+              id: "msg-replayed",
+              role: "user",
+              text: "please answer once",
+              createdAtMs: 1,
+              author: {
+                userId: "U-test",
+              },
+              meta: {
+                replied: true,
+                slackTs: "1700000000.000",
+              },
+            },
+            {
+              id: "assistant-reply",
+              role: "assistant",
+              text: "Already answered.",
+              createdAtMs: 2,
+              author: {
+                isBot: true,
+                userName: "Junior",
+              },
+              meta: {
+                replied: true,
+              },
+            },
+          ],
+          processing: {},
+          stats: {
+            compactedMessageCount: 0,
+            estimatedContextTokens: 0,
+            totalMessageCount: 2,
+            updatedAtMs: 2,
+          },
+          vision: {
+            byFileId: {},
+          },
+        },
+      },
+    });
+
+    await expect(
+      slackRuntime.handleNewMention(
+        thread,
+        createTestMessage({
+          id: "msg-replayed",
+          threadId: conversationId,
+          text: "please answer once",
+          isMention: true,
+        }),
+      ),
+    ).resolves.toBeUndefined();
+
+    expect(generateAssistantReply).not.toHaveBeenCalled();
+    expect(thread.posts).toEqual([]);
   });
 
   it("handleSubscribedMessage with explicit mention: replies when should_reply is true", async () => {
@@ -594,7 +696,7 @@ describe("bot handlers (integration)", () => {
     });
   });
 
-  it("posts a durable notice when a turn is scheduled for continuation", async () => {
+  it("schedules durable continuation without posting a notice", async () => {
     const scheduleTurnTimeoutResume = vi.fn().mockResolvedValue(undefined);
     const conversationId = "slack:C_TIMEOUT:1700000000.000";
     const sessionId = "turn_msg-timeout";
@@ -636,11 +738,7 @@ describe("bot handlers (integration)", () => {
       sessionId,
       expectedVersion: 3,
     });
-    expect(thread.posts).toEqual([
-      expect.objectContaining({
-        markdown: buildTurnContinuationResponse(),
-      }),
-    ]);
+    expect(thread.posts).toEqual([]);
 
     const state = thread.getState();
     const conversation = (
@@ -653,7 +751,7 @@ describe("bot handlers (integration)", () => {
     expect(conversation?.processing?.activeTurnId).toBe(sessionId);
   });
 
-  it("posts a Slack continuation notice with a correlation footer when a live turn times out", async () => {
+  it("does not post a Slack continuation notice when a live turn times out", async () => {
     resetSlackApiMockState();
     const scheduleTurnTimeoutResume = vi.fn().mockResolvedValue(undefined);
     const conversationId = "slack:C_TIMEOUT_API:1700000000.000";
@@ -699,33 +797,10 @@ describe("bot handlers (integration)", () => {
       expectedVersion: 3,
     });
     expect(thread.posts).toEqual([]);
-    expect(getCapturedSlackApiCalls("chat.postMessage")).toEqual([
-      expect.objectContaining({
-        params: expect.objectContaining({
-          channel: "C_TIMEOUT_API",
-          thread_ts: "1700000000.000",
-          text: buildTurnContinuationResponse(),
-          blocks: [
-            {
-              type: "markdown",
-              text: buildTurnContinuationResponse(),
-            },
-            {
-              type: "context",
-              elements: [
-                {
-                  type: "mrkdwn",
-                  text: `*ID:* ${conversationId}`,
-                },
-              ],
-            },
-          ],
-        }),
-      }),
-    ]);
+    expect(getCapturedSlackApiCalls("chat.postMessage")).toEqual([]);
   });
 
-  it("reschedules an awaiting turn continuation instead of starting a new turn", async () => {
+  it("reschedules an awaiting turn continuation without replying to the follow-up", async () => {
     const conversationId = "slack:C_TIMEOUT_RETRY:1700000000.000";
     const activeSessionId = "turn_msg-original";
     const scheduleTurnTimeoutResume = vi.fn().mockResolvedValue(undefined);
@@ -735,6 +810,8 @@ describe("bot handlers (integration)", () => {
       expectedVersion: 4,
     });
     const generateAssistantReply = vi.fn();
+    const onInputCommitted = vi.fn();
+    const onTurnStatePersisted = vi.fn();
     const { slackRuntime } = createRuntime({
       services: {
         replyExecutor: {
@@ -759,6 +836,7 @@ describe("bot handlers (integration)", () => {
           text: "what happened?",
           isMention: true,
         }),
+        { onInputCommitted, onTurnStatePersisted },
       ),
     ).resolves.toBeUndefined();
 
@@ -772,11 +850,9 @@ describe("bot handlers (integration)", () => {
       expectedVersion: 4,
     });
     expect(generateAssistantReply).not.toHaveBeenCalled();
-    expect(thread.posts).toEqual([
-      expect.objectContaining({
-        markdown: buildTurnContinuationResponse(),
-      }),
-    ]);
+    expect(onTurnStatePersisted).toHaveBeenCalledOnce();
+    expect(onInputCommitted).toHaveBeenCalledOnce();
+    expect(thread.posts).toEqual([]);
 
     const state = thread.getState();
     const conversation = (
@@ -791,14 +867,138 @@ describe("bot handlers (integration)", () => {
       }
     ).conversation;
     expect(conversation?.processing?.activeTurnId).toBe(activeSessionId);
-    expect(
-      conversation?.messages?.find((message) => message.id === "msg-retry"),
-    ).toMatchObject({
-      meta: {
-        replied: true,
-        skippedReason: undefined,
+    const followUp = conversation?.messages?.find(
+      (message) => message.id === "msg-retry",
+    );
+    expect(followUp).toBeDefined();
+    expect(followUp?.meta?.replied).toBeUndefined();
+    expect(followUp?.meta?.skippedReason).toBeUndefined();
+  });
+
+  it("parks auth-paused active turns without starting a new follow-up turn", async () => {
+    const conversationId = "slack:C_AUTH_PARKED:1700000000.000";
+    const activeSessionId = "turn_msg-auth-original";
+    const generateAssistantReply = vi.fn();
+    const onTurnStatePersisted = vi.fn();
+    await upsertAgentTurnSessionRecord({
+      conversationId,
+      sessionId: activeSessionId,
+      sliceId: 1,
+      state: "awaiting_resume",
+      resumeReason: "auth",
+      piMessages: turnPiMessages("please use notion"),
+    });
+    const { slackRuntime } = createRuntime({
+      services: {
+        replyExecutor: {
+          generateAssistantReply,
+        },
       },
     });
+
+    const thread = createTestThread({
+      id: conversationId,
+      state: createAwaitingContinuationState({ activeSessionId }),
+    });
+
+    await slackRuntime.handleNewMention(
+      thread,
+      createTestMessage({
+        id: "msg-auth-follow-up",
+        threadId: conversationId,
+        text: "any update?",
+        isMention: true,
+      }),
+      { onTurnStatePersisted },
+    );
+
+    expect(generateAssistantReply).not.toHaveBeenCalled();
+    expect(onTurnStatePersisted).toHaveBeenCalledOnce();
+    expect(thread.posts).toEqual([]);
+    const state = thread.getState();
+    const conversation = (
+      state as {
+        conversation?: {
+          messages?: Array<{
+            id?: string;
+            meta?: { replied?: boolean; skippedReason?: string };
+          }>;
+          processing?: { activeTurnId?: string };
+        };
+      }
+    ).conversation;
+    expect(conversation?.processing?.activeTurnId).toBe(activeSessionId);
+    const followUp = conversation?.messages?.find(
+      (message) => message.id === "msg-auth-follow-up",
+    );
+    expect(followUp).toBeDefined();
+    expect(followUp?.meta?.replied).toBeUndefined();
+    expect(followUp?.meta?.skippedReason).toBeUndefined();
+  });
+
+  it("fails malformed awaiting continuations before handling the follow-up", async () => {
+    const conversationId = "slack:C_BAD_CONTINUATION:1700000000.000";
+    const activeSessionId = "turn_msg-timeout-original";
+    const generateAssistantReply = vi.fn().mockResolvedValue({
+      text: "Recovered.",
+      diagnostics: {
+        assistantMessageCount: 1,
+        modelId: "test-model",
+        outcome: "success" as const,
+        toolCalls: [],
+        toolErrorCount: 0,
+        toolResultCount: 0,
+        usedPrimaryText: true,
+      },
+    });
+    await upsertAgentTurnSessionRecord({
+      conversationId,
+      sessionId: activeSessionId,
+      sliceId: 1,
+      state: "awaiting_resume",
+      resumeReason: "timeout",
+      piMessages: turnPiMessages("please keep working"),
+    });
+    const { slackRuntime } = createRuntime({
+      services: {
+        replyExecutor: {
+          generateAssistantReply,
+        },
+      },
+    });
+
+    const thread = createTestThread({
+      id: conversationId,
+      state: createAwaitingContinuationState({ activeSessionId }),
+    });
+
+    await slackRuntime.handleNewMention(
+      thread,
+      createTestMessage({
+        id: "msg-timeout-follow-up",
+        threadId: conversationId,
+        text: "what happened?",
+        isMention: true,
+      }),
+    );
+
+    expect(generateAssistantReply).toHaveBeenCalledOnce();
+    expect(postIncludes(thread, "Recovered.")).toBe(true);
+    const failedRecord = await getAgentTurnSessionRecord(
+      conversationId,
+      activeSessionId,
+    );
+    expect(failedRecord?.state).toBe("failed");
+    expect(failedRecord?.errorMessage).toBe(
+      "Awaiting turn continuation metadata could not be materialized",
+    );
+    const state = thread.getState();
+    const conversation = (
+      state as {
+        conversation?: { processing?: { activeTurnId?: string } };
+      }
+    ).conversation;
+    expect(conversation?.processing?.activeTurnId).toBeUndefined();
   });
 
   it("reschedules an awaiting continuation for repeated delivery of the active message", async () => {
@@ -847,7 +1047,55 @@ describe("bot handlers (integration)", () => {
     expect(generateAssistantReply).not.toHaveBeenCalled();
   });
 
-  it("does not silently complete when continuation acknowledgement fails", async () => {
+  it("does not reschedule an awaiting continuation for an already-replied duplicate", async () => {
+    const conversationId = "slack:C_TIMEOUT_REPLIED_DUP:1700000000.000";
+    const activeSessionId = "turn_msg-replied-duplicate";
+    const scheduleTurnTimeoutResume = vi.fn().mockResolvedValue(undefined);
+    const getAwaitingTurnContinuationRequest = vi.fn().mockResolvedValue({
+      conversationId,
+      sessionId: activeSessionId,
+      expectedVersion: 4,
+    });
+    const generateAssistantReply = vi.fn();
+    const onTurnStatePersisted = vi.fn();
+    const { slackRuntime } = createRuntime({
+      services: {
+        replyExecutor: {
+          generateAssistantReply,
+          getAwaitingTurnContinuationRequest,
+          scheduleTurnTimeoutResume,
+        },
+      },
+    });
+
+    const thread = createTestThread({
+      id: conversationId,
+      state: createAwaitingContinuationState({
+        activeSessionId,
+        replied: true,
+        userMessageId: "msg-replied-duplicate",
+      }),
+    });
+
+    await slackRuntime.handleNewMention(
+      thread,
+      createTestMessage({
+        id: "msg-replied-duplicate",
+        threadId: conversationId,
+        text: "please keep working",
+        isMention: true,
+      }),
+      { onTurnStatePersisted },
+    );
+
+    expect(getAwaitingTurnContinuationRequest).not.toHaveBeenCalled();
+    expect(scheduleTurnTimeoutResume).not.toHaveBeenCalled();
+    expect(generateAssistantReply).not.toHaveBeenCalled();
+    expect(onTurnStatePersisted).toHaveBeenCalledOnce();
+    expect(thread.posts).toEqual([]);
+  });
+
+  it("keeps awaiting continuation state without a visible acknowledgement", async () => {
     const conversationId = "slack:C_TIMEOUT_NOTICE_FAIL:1700000000.000";
     const activeSessionId = "turn_msg-original";
     const scheduleTurnTimeoutResume = vi.fn().mockResolvedValue(undefined);
@@ -871,9 +1119,6 @@ describe("bot handlers (integration)", () => {
       id: conversationId,
       state: createAwaitingContinuationState({ activeSessionId }),
     });
-    vi.spyOn(thread, "post").mockRejectedValueOnce(
-      new Error("slack unavailable"),
-    );
 
     await slackRuntime.handleNewMention(
       thread,
@@ -891,11 +1136,7 @@ describe("bot handlers (integration)", () => {
       expectedVersion: 4,
     });
     expect(generateAssistantReply).not.toHaveBeenCalled();
-    expect(thread.posts).toEqual([
-      expect.stringContaining(
-        "I ran into an internal error while processing that.",
-      ),
-    ]);
+    expect(thread.posts).toEqual([]);
 
     const state = thread.getState();
     const conversation = (

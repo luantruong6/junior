@@ -18,10 +18,15 @@ import {
 } from "@/chat/agent-dispatch/store";
 import type { DispatchRecord } from "@/chat/agent-dispatch/types";
 import { disconnectStateAdapter, getStateAdapter } from "@/chat/state/adapter";
+import { upsertAgentTurnSessionRecord } from "@/chat/state/turn-session";
+import { persistThreadStateById } from "@/chat/runtime/thread-state";
+import { getConversationWorkState } from "@/chat/task-execution/store";
+import type { PiMessage } from "@/chat/pi/messages";
 import { setAgentPlugins } from "@/chat/plugins/agent-hooks";
 import { GET as heartbeat } from "@/handlers/heartbeat";
-import type { WaitUntilFn } from "@/handlers/types";
 import { createSlackDirectCredentialSubject } from "@/chat/credentials/subject";
+import { createConversationWorkQueueTestAdapter } from "../fixtures/conversation-work";
+import { createWaitUntilCollector } from "../fixtures/wait-until";
 import { getCapturedSlackApiCalls } from "../msw/handlers/slack-api";
 
 vi.hoisted(() => {
@@ -30,12 +35,6 @@ vi.hoisted(() => {
 
 const TEST_NOW_MS = Date.parse("2026-05-26T12:05:00.000Z");
 const TEST_RUN_AT_MS = Date.parse("2026-05-26T12:00:00.000Z");
-
-function collectWaitUntil(tasks: Promise<unknown>[]): WaitUntilFn {
-  return (task) => {
-    tasks.push(typeof task === "function" ? task() : task);
-  };
-}
 
 function schedulerStore() {
   return createSchedulerStore(createPluginState("scheduler"));
@@ -131,6 +130,33 @@ function createCredentialSubject(
   return subject;
 }
 
+async function persistActiveTurn(
+  conversationId: string,
+  activeTurnId?: string,
+): Promise<void> {
+  await persistThreadStateById(conversationId, {
+    conversation: {
+      schemaVersion: 1,
+      backfill: {},
+      compactions: [],
+      messages: [],
+      piMessages: [],
+      processing: {
+        activeTurnId,
+      },
+      stats: {
+        compactedMessageCount: 0,
+        estimatedContextTokens: 0,
+        totalMessageCount: 0,
+        updatedAtMs: TEST_NOW_MS,
+      },
+      vision: {
+        byFileId: {},
+      },
+    },
+  });
+}
+
 describe("trusted plugin heartbeat", () => {
   const originalFetch = global.fetch;
 
@@ -156,14 +182,14 @@ describe("trusted plugin heartbeat", () => {
   });
 
   it("rejects unauthenticated heartbeat requests", async () => {
-    const waitUntilTasks: Promise<unknown>[] = [];
+    const waitUntil = createWaitUntilCollector();
     const response = await heartbeat(
       new Request("https://example.invalid/api/internal/heartbeat"),
-      collectWaitUntil(waitUntilTasks),
+      waitUntil.fn,
     );
 
     expect(response.status).toBe(401);
-    expect(waitUntilTasks).toHaveLength(0);
+    expect(waitUntil.pendingCount()).toBe(0);
   });
 
   it("runs trusted plugin heartbeat hooks", async () => {
@@ -181,17 +207,157 @@ describe("trusted plugin heartbeat", () => {
         },
       }),
     ]);
-    const waitUntilTasks: Promise<unknown>[] = [];
+    const waitUntil = createWaitUntilCollector();
     const response = await heartbeat(
       new Request("https://example.invalid/api/internal/heartbeat", {
         headers: { authorization: "Bearer heartbeat-secret" },
       }),
-      collectWaitUntil(waitUntilTasks),
+      waitUntil.fn,
     );
 
     expect(response.status).toBe(202);
-    await Promise.all(waitUntilTasks);
+    await waitUntil.flush();
     expect(seen).toHaveLength(1);
+  });
+
+  it("reschedules stale timeout resume records", async () => {
+    const queue = createConversationWorkQueueTestAdapter();
+    const conversationId = "slack:C123:1712345.0001";
+    const sessionId = "turn-timeout";
+    const staleNowMs = TEST_NOW_MS - 3 * 60 * 1000;
+    vi.setSystemTime(staleNowMs);
+    await upsertAgentTurnSessionRecord({
+      conversationId,
+      sessionId,
+      sliceId: 2,
+      state: "awaiting_resume",
+      resumeReason: "timeout",
+      piMessages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "finish this" }],
+          timestamp: staleNowMs,
+        } as PiMessage,
+      ],
+    });
+    await persistActiveTurn(conversationId, sessionId);
+    vi.setSystemTime(TEST_NOW_MS);
+
+    const waitUntil = createWaitUntilCollector();
+    const response = await heartbeat(
+      new Request("https://example.invalid/api/internal/heartbeat", {
+        headers: { authorization: "Bearer heartbeat-secret" },
+      }),
+      waitUntil.fn,
+      { conversationWorkQueue: queue },
+    );
+
+    expect(response.status).toBe(202);
+    await waitUntil.flush();
+    expect(queue.sentRecords()).toEqual([
+      {
+        conversationId,
+        idempotencyKey: expect.stringContaining(
+          `timeout:${conversationId}:${sessionId}:`,
+        ),
+      },
+    ]);
+    await expect(
+      getConversationWorkState({ conversationId }),
+    ).resolves.toMatchObject({
+      conversationId,
+      needsRun: true,
+    });
+  });
+
+  it("reschedules stale cooperative yield resume records", async () => {
+    const queue = createConversationWorkQueueTestAdapter();
+    const conversationId = "slack:C123:1712345.0008";
+    const sessionId = "turn-yield";
+    const staleNowMs = TEST_NOW_MS - 3 * 60 * 1000;
+    vi.setSystemTime(staleNowMs);
+    await upsertAgentTurnSessionRecord({
+      conversationId,
+      sessionId,
+      sliceId: 1,
+      state: "awaiting_resume",
+      resumeReason: "yield",
+      piMessages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "keep going" }],
+          timestamp: staleNowMs,
+        } as PiMessage,
+      ],
+    });
+    await persistActiveTurn(conversationId, sessionId);
+    vi.setSystemTime(TEST_NOW_MS);
+
+    const waitUntil = createWaitUntilCollector();
+    const response = await heartbeat(
+      new Request("https://example.invalid/api/internal/heartbeat", {
+        headers: { authorization: "Bearer heartbeat-secret" },
+      }),
+      waitUntil.fn,
+      { conversationWorkQueue: queue },
+    );
+
+    expect(response.status).toBe(202);
+    await waitUntil.flush();
+    expect(queue.sentRecords()).toEqual([
+      {
+        conversationId,
+        idempotencyKey: expect.stringContaining(
+          `timeout:${conversationId}:${sessionId}:`,
+        ),
+      },
+    ]);
+    await expect(
+      getConversationWorkState({ conversationId }),
+    ).resolves.toMatchObject({
+      conversationId,
+      needsRun: true,
+    });
+  });
+
+  it("skips stale timeout resume records for inactive turns", async () => {
+    const queue = createConversationWorkQueueTestAdapter();
+    const conversationId = "slack:C123:1712345.0007";
+    const sessionId = "turn-timeout-inactive";
+    const staleNowMs = TEST_NOW_MS - 3 * 60 * 1000;
+    vi.setSystemTime(staleNowMs);
+    await upsertAgentTurnSessionRecord({
+      conversationId,
+      sessionId,
+      sliceId: 2,
+      state: "awaiting_resume",
+      resumeReason: "timeout",
+      piMessages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "finish this" }],
+          timestamp: staleNowMs,
+        } as PiMessage,
+      ],
+    });
+    await persistActiveTurn(conversationId, "turn-newer");
+    vi.setSystemTime(TEST_NOW_MS);
+
+    const waitUntil = createWaitUntilCollector();
+    const response = await heartbeat(
+      new Request("https://example.invalid/api/internal/heartbeat", {
+        headers: { authorization: "Bearer heartbeat-secret" },
+      }),
+      waitUntil.fn,
+      { conversationWorkQueue: queue },
+    );
+
+    expect(response.status).toBe(202);
+    await waitUntil.flush();
+    expect(queue.sentRecords()).toEqual([]);
+    await expect(getConversationWorkState({ conversationId })).resolves.toBe(
+      undefined,
+    );
   });
 
   it("scopes dispatch lookup to the plugin that created it", async () => {
@@ -540,15 +706,15 @@ describe("trusted plugin heartbeat", () => {
     const store = schedulerStore();
     await store.saveTask(createTask());
 
-    const firstWaitUntilTasks: Promise<unknown>[] = [];
+    const firstWaitUntil = createWaitUntilCollector();
     const firstResponse = await heartbeat(
       new Request("https://example.invalid/api/internal/heartbeat", {
         headers: { authorization: "Bearer heartbeat-secret" },
       }),
-      collectWaitUntil(firstWaitUntilTasks),
+      firstWaitUntil.fn,
     );
     expect(firstResponse.status).toBe(202);
-    await Promise.all(firstWaitUntilTasks);
+    await firstWaitUntil.flush();
 
     const running = await store.getRun(`sched_plugin_1:${TEST_RUN_AT_MS}`);
     expect(running).toMatchObject({
@@ -571,15 +737,15 @@ describe("trusted plugin heartbeat", () => {
       });
     });
 
-    const secondWaitUntilTasks: Promise<unknown>[] = [];
+    const secondWaitUntil = createWaitUntilCollector();
     const secondResponse = await heartbeat(
       new Request("https://example.invalid/api/internal/heartbeat", {
         headers: { authorization: "Bearer heartbeat-secret" },
       }),
-      collectWaitUntil(secondWaitUntilTasks),
+      secondWaitUntil.fn,
     );
     expect(secondResponse.status).toBe(202);
-    await Promise.all(secondWaitUntilTasks);
+    await secondWaitUntil.flush();
 
     await expect(store.getRun(running!.id)).resolves.toMatchObject({
       status: "completed",
@@ -610,15 +776,15 @@ describe("trusted plugin heartbeat", () => {
       }),
     );
 
-    const waitUntilTasks: Promise<unknown>[] = [];
+    const waitUntil = createWaitUntilCollector();
     const response = await heartbeat(
       new Request("https://example.invalid/api/internal/heartbeat", {
         headers: { authorization: "Bearer heartbeat-secret" },
       }),
-      collectWaitUntil(waitUntilTasks),
+      waitUntil.fn,
     );
     expect(response.status).toBe(202);
-    await Promise.all(waitUntilTasks);
+    await waitUntil.flush();
 
     const running = await store.getRun(`sched_plugin_1:${TEST_RUN_AT_MS}`);
     expect(running?.dispatchId).toEqual(expect.any(String));
@@ -649,15 +815,15 @@ describe("trusted plugin heartbeat", () => {
     const store = schedulerStore();
     await store.saveTask(createTask());
 
-    const firstWaitUntilTasks: Promise<unknown>[] = [];
+    const firstWaitUntil = createWaitUntilCollector();
     const firstResponse = await heartbeat(
       new Request("https://example.invalid/api/internal/heartbeat", {
         headers: { authorization: "Bearer heartbeat-secret" },
       }),
-      collectWaitUntil(firstWaitUntilTasks),
+      firstWaitUntil.fn,
     );
     expect(firstResponse.status).toBe(202);
-    await Promise.all(firstWaitUntilTasks);
+    await firstWaitUntil.flush();
 
     const running = await store.getRun(`sched_plugin_1:${TEST_RUN_AT_MS}`);
     expect(running).toMatchObject({
@@ -668,15 +834,15 @@ describe("trusted plugin heartbeat", () => {
     await state.connect();
     await state.delete(getDispatchStorageKey(running!.dispatchId!));
 
-    const secondWaitUntilTasks: Promise<unknown>[] = [];
+    const secondWaitUntil = createWaitUntilCollector();
     const secondResponse = await heartbeat(
       new Request("https://example.invalid/api/internal/heartbeat", {
         headers: { authorization: "Bearer heartbeat-secret" },
       }),
-      collectWaitUntil(secondWaitUntilTasks),
+      secondWaitUntil.fn,
     );
     expect(secondResponse.status).toBe(202);
-    await Promise.all(secondWaitUntilTasks);
+    await secondWaitUntil.flush();
 
     await expect(store.getRun(running!.id)).resolves.toMatchObject({
       status: "failed",
@@ -702,15 +868,15 @@ describe("trusted plugin heartbeat", () => {
       } as unknown as ScheduledTask["task"],
     });
 
-    const waitUntilTasks: Promise<unknown>[] = [];
+    const waitUntil = createWaitUntilCollector();
     const response = await heartbeat(
       new Request("https://example.invalid/api/internal/heartbeat", {
         headers: { authorization: "Bearer heartbeat-secret" },
       }),
-      collectWaitUntil(waitUntilTasks),
+      waitUntil.fn,
     );
     expect(response.status).toBe(202);
-    await Promise.all(waitUntilTasks);
+    await waitUntil.flush();
 
     await expect(
       store.getRun(`sched_plugin_malformed:${TEST_RUN_AT_MS}`),
@@ -748,15 +914,15 @@ describe("trusted plugin heartbeat", () => {
       },
     });
 
-    const waitUntilTasks: Promise<unknown>[] = [];
+    const waitUntil = createWaitUntilCollector();
     const response = await heartbeat(
       new Request("https://example.invalid/api/internal/heartbeat", {
         headers: { authorization: "Bearer heartbeat-secret" },
       }),
-      collectWaitUntil(waitUntilTasks),
+      waitUntil.fn,
     );
     expect(response.status).toBe(202);
-    await Promise.all(waitUntilTasks);
+    await waitUntil.flush();
 
     await expect(
       store.getRun(`sched_plugin_bad_destination:${TEST_RUN_AT_MS}`),
@@ -787,15 +953,15 @@ describe("trusted plugin heartbeat", () => {
     const task = createDailyTask();
     await store.saveTask(task);
 
-    const waitUntilTasks: Promise<unknown>[] = [];
+    const waitUntil = createWaitUntilCollector();
     const response = await heartbeat(
       new Request("https://example.invalid/api/internal/heartbeat", {
         headers: { authorization: "Bearer heartbeat-secret" },
       }),
-      collectWaitUntil(waitUntilTasks),
+      waitUntil.fn,
     );
     expect(response.status).toBe(202);
-    await Promise.all(waitUntilTasks);
+    await waitUntil.flush();
 
     await expect(
       store.getRun(`${task.id}:${task.nextRunAtMs}`),
@@ -828,15 +994,15 @@ describe("trusted plugin heartbeat", () => {
     await store.saveTask(first);
     await store.saveTask(duplicate);
 
-    const waitUntilTasks: Promise<unknown>[] = [];
+    const waitUntil = createWaitUntilCollector();
     const response = await heartbeat(
       new Request("https://example.invalid/api/internal/heartbeat", {
         headers: { authorization: "Bearer heartbeat-secret" },
       }),
-      collectWaitUntil(waitUntilTasks),
+      waitUntil.fn,
     );
     expect(response.status).toBe(202);
-    await Promise.all(waitUntilTasks);
+    await waitUntil.flush();
 
     await expect(
       store.getRun(`${duplicate.id}:${duplicate.nextRunAtMs}`),

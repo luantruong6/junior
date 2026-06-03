@@ -26,7 +26,6 @@ import {
   postSlackApiReplyPosts,
 } from "@/chat/slack/reply";
 import { postSlackMessage as postSlackApiMessage } from "@/chat/slack/outbound";
-import { buildSlackTurnContinuationNotice } from "@/chat/slack/turn-continuation-notice";
 import { ACTIVE_LOCK_TTL_MS, getStateAdapter } from "@/chat/state/adapter";
 import { getAgentTurnSessionRecord } from "@/chat/state/turn-session";
 import { addAgentTurnUsage } from "@/chat/usage";
@@ -35,6 +34,7 @@ import {
   type ProcessingReactionSession,
 } from "@/chat/runtime/processing-reaction";
 import { buildAuthPauseResponse } from "@/chat/services/auth-pause-response";
+import { getTurnRequestDeadline } from "@/chat/runtime/request-deadline";
 
 function resolveReplyTimeoutMs(explicitTimeoutMs?: number): number | undefined {
   if (typeof explicitTimeoutMs === "number" && explicitTimeoutMs > 0) {
@@ -172,33 +172,6 @@ async function postResumeFailureReply(args: {
   }
 }
 
-async function postTurnContinuationNoticeBestEffort(args: {
-  lockKey: string;
-  resumeArgs: ResumeSlackTurnArgs;
-}): Promise<void> {
-  const notice = buildSlackTurnContinuationNotice({
-    conversationId:
-      args.resumeArgs.replyContext?.correlation?.conversationId ?? args.lockKey,
-  });
-  try {
-    await postSlackApiMessage({
-      channelId: args.resumeArgs.channelId,
-      threadTs: args.resumeArgs.threadTs,
-      ...notice,
-    });
-  } catch (error) {
-    logException(
-      error,
-      "slack_turn_continuation_notice_post_failed",
-      getResumeLogContext(args.resumeArgs, args.lockKey),
-      {
-        "app.slack.reply_stage": "thread_reply_turn_continuation_notice",
-      },
-      "Failed to post turn continuation notice",
-    );
-  }
-}
-
 async function handleResumeFailure(args: {
   body: string;
   error: unknown;
@@ -229,6 +202,7 @@ function createResumeReplyContext(
   statusSession: AssistantStatusSession,
 ): ReplyRequestContext {
   const replyContext = args.replyContext ?? {};
+  const requestDeadline = getTurnRequestDeadline();
   const threadId =
     args.lockKey ?? getDefaultLockKey(args.channelId, args.threadTs);
   const persistedChannelConfiguration =
@@ -239,6 +213,8 @@ function createResumeReplyContext(
 
   return {
     ...replyContext,
+    turnDeadlineAtMs:
+      replyContext.turnDeadlineAtMs ?? requestDeadline?.deadlineAtMs,
     correlation: {
       ...replyContext.correlation,
       threadId: replyContext.correlation?.threadId ?? threadId,
@@ -269,12 +245,13 @@ function createResumeReplyContext(
 /**
  * Resume a paused Slack turn under the normal thread lock.
  *
- * Success is defined by final reply delivery, not only by successful assistant
- * generation. If the final visible Slack post fails, the resumed turn is
- * treated as failed so thread state does not claim the user saw a reply that
- * never arrived.
+ * Started resumes own their terminal side effects: final delivery, pause
+ * persistence, or failure response. Returns false only when `beforeStart`
+ * proves the resume is stale before generation begins.
  */
-export async function resumeSlackTurn(args: ResumeSlackTurnArgs) {
+export async function resumeSlackTurn(
+  args: ResumeSlackTurnArgs,
+): Promise<boolean> {
   const stateAdapter = getStateAdapter();
   await stateAdapter.connect();
   const lockKey =
@@ -298,7 +275,7 @@ export async function resumeSlackTurn(args: ResumeSlackTurnArgs) {
   try {
     const preparedArgs = await args.beforeStart?.();
     if (preparedArgs === false) {
-      return;
+      return false;
     }
     if (preparedArgs) {
       runArgs = { ...args, ...preparedArgs };
@@ -445,7 +422,11 @@ export async function resumeSlackTurn(args: ResumeSlackTurnArgs) {
       };
     }
   } finally {
-    await processingReaction?.stop();
+    if (finalReplyDelivered) {
+      await processingReaction?.complete();
+    } else {
+      await processingReaction?.stop();
+    }
     await stateAdapter.releaseLock(lock);
   }
 
@@ -470,13 +451,7 @@ export async function resumeSlackTurn(args: ResumeSlackTurnArgs) {
           buildAuthPauseResponse(),
         );
       }
-      if (deferredPauseKind === "timeout") {
-        await postTurnContinuationNoticeBestEffort({
-          lockKey,
-          resumeArgs: runArgs,
-        });
-      }
-      return;
+      return true;
     } catch (pauseError) {
       await handleResumeFailure({
         body: "Failed to handle resumed turn pause",
@@ -485,13 +460,15 @@ export async function resumeSlackTurn(args: ResumeSlackTurnArgs) {
         lockKey,
         resumeArgs: runArgs,
       });
-      return;
+      return true;
     }
   }
 
   if (deferredFailureHandler) {
     await deferredFailureHandler();
   }
+
+  return true;
 }
 
 /** Resume an OAuth-paused Slack request through the shared resume runner. */

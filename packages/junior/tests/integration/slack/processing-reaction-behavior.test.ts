@@ -4,7 +4,7 @@ import {
   createTestMessage,
   createTestThread,
 } from "../../fixtures/slack-harness";
-import { getCapturedSlackApiCalls } from "../../msw/handlers/slack-api";
+import { slackApiOutbox } from "../../fixtures/slack-api-outbox";
 
 function successDiagnostics(toolCalls: string[] = []) {
   return {
@@ -18,16 +18,24 @@ function successDiagnostics(toolCalls: string[] = []) {
   };
 }
 
+function reactionCall(name: string, timestamp: string) {
+  return expect.objectContaining({
+    params: expect.objectContaining({
+      channel: "C_PROCESSING",
+      timestamp,
+      name,
+    }),
+  });
+}
+
 describe("Slack behavior: processing reaction", () => {
-  it("adds eyes before mention work and removes it after the reply", async () => {
+  it("adds eyes before mention work and marks the message complete after the reply", async () => {
     const { slackRuntime } = createTestChatRuntime({
       services: {
         replyExecutor: {
           generateAssistantReply: async () => {
-            expect(getCapturedSlackApiCalls("reactions.add")).toHaveLength(1);
-            expect(getCapturedSlackApiCalls("reactions.remove")).toHaveLength(
-              0,
-            );
+            expect(slackApiOutbox.reactionAdds()).toHaveLength(1);
+            expect(slackApiOutbox.reactionRemovals()).toHaveLength(0);
             return {
               text: "Done.",
               diagnostics: successDiagnostics(),
@@ -55,23 +63,12 @@ describe("Slack behavior: processing reaction", () => {
       }),
     );
 
-    expect(getCapturedSlackApiCalls("reactions.add")).toEqual([
-      expect.objectContaining({
-        params: expect.objectContaining({
-          channel: "C_PROCESSING",
-          timestamp: "1700007001.000000",
-          name: "eyes",
-        }),
-      }),
+    expect(slackApiOutbox.reactionAdds()).toEqual([
+      reactionCall("eyes", "1700007001.000000"),
+      reactionCall("white_check_mark", "1700007001.000000"),
     ]);
-    expect(getCapturedSlackApiCalls("reactions.remove")).toEqual([
-      expect.objectContaining({
-        params: expect.objectContaining({
-          channel: "C_PROCESSING",
-          timestamp: "1700007001.000000",
-          name: "eyes",
-        }),
-      }),
+    expect(slackApiOutbox.reactionRemovals()).toEqual([
+      reactionCall("eyes", "1700007001.000000"),
     ]);
   });
 
@@ -80,10 +77,8 @@ describe("Slack behavior: processing reaction", () => {
       services: {
         subscribedReplyPolicy: {
           completeObject: async () => {
-            expect(getCapturedSlackApiCalls("reactions.add")).toHaveLength(0);
-            expect(getCapturedSlackApiCalls("reactions.remove")).toHaveLength(
-              0,
-            );
+            expect(slackApiOutbox.reactionAdds()).toHaveLength(0);
+            expect(slackApiOutbox.reactionRemovals()).toHaveLength(0);
             return {
               object: {
                 should_reply: false,
@@ -121,19 +116,17 @@ describe("Slack behavior: processing reaction", () => {
     );
 
     expect(thread.posts).toHaveLength(0);
-    expect(getCapturedSlackApiCalls("reactions.add")).toHaveLength(0);
-    expect(getCapturedSlackApiCalls("reactions.remove")).toHaveLength(0);
+    expect(slackApiOutbox.reactionAdds()).toHaveLength(0);
+    expect(slackApiOutbox.reactionRemovals()).toHaveLength(0);
   });
 
-  it("adds eyes after a subscribed message is approved and removes it after the reply", async () => {
+  it("adds eyes after a subscribed message is approved and marks the message complete after the reply", async () => {
     const { slackRuntime } = createTestChatRuntime({
       services: {
         subscribedReplyPolicy: {
           completeObject: async () => {
-            expect(getCapturedSlackApiCalls("reactions.add")).toHaveLength(0);
-            expect(getCapturedSlackApiCalls("reactions.remove")).toHaveLength(
-              0,
-            );
+            expect(slackApiOutbox.reactionAdds()).toHaveLength(0);
+            expect(slackApiOutbox.reactionRemovals()).toHaveLength(0);
             return {
               object: {
                 should_reply: true,
@@ -146,10 +139,8 @@ describe("Slack behavior: processing reaction", () => {
         },
         replyExecutor: {
           generateAssistantReply: async () => {
-            expect(getCapturedSlackApiCalls("reactions.add")).toHaveLength(1);
-            expect(getCapturedSlackApiCalls("reactions.remove")).toHaveLength(
-              0,
-            );
+            expect(slackApiOutbox.reactionAdds()).toHaveLength(1);
+            expect(slackApiOutbox.reactionRemovals()).toHaveLength(0);
             return {
               text: "Done.",
               diagnostics: successDiagnostics(),
@@ -177,23 +168,12 @@ describe("Slack behavior: processing reaction", () => {
       }),
     );
 
-    expect(getCapturedSlackApiCalls("reactions.add")).toEqual([
-      expect.objectContaining({
-        params: expect.objectContaining({
-          channel: "C_PROCESSING",
-          timestamp: "1700007151.000000",
-          name: "eyes",
-        }),
-      }),
+    expect(slackApiOutbox.reactionAdds()).toEqual([
+      reactionCall("eyes", "1700007151.000000"),
+      reactionCall("white_check_mark", "1700007151.000000"),
     ]);
-    expect(getCapturedSlackApiCalls("reactions.remove")).toEqual([
-      expect.objectContaining({
-        params: expect.objectContaining({
-          channel: "C_PROCESSING",
-          timestamp: "1700007151.000000",
-          name: "eyes",
-        }),
-      }),
+    expect(slackApiOutbox.reactionRemovals()).toEqual([
+      reactionCall("eyes", "1700007151.000000"),
     ]);
   });
 
@@ -233,7 +213,7 @@ describe("Slack behavior: processing reaction", () => {
       }),
     );
 
-    expect(getCapturedSlackApiCalls("reactions.add")).toHaveLength(1);
-    expect(getCapturedSlackApiCalls("reactions.remove")).toHaveLength(0);
+    expect(slackApiOutbox.reactionAdds()).toHaveLength(1);
+    expect(slackApiOutbox.reactionRemovals()).toHaveLength(0);
   });
 });

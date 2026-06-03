@@ -82,7 +82,13 @@ import type { AssistantStatusSpec } from "@/chat/slack/assistant-thread/status";
 import type { SlackConversationContext } from "@/chat/slack/conversation-context";
 import { createAgentTools } from "@/chat/tools/agent-tools";
 import { mergeArtifactsState } from "@/chat/runtime/thread-state";
-import { RetryableTurnError, isRetryableTurnError } from "@/chat/runtime/turn";
+import {
+  CooperativeTurnYieldError,
+  RetryableTurnError,
+  TurnInputCommitLostError,
+  isTurnInputCommitLostError,
+  isRetryableTurnError,
+} from "@/chat/runtime/turn";
 import {
   buildUserTurnText,
   encodeNonImageAttachmentForPrompt,
@@ -119,6 +125,7 @@ import {
   persistAuthPauseSessionRecord,
   persistRunningSessionRecord,
   persistTimeoutSessionRecord,
+  persistYieldSessionRecord,
 } from "@/chat/services/turn-session-record";
 import type { AgentTurnRequester } from "@/chat/state/turn-session";
 import type { CredentialContext } from "@/chat/credentials/context";
@@ -209,13 +216,10 @@ export interface ReplyRequestContext {
   configuration?: Record<string, unknown>;
   /** Durable Pi transcript for this conversation, excluding ephemeral turn context. */
   piMessages?: PiMessage[];
+  /** Absolute wall-clock deadline for this host request, in milliseconds. */
+  turnDeadlineAtMs?: number;
   channelConfiguration?: ChannelConfigurationService;
-  userAttachments?: Array<{
-    data?: Buffer;
-    mediaType: string;
-    filename?: string;
-    promptText?: string;
-  }>;
+  userAttachments?: ReplyRequestAttachment[];
   inboundAttachmentCount?: number;
   omittedImageAttachmentCount?: number;
   sandbox?: {
@@ -226,12 +230,18 @@ export interface ReplyRequestContext {
   onArtifactStateUpdated?: (
     artifactState: ThreadArtifactsState,
   ) => void | Promise<void>;
+  onInputCommitted?: () => void | Promise<void>;
   toolOverrides?: {
     imageGenerate?: ImageGenerateToolDeps;
     webFetch?: WebFetchToolDeps;
     webSearch?: WebSearchToolDeps;
   };
   onStatus?: (status: AssistantStatusSpec) => void | Promise<void>;
+  drainSteeringMessages?: (
+    inject: (messages: ReplySteeringMessage[]) => Promise<void>,
+  ) => Promise<ReplySteeringMessage[]>;
+  /** Return true when the durable worker should pause at the next Pi boundary. */
+  shouldYield?: () => boolean;
   onAuthPending?: (
     pendingAuth: ConversationPendingAuthState,
   ) => void | Promise<void>;
@@ -241,6 +251,20 @@ export interface ReplyRequestContext {
     toolName: string;
     params: Record<string, unknown>;
   }) => void;
+}
+
+export interface ReplyRequestAttachment {
+  data?: Buffer;
+  mediaType: string;
+  filename?: string;
+  promptText?: string;
+}
+
+export interface ReplySteeringMessage {
+  omittedImageAttachmentCount?: number;
+  text: string;
+  timestampMs?: number;
+  userAttachments?: ReplyRequestAttachment[];
 }
 
 let startupDiscoveryLogged = false;
@@ -403,12 +427,36 @@ function buildUserTurnInput(args: {
   return { routerBlocks, userContentParts };
 }
 
+function buildSteeringPiMessage(message: ReplySteeringMessage): PiMessage {
+  const { userContentParts } = buildUserTurnInput({
+    userTurnText: message.text,
+    userAttachments: message.userAttachments,
+    omittedImageAttachmentCount: message.omittedImageAttachmentCount ?? 0,
+  });
+  return {
+    role: "user",
+    content: userContentParts,
+    timestamp: message.timestampMs ?? Date.now(),
+  } as PiMessage;
+}
+
 /** Run a full agent turn: discover skills, execute tools, and return the assistant reply. */
 export async function generateAssistantReply(
   messageText: string,
   context: ReplyRequestContext = {},
 ): Promise<AssistantReply> {
   const replyStartedAtMs = Date.now();
+  const configuredTurnDeadlineAtMs = replyStartedAtMs + botConfig.turnTimeoutMs;
+  const contextTurnDeadlineAtMs =
+    typeof context.turnDeadlineAtMs === "number" &&
+    Number.isFinite(context.turnDeadlineAtMs)
+      ? Math.floor(context.turnDeadlineAtMs)
+      : undefined;
+  const turnDeadlineAtMs =
+    contextTurnDeadlineAtMs === undefined
+      ? configuredTurnDeadlineAtMs
+      : Math.min(configuredTurnDeadlineAtMs, contextTurnDeadlineAtMs);
+  const turnTimeoutBudgetMs = Math.max(0, turnDeadlineAtMs - replyStartedAtMs);
   let timeoutResumeConversationId: string | undefined;
   let timeoutResumeSessionId: string | undefined;
   let timeoutResumeSliceId = 1;
@@ -423,6 +471,8 @@ export async function generateAssistantReply(
   let canRecordMcpProviders = false;
   let sandboxExecutor: SandboxExecutor | undefined;
   let timedOut = false;
+  let yielded = false;
+  let inputCommitted = false;
   let turnUsage: AgentTurnUsage | undefined;
   let thinkingSelection: TurnThinkingSelection | undefined;
   const requester = requesterFromContext(
@@ -779,6 +829,13 @@ export async function generateAssistantReply(
     const toolCalls: string[] = [];
     let advisorTools: AgentTool[] = [];
     let agent: Agent | undefined;
+    let latestSafeBoundaryMessages: PiMessage[] = [];
+    const getResumeSnapshot = (): PiMessage[] => {
+      const currentMessages = agent ? [...agent.state.messages] : [];
+      return latestSafeBoundaryMessages.length > currentMessages.length
+        ? [...latestSafeBoundaryMessages]
+        : currentMessages;
+    };
 
     // ── MCP auth orchestration ───────────────────────────────────────
     const mcpAuth = createMcpAuthOrchestration(
@@ -1050,30 +1107,27 @@ export async function generateAssistantReply(
     // mid-run native tool-list mutation.
 
     // ── Agent execution ──────────────────────────────────────────────
-    agent = new Agent({
-      getApiKey: () => getPiGatewayApiKeyOverride(),
-      streamFn: createTracedStreamFn({ conversationPrivacy }),
-      initialState: {
-        systemPrompt: baseInstructions,
-        model: resolveGatewayModel(botConfig.modelId),
-        thinkingLevel: toAgentThinkingLevel(thinkingSelection.thinkingLevel),
-        tools: agentTools,
-      },
-    });
     let hasEmittedText = false;
     let needsSeparator = false;
+    const commitInput = async (): Promise<void> => {
+      if (inputCommitted) {
+        return;
+      }
+      await context.onInputCommitted?.();
+      inputCommitted = true;
+    };
     const persistSafeBoundary = async (
       messages: PiMessage[],
-    ): Promise<void> => {
+    ): Promise<boolean> => {
       if (
         !turnSessionState.canUseTurnSession ||
         !sessionConversationId ||
         !sessionId
       ) {
-        return;
+        return false;
       }
 
-      await persistRunningSessionRecord({
+      const persisted = await persistRunningSessionRecord({
         channelName: context.correlation?.channelName,
         conversationId: sessionConversationId,
         sessionId,
@@ -1083,11 +1137,111 @@ export async function generateAssistantReply(
         logContext: sessionRecordLogContext,
         requester,
       });
+      if (!persisted) {
+        return false;
+      }
+
+      latestSafeBoundaryMessages = [...messages];
+      return true;
     };
+    const requireDurableInputCheckpoint = async (
+      messages: PiMessage[],
+    ): Promise<boolean> => {
+      const persisted = await persistSafeBoundary(messages);
+      if (!persisted && context.onInputCommitted) {
+        throw new TurnInputCommitLostError(
+          `Durable turn input could not be checkpointed for conversation=${sessionConversationId ?? "unknown"} session=${sessionId ?? "unknown"}`,
+        );
+      }
+      return persisted;
+    };
+    const drainSteeringMessages = async (): Promise<void> => {
+      if (
+        !context.drainSteeringMessages ||
+        !turnSessionState.canUseTurnSession ||
+        !sessionConversationId ||
+        !sessionId
+      ) {
+        return;
+      }
+
+      try {
+        let steeredMessageCount = 0;
+        await context.drainSteeringMessages(async (messages) => {
+          const piMessages = messages.map(buildSteeringPiMessage);
+          if (piMessages.length === 0) {
+            return;
+          }
+          await requireDurableInputCheckpoint([
+            ...agent!.state.messages,
+            ...piMessages,
+          ]);
+          for (const message of piMessages) {
+            agent!.steer(message);
+          }
+          steeredMessageCount += piMessages.length;
+        });
+        if (steeredMessageCount > 0) {
+          logInfo(
+            "agent_turn_steering_messages_injected",
+            spanContext,
+            {
+              "app.ai.steering_message_count": steeredMessageCount,
+            },
+            "Agent turn steering messages injected",
+          );
+        }
+      } catch (error) {
+        if (isTurnInputCommitLostError(error)) {
+          throw error;
+        }
+        logWarn(
+          "agent_turn_steering_messages_drain_failed",
+          spanContext,
+          {
+            "exception.message":
+              error instanceof Error ? error.message : String(error),
+          },
+          "Agent turn steering message drain failed",
+        );
+      }
+    };
+    const yieldAtSafeBoundaryIfDue = (): void => {
+      if (!context.shouldYield?.()) {
+        return;
+      }
+
+      yielded = true;
+      timeoutResumeMessages = getResumeSnapshot();
+      throw new CooperativeTurnYieldError(
+        `Agent turn yielded at a safe boundary after ${
+          Date.now() - replyStartedAtMs
+        }ms`,
+      );
+    };
+
+    agent = new Agent({
+      getApiKey: () => getPiGatewayApiKeyOverride(),
+      streamFn: createTracedStreamFn({ conversationPrivacy }),
+      steeringMode: "all",
+      prepareNextTurn: async () => {
+        await drainSteeringMessages();
+        yieldAtSafeBoundaryIfDue();
+        return undefined;
+      },
+      initialState: {
+        systemPrompt: baseInstructions,
+        model: resolveGatewayModel(botConfig.modelId),
+        thinkingLevel: toAgentThinkingLevel(thinkingSelection.thinkingLevel),
+        tools: agentTools,
+      },
+    });
 
     const unsubscribe = agent.subscribe((event) => {
       if (event.type === "turn_end" && event.toolResults.length > 0) {
-        return persistSafeBoundary([...agent!.state.messages]);
+        return persistSafeBoundary([...agent!.state.messages]).then(
+          () => undefined,
+        );
       }
       if (event.type === "message_start") {
         Promise.resolve(context.onAssistantMessageStart?.()).catch((error) => {
@@ -1155,10 +1309,13 @@ export async function generateAssistantReply(
             timestamp: Date.now(),
           } as PiMessage;
           if (!resumedFromSessionRecord) {
-            await persistSafeBoundary([
+            const promptPersisted = await requireDurableInputCheckpoint([
               ...agent.state.messages,
               freshPromptMessage,
             ]);
+            if (promptPersisted) {
+              await commitInput();
+            }
           }
 
           const runAgentStep = async (
@@ -1166,15 +1323,21 @@ export async function generateAssistantReply(
           ): Promise<unknown> => {
             let timeoutId: ReturnType<typeof setTimeout> | undefined;
             const timeoutPromise = new Promise<never>((_, reject) => {
-              timeoutId = setTimeout(() => {
+              const rejectWithTimeout = () => {
                 timedOut = true;
                 agent.abort();
                 reject(
                   new Error(
-                    `Agent turn timed out after ${botConfig.turnTimeoutMs}ms`,
+                    `Agent turn timed out after ${turnTimeoutBudgetMs}ms`,
                   ),
                 );
-              }, botConfig.turnTimeoutMs);
+              };
+              const remainingTimeoutMs = turnDeadlineAtMs - Date.now();
+              if (remainingTimeoutMs <= 0) {
+                rejectWithTimeout();
+                return;
+              }
+              timeoutId = setTimeout(rejectWithTimeout, remainingTimeoutMs);
             });
 
             try {
@@ -1194,7 +1357,11 @@ export async function generateAssistantReply(
                             thinkingSelection.thinkingLevel,
                         }
                       : {}),
-                    "app.ai.turn_timeout_ms": botConfig.turnTimeoutMs,
+                    "app.ai.turn_timeout_ms": turnTimeoutBudgetMs,
+                    "app.ai.turn_deadline_remaining_ms": Math.max(
+                      0,
+                      turnDeadlineAtMs - Date.now(),
+                    ),
                   },
                   "Agent turn timed out and was aborted",
                 );
@@ -1213,10 +1380,10 @@ export async function generateAssistantReply(
                     "Timed-out agent run did not settle after abort before resume snapshot",
                   );
                 }
-                timeoutResumeMessages = [...agent.state.messages];
+                timeoutResumeMessages = getResumeSnapshot();
               }
               if (getPendingAuthPause()) {
-                timeoutResumeMessages = [...agent.state.messages];
+                timeoutResumeMessages = getResumeSnapshot();
                 throw getPendingAuthPause()!;
               }
               throw error;
@@ -1261,7 +1428,7 @@ export async function generateAssistantReply(
               ...extractGenAiUsageAttributes(usageSummary),
             });
             if (getPendingAuthPause()) {
-              timeoutResumeMessages = [...agent.state.messages];
+              timeoutResumeMessages = getResumeSnapshot();
               throw getPendingAuthPause()!;
             }
 
@@ -1362,6 +1529,37 @@ export async function generateAssistantReply(
       assistantUserName: botConfig.userName,
     });
   } catch (error) {
+    if (
+      yielded &&
+      error instanceof CooperativeTurnYieldError &&
+      timeoutResumeConversationId &&
+      timeoutResumeSessionId
+    ) {
+      turnUsage =
+        turnUsage ??
+        extractSliceUsage(timeoutResumeMessages, beforeMessageCount);
+      await recordActiveMcpProviders();
+      const sessionRecord = await persistYieldSessionRecord({
+        channelName: context.correlation?.channelName,
+        conversationId: timeoutResumeConversationId,
+        sessionId: timeoutResumeSessionId,
+        currentSliceId: timeoutResumeSliceId,
+        currentDurationMs: Date.now() - replyStartedAtMs,
+        currentUsage: turnUsage,
+        messages: timeoutResumeMessages,
+        errorMessage: error.message,
+        loadedSkillNames: loadedSkillNamesForResume,
+        logContext: sessionRecordLogContext,
+        requester,
+      });
+      if (!sessionRecord) {
+        throw new Error(
+          `Failed to persist cooperative yield continuation for conversation=${timeoutResumeConversationId} session=${timeoutResumeSessionId}`,
+        );
+      }
+      throw error;
+    }
+
     if (timedOut && timeoutResumeConversationId && timeoutResumeSessionId) {
       turnUsage =
         turnUsage ??
@@ -1380,7 +1578,12 @@ export async function generateAssistantReply(
         logContext: sessionRecordLogContext,
         requester,
       });
-      if (sessionRecord) {
+      if (!sessionRecord) {
+        throw new Error(
+          `Failed to persist timeout continuation for conversation=${timeoutResumeConversationId} session=${timeoutResumeSessionId}`,
+        );
+      }
+      if (sessionRecord.state === "awaiting_resume") {
         throw new RetryableTurnError(
           "turn_timeout_resume",
           `conversation=${timeoutResumeConversationId} session=${timeoutResumeSessionId} slice=${sessionRecord.sliceId} version=${sessionRecord.version}`,
@@ -1392,6 +1595,10 @@ export async function generateAssistantReply(
           },
         );
       }
+      throw new Error(
+        sessionRecord.errorMessage ??
+          (error instanceof Error ? error.message : String(error)),
+      );
     }
 
     // ── MCP auth pause → session continuation ────────────────────────
@@ -1442,7 +1649,13 @@ export async function generateAssistantReply(
     if (isRetryableTurnError(error)) {
       throw error;
     }
+    if (isTurnInputCommitLostError(error)) {
+      throw error;
+    }
     if (error instanceof AuthorizationFlowDisabledError) {
+      throw error;
+    }
+    if (context.onInputCommitted && !inputCommitted) {
       throw error;
     }
 

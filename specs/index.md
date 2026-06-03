@@ -3,7 +3,7 @@
 ## Metadata
 
 - Created: 2026-03-03
-- Last Edited: 2026-05-30
+- Last Edited: 2026-06-01
 
 ## Purpose
 
@@ -31,6 +31,7 @@ Define spec taxonomy, naming conventions, and canonical source-of-truth document
 - `specs/security-policy.md`
 - `specs/data-redaction-policy.md`
 - `specs/chat-architecture.md`
+- `specs/task-execution.md`
 - `specs/agent-turn-handling.md`
 - `specs/slack-agent-delivery.md`
 - `specs/slack-outbound-contract.md`
@@ -57,6 +58,7 @@ Define spec taxonomy, naming conventions, and canonical source-of-truth document
 - `specs/otel-semantics.md`
 - `specs/testing.md`
 - `specs/unit-testing.md`
+- `specs/component-testing.md`
 - `specs/integration-testing.md`
 - `specs/eval-testing.md`
 - `specs/slack-http-mocking.md`
@@ -66,6 +68,7 @@ Define spec taxonomy, naming conventions, and canonical source-of-truth document
 For chat/agent/Slack turn behavior:
 
 - `specs/chat-architecture.md` owns the end-to-end turn data flow, data authority map, and module boundaries.
+- `specs/task-execution.md` owns durable conversation mailbox execution, queue wake-up semantics, conversation leases, cooperative yield, and heartbeat repair.
 - `specs/agent-turn-handling.md` owns user-message response policy: when Junior answers, stays silent, asks, uses tools, satisfies Slack side effects, handles resumed turns, and considers a turn complete.
 - `specs/agent-execution.md` owns coding-agent execution discipline and the repository-wide model-repairable tool failure contract.
 - `specs/harness-agent.md` owns the Pi agent turn runtime contract, final output resolution, and turn diagnostics.
