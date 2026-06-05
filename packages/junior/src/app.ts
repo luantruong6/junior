@@ -3,6 +3,7 @@ import {
   getConfigDefaults,
   setConfigDefaults,
 } from "@/chat/configuration/defaults";
+import { getSlackReactionConfig, setSlackReactionConfig } from "@/chat/config";
 import { logException } from "@/chat/logging";
 import {
   getPluginCatalogSignature,
@@ -51,6 +52,13 @@ export type {
 } from "@/plugins";
 
 export interface JuniorAppOptions {
+  /** Slack-specific overrides applied after env parsing. */
+  slack?: {
+    /** Slack emoji shown while Junior is processing. Defaults to `eyes`. */
+    processingReactionEmoji?: string;
+    /** Slack emoji shown after a turn completes. Defaults to `white_check_mark`. */
+    completedReactionEmoji?: string;
+  };
   /** Install-wide provider defaults (`provider.key` format). Channel overrides take precedence. */
   configDefaults?: Record<string, unknown>;
   /** Queue consumer wiring for the durable conversation worker. */
@@ -276,9 +284,13 @@ export async function createApp(options?: JuniorAppOptions): Promise<Hono> {
   const previousPluginCatalogConfig = setPluginCatalogConfig(pluginConfig);
   const previousAgentPlugins = setAgentPlugins(agentPlugins);
   const previousConfigDefaults = getConfigDefaults();
+  const previousSlackReactionConfig = getSlackReactionConfig();
   let agentPluginRoutes: AgentPluginRouteRegistration[] = [];
   try {
     setConfigDefaults(options?.configDefaults);
+    if (options?.slack) {
+      setSlackReactionConfig(options.slack);
+    }
     if (shouldValidatePluginCatalog) {
       getPluginCatalogSignature();
       validatePluginRegistrations(configuredPlugins?.registrations ?? []);
@@ -288,6 +300,7 @@ export async function createApp(options?: JuniorAppOptions): Promise<Hono> {
     setPluginCatalogConfig(previousPluginCatalogConfig);
     setAgentPlugins(previousAgentPlugins);
     setConfigDefaults(previousConfigDefaults);
+    setSlackReactionConfig(previousSlackReactionConfig);
     throw error;
   }
 

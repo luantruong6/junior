@@ -177,38 +177,10 @@ describe("chat config", () => {
     );
   });
 
-  it("uses default reaction emojis when env vars are unset", async () => {
-    delete process.env.JUNIOR_PROCESSING_REACTION;
-    delete process.env.JUNIOR_COMPLETED_REACTION;
-
-    const { botConfig } = await loadConfig();
-    expect(botConfig.processingReactionEmoji).toBe("eyes");
-    expect(botConfig.completedReactionEmoji).toBe("white_check_mark");
-  });
-
-  it("uses JUNIOR_PROCESSING_REACTION and JUNIOR_COMPLETED_REACTION when configured", async () => {
-    process.env.JUNIOR_PROCESSING_REACTION = "hourglass_flowing_sand";
-    process.env.JUNIOR_COMPLETED_REACTION = ":tada:";
-
-    const { botConfig } = await loadConfig();
-    expect(botConfig.processingReactionEmoji).toBe("hourglass_flowing_sand");
-    expect(botConfig.completedReactionEmoji).toBe("tada");
-  });
-
-  it("throws at config load when JUNIOR_PROCESSING_REACTION is not a valid emoji name", async () => {
-    process.env.JUNIOR_PROCESSING_REACTION = "not valid emoji!";
-
-    await expect(loadConfig()).rejects.toThrow(
-      "JUNIOR_PROCESSING_REACTION must be a valid Slack emoji name",
-    );
-  });
-
-  it("throws at config load when JUNIOR_COMPLETED_REACTION is not a valid emoji name", async () => {
-    process.env.JUNIOR_COMPLETED_REACTION = "not valid emoji!";
-
-    await expect(loadConfig()).rejects.toThrow(
-      "JUNIOR_COMPLETED_REACTION must be a valid Slack emoji name",
-    );
+  it("uses default reaction emojis", async () => {
+    const { getChatConfig } = await loadConfig();
+    expect(getChatConfig().slack.processingReactionEmoji).toBe("eyes");
+    expect(getChatConfig().slack.completedReactionEmoji).toBe("white_check_mark");
   });
 
   it("uses default AGENT_TURN_TIMEOUT_MS when env var is unset", async () => {
@@ -247,5 +219,43 @@ describe("chat config", () => {
     process.env.AGENT_TURN_TIMEOUT_MS = "999999";
     const { botConfig } = await loadConfig();
     expect(botConfig.turnTimeoutMs).toBe(480000);
+  });
+});
+
+describe("setSlackReactionConfig", () => {
+  afterEach(() => {
+    vi.resetModules();
+  });
+
+  it("overrides processingReactionEmoji when provided", async () => {
+    const { getChatConfig, setSlackReactionConfig } = await loadConfig();
+    setSlackReactionConfig({ processingReactionEmoji: "jr-thinking" });
+    expect(getChatConfig().slack.processingReactionEmoji).toBe("jr-thinking");
+  });
+
+  it("overrides completedReactionEmoji when provided", async () => {
+    const { getChatConfig, setSlackReactionConfig } = await loadConfig();
+    setSlackReactionConfig({ completedReactionEmoji: "jr-done" });
+    expect(getChatConfig().slack.completedReactionEmoji).toBe("jr-done");
+  });
+
+  it("normalizes colon-wrapped emoji names", async () => {
+    const { getChatConfig, setSlackReactionConfig } = await loadConfig();
+    setSlackReactionConfig({ processingReactionEmoji: ":tada:" });
+    expect(getChatConfig().slack.processingReactionEmoji).toBe("tada");
+  });
+
+  it("throws when override emoji name is invalid", async () => {
+    const { setSlackReactionConfig } = await loadConfig();
+    expect(() =>
+      setSlackReactionConfig({ processingReactionEmoji: "not valid emoji!" }),
+    ).toThrow("processingReactionEmoji must be a valid Slack emoji name");
+  });
+
+  it("leaves unspecified fields unchanged", async () => {
+    const { getChatConfig, setSlackReactionConfig } = await loadConfig();
+    const original = getChatConfig().slack.completedReactionEmoji;
+    setSlackReactionConfig({ processingReactionEmoji: "jr-thinking" });
+    expect(getChatConfig().slack.completedReactionEmoji).toBe(original);
   });
 });
