@@ -88,11 +88,6 @@ describe("tool idempotency", () => {
     const tool = createSlackCanvasCreateTool(
       {
         channelId: "C123",
-        channelCapabilities: {
-          canCreateCanvas: true,
-          canPostToChannel: true,
-          canAddReactions: true,
-        },
         sandbox: noopSandbox,
       },
       state,
@@ -145,11 +140,6 @@ describe("tool idempotency", () => {
     const tool = createSlackCanvasCreateTool(
       {
         channelId: "D123",
-        channelCapabilities: {
-          canCreateCanvas: true,
-          canPostToChannel: false,
-          canAddReactions: true,
-        },
         sandbox: noopSandbox,
       },
       state,
@@ -178,15 +168,51 @@ describe("tool idempotency", () => {
     ).toHaveLength(0);
   });
 
+  it("creates a canvas from assistant context channel during DM turns", async () => {
+    queueSlackApiResponse("canvases.create", {
+      body: canvasesCreateOk({ canvasId: "canvas-shared-1" }),
+    });
+    queueSlackApiResponse("canvases.access.set", {
+      body: canvasesAccessSetOk(),
+    });
+    queueSlackApiResponse("files.info", {
+      body: filesInfoOk({
+        fileId: "canvas-shared-1",
+        permalink: "https://example.invalid/canvas-shared-1",
+      }),
+    });
+
+    const tool = createSlackCanvasCreateTool(
+      {
+        channelId: "D123",
+        deliveryChannelId: "C_SHARED",
+        sandbox: noopSandbox,
+      },
+      createToolState(),
+    );
+
+    const result = await executeTool(tool, {
+      title: "Shared brief",
+      markdown: "Body",
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      canvas_id: "canvas-shared-1",
+    });
+    expect(
+      getCapturedSlackApiCalls("canvases.access.set")[0]?.params,
+    ).toMatchObject({
+      canvas_id: "canvas-shared-1",
+      access_level: "write",
+      channel_ids: ["C_SHARED"],
+    });
+  });
+
   it("throws when creating a canvas without assistant channel context", async () => {
     const state = createToolState();
     const tool = createSlackCanvasCreateTool(
       {
-        channelCapabilities: {
-          canCreateCanvas: false,
-          canPostToChannel: false,
-          canAddReactions: false,
-        },
         sandbox: noopSandbox,
       },
       state,
@@ -257,11 +283,6 @@ describe("tool idempotency", () => {
     const tool = createSlackCanvasCreateTool(
       {
         channelId: "C123",
-        channelCapabilities: {
-          canCreateCanvas: true,
-          canPostToChannel: true,
-          canAddReactions: true,
-        },
         sandbox: noopSandbox,
       },
       state,

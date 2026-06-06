@@ -17,6 +17,7 @@ import {
   getDispatchRecord,
   isTerminalDispatchStatus,
   listIncompleteDispatchIds,
+  parseDispatchRecord,
   updateDispatchRecord,
   withDispatchLock,
 } from "./store";
@@ -64,9 +65,9 @@ async function failDispatch(args: {
 }): Promise<void> {
   await withDispatchLock(args.record.id, async (state) => {
     const current =
-      (await state.get<DispatchRecord>(
-        getDispatchStorageKey(args.record.id),
-      )) ?? args.record;
+      parseDispatchRecord(
+        await state.get(getDispatchStorageKey(args.record.id)),
+      ) ?? args.record;
     if (isTerminalDispatchStatus(current.status)) {
       return;
     }
@@ -77,7 +78,6 @@ async function failDispatch(args: {
     });
   });
 }
-
 async function runWithTimeout<T>(
   promise: Promise<T>,
   timeoutMs: number,

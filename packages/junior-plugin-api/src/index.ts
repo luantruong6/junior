@@ -1,9 +1,94 @@
-export interface AgentPluginRequester {
-  userId?: string;
-  userName?: string;
-  fullName?: string;
-  email?: string;
-}
+import { z } from "zod";
+
+const slackTeamIdSchema = z.string().regex(/^T[A-Z0-9]+$/);
+const slackConversationIdSchema = z.string().regex(/^(C|G|D)[A-Z0-9]+$/);
+const exactActorUserIdSchema = z
+  .string()
+  .min(1)
+  .refine(
+    (value) => value === value.trim() && value.toLowerCase() !== "unknown",
+  );
+const nonBlankStringSchema = z
+  .string()
+  .refine((value) => value.trim().length > 0);
+
+/** Runtime-owned provider-neutral address for routing future work or side effects. */
+export const destinationSchema = z
+  .object({
+    platform: z.literal("slack"),
+    teamId: slackTeamIdSchema,
+    channelId: slackConversationIdSchema,
+  })
+  .strict();
+
+/** Stable user credential subject shape accepted from trusted plugins. */
+export const agentPluginCredentialSubjectSchema = z
+  .object({
+    type: z.literal("user"),
+    userId: exactActorUserIdSchema,
+    allowedWhen: z.literal("private-direct-conversation"),
+  })
+  .strict();
+
+/** Runtime-provided requester identity visible to trusted plugin hooks. */
+export const agentPluginRequesterSchema = z
+  .object({
+    userId: exactActorUserIdSchema.optional(),
+    userName: nonBlankStringSchema.optional(),
+    fullName: nonBlankStringSchema.optional(),
+    email: nonBlankStringSchema.optional(),
+  })
+  .strict();
+
+const dispatchMetadataSchema = z
+  .record(z.string(), z.string())
+  .superRefine((metadata, ctx) => {
+    const entries = Object.entries(metadata);
+    if (entries.length > 20) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Dispatch metadata has too many keys",
+      });
+      return;
+    }
+    for (const [key, value] of entries) {
+      if (!key.trim()) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Dispatch metadata values must be strings",
+          path: [key],
+        });
+        continue;
+      }
+      if (key.length > 128) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Dispatch metadata key exceeds the maximum length",
+          path: [key],
+        });
+      }
+      if (value.length > 512) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Dispatch metadata value exceeds the maximum length",
+          path: [key],
+        });
+      }
+    }
+  });
+
+/** Trusted plugin dispatch request accepted by Junior core. */
+export const dispatchOptionsSchema = z
+  .object({
+    idempotencyKey: nonBlankStringSchema.pipe(z.string().max(512)),
+    credentialSubject: agentPluginCredentialSubjectSchema.optional(),
+    destination: destinationSchema,
+    input: nonBlankStringSchema.pipe(z.string().max(32_000)),
+    metadata: dispatchMetadataSchema.optional(),
+  })
+  .strict();
+
+export type AgentPluginRequester = z.output<typeof agentPluginRequesterSchema>;
 
 export interface AgentPluginMetadata {
   name: string;
@@ -104,13 +189,36 @@ export interface AgentPluginToolDefinition<TInput = unknown> {
 }
 
 export interface ToolRegistrationHookContext extends AgentPluginContext {
+  /**
+   * Capabilities of `channelId` — the raw conversation channel exposed to
+   * this plugin. Recomputed from `channelId`, not from `destination`.
+   */
   channelCapabilities?: {
     canAddReactions: boolean;
     canCreateCanvas: boolean;
     canPostToChannel: boolean;
   };
+  /**
+   * The raw Slack channel ID for this conversation — the DM or channel where
+   * this turn is happening, without any assistant-context-source override.
+   * Use this as the stable binding key for state scoped to a Slack conversation.
+   * `channelCapabilities` describes this channel.
+   */
   channelId?: string;
+  /**
+   * Opaque Junior conversation/session identity for this turn.
+   * Interactive Slack turns use `slack:{channelId}:{threadTs}`.
+   * Scheduled/API turns use an internal id such as `agent-dispatch:{id}`.
+   * Do not parse as Slack unless the value starts with `slack:`.
+   */
+  conversationId?: string;
   credentialSubject?: AgentPluginCredentialSubject;
+  /**
+   * Runtime-owned destination suitable for future autonomous dispatch. For
+   * Slack, this is the raw conversation channel, not a thread timestamp or
+   * assistant-context source channel.
+   */
+  destination?: Destination;
   messageTs?: string;
   requester?: AgentPluginRequester;
   state: AgentPluginState;
@@ -119,23 +227,13 @@ export interface ToolRegistrationHookContext extends AgentPluginContext {
   userText?: string;
 }
 
-export interface AgentPluginCredentialSubject {
-  type: "user";
-  userId: string;
-  allowedWhen: "private-direct-conversation";
-}
+export type AgentPluginCredentialSubject = z.output<
+  typeof agentPluginCredentialSubjectSchema
+>;
 
-export interface DispatchOptions {
-  credentialSubject?: AgentPluginCredentialSubject;
-  destination: {
-    platform: "slack";
-    teamId: string;
-    channelId: string;
-  };
-  idempotencyKey: string;
-  input: string;
-  metadata?: Record<string, string>;
-}
+export type Destination = z.output<typeof destinationSchema>;
+
+export type DispatchOptions = z.output<typeof dispatchOptionsSchema>;
 
 export interface DispatchResult {
   id: string;

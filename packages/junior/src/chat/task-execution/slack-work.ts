@@ -14,7 +14,7 @@ import {
   TurnInputCommitLostError,
 } from "@/chat/runtime/turn";
 import { normalizeIncomingSlackThreadId } from "@/chat/ingress/message-router";
-import { rehydrateAttachmentFetchers } from "@/chat/queue/thread-message-dispatcher";
+import { rehydrateAttachmentFetchers } from "@/chat/slack/attachment-fetchers";
 import { getAwaitingTurnContinuationRequest } from "@/chat/services/timeout-resume";
 import { resumeTimedOutTurnWithLockRetry } from "@/chat/runtime/timeout-resume-runner";
 import {
@@ -45,6 +45,7 @@ import {
   parseActorUserId,
   type SlackActorProfile,
 } from "@/chat/services/requester-identity";
+import { createSlackDestination } from "@/chat/destination";
 
 export type SlackConversationRoute = "mention" | "subscribed";
 
@@ -381,6 +382,7 @@ export function createSlackConversationWorker(
         try {
           if (route === "mention") {
             await options.runtime.handleNewMention(thread, latestMessage, {
+              destination: context.destination,
               messageContext,
               drainSteeringMessages,
               onInputCommitted,
@@ -390,6 +392,7 @@ export function createSlackConversationWorker(
           }
 
           await options.runtime.handleSubscribedMessage(thread, latestMessage, {
+            destination: context.destination,
             messageContext,
             drainSteeringMessages,
             onInputCommitted,
@@ -427,8 +430,16 @@ export function buildSlackInboundMessage(args: {
   thread: ThreadImpl;
 }): InboundMessageRecord {
   const authorId = requireSlackAuthorId(args.message);
+  const destination = createSlackDestination({
+    channelId: args.thread.channelId,
+    teamId: args.installation?.teamId,
+  });
+  if (!destination) {
+    throw new Error("Slack inbound message requires destination context");
+  }
   return {
     conversationId: args.conversationId,
+    destination,
     inboundMessageId: [
       "slack",
       args.installation?.teamId ?? args.installation?.enterpriseId ?? "unknown",

@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AgentPluginToolInputError } from "@sentry/junior-plugin-api";
+import {
+  AgentPluginToolInputError,
+  type AgentPluginToolDefinition,
+} from "@sentry/junior-plugin-api";
 import {
   createSchedulerStore,
   createSlackScheduleCreateTaskTool,
@@ -7,11 +10,17 @@ import {
   createSlackScheduleListTasksTool,
   createSlackScheduleRunTaskNowTool,
   createSlackScheduleUpdateTaskTool,
+  type ScheduledTask,
   type SchedulerToolContext,
 } from "@sentry/junior-scheduler";
 import { createSlackDirectCredentialSubject } from "@/chat/credentials/subject";
+import {
+  getAgentPluginTools,
+  setAgentPlugins,
+} from "@/chat/plugins/agent-hooks";
 import { createPluginState } from "@/chat/plugins/state";
 import { disconnectStateAdapter } from "@/chat/state/adapter";
+import { schedulerPlugin } from "@sentry/junior-scheduler";
 
 vi.hoisted(() => {
   process.env.JUNIOR_STATE_ADAPTER = "memory";
@@ -20,30 +29,36 @@ vi.hoisted(() => {
 const TEST_TEAM_ID = `TSCHEDULE${Date.now()}`;
 
 function createContext(
-  overrides: Partial<SchedulerToolContext> = {},
+  overrides: Partial<SchedulerToolContext> & {
+    channelId?: string;
+    teamId?: string;
+  } = {},
 ): SchedulerToolContext {
+  const channelId = overrides.channelId ?? "C123";
+  const teamId = overrides.teamId ?? TEST_TEAM_ID;
+  const contextOverrides = { ...overrides };
+  delete contextOverrides.channelId;
+  delete contextOverrides.teamId;
   const context: SchedulerToolContext = {
-    channelId: "C123",
-    teamId: TEST_TEAM_ID,
+    destination: {
+      platform: "slack",
+      teamId,
+      channelId,
+    },
     requester: {
       userId: "U123",
       userName: "dcramer",
       fullName: "David Cramer",
     },
-    channelCapabilities: {
-      canCreateCanvas: true,
-      canPostToChannel: true,
-      canAddReactions: true,
-    },
     userText: "schedule this weekly",
     state: createPluginState("scheduler"),
-    ...overrides,
+    ...contextOverrides,
   };
   const credentialSubject =
     context.credentialSubject ??
     createSlackDirectCredentialSubject({
-      channelId: context.channelId,
-      teamId: context.teamId,
+      channelId: context.destination?.channelId,
+      teamId: context.destination?.teamId,
       userId: context.requester?.userId,
     });
   return {
@@ -52,11 +67,14 @@ function createContext(
   };
 }
 
-async function executeTool<TInput>(tool: any, input: TInput) {
+async function executeTool<TInput>(
+  tool: AgentPluginToolDefinition<TInput>,
+  input: TInput,
+) {
   if (typeof tool?.execute !== "function") {
     throw new Error("tool execute function missing");
   }
-  return await tool.execute(input, {} as any);
+  return await tool.execute(input, {});
 }
 
 function schedulerStore() {
@@ -125,9 +143,7 @@ describe("Slack schedule tools", () => {
     });
 
     const sameChannelOtherThread = await executeTool(
-      createSlackScheduleListTasksTool(
-        createContext({ threadTs: "1700000999.000000" }),
-      ),
+      createSlackScheduleListTasksTool(createContext()),
       {},
     );
     expect(sameChannelOtherThread).toMatchObject({
@@ -211,7 +227,7 @@ describe("Slack schedule tools", () => {
     ).resolves.toEqual([]);
   });
 
-  it("rejects invalid Slack workspace context before creating a task", async () => {
+  it("rejects invalid Slack destination before creating a task", async () => {
     const rejected = executeTool(
       createSlackScheduleCreateTaskTool(createContext({ teamId: "D123" })),
       {
@@ -223,11 +239,108 @@ describe("Slack schedule tools", () => {
 
     await expect(rejected).rejects.toThrow(AgentPluginToolInputError);
     await expect(rejected).rejects.toThrow(
-      "Active Slack workspace context is invalid.",
+      "Active Slack destination workspace is invalid.",
     );
     await expect(
       schedulerStore().listTasksForTeam(TEST_TEAM_ID),
     ).resolves.toEqual([]);
+  });
+
+  it("rejects non-canonical Slack destination context before creating a task", async () => {
+    const rejected = createTask(
+      createContext({
+        destination: {
+          platform: "slack",
+          teamId: TEST_TEAM_ID,
+          channelId: "C123",
+          threadTs: "1700000000.000",
+        } as SchedulerToolContext["destination"],
+      }),
+    );
+
+    await expect(rejected).rejects.toThrow(AgentPluginToolInputError);
+    await expect(rejected).rejects.toThrow(
+      "Active Slack destination must not include unknown fields.",
+    );
+    await expect(
+      schedulerStore().listTasksForTeam(TEST_TEAM_ID),
+    ).resolves.toEqual([]);
+  });
+
+  it("rejects invalid Slack credential subject context before creating a task", async () => {
+    const rejected = createTask(
+      createContext({
+        channelId: "D123",
+        credentialSubject: {
+          type: "user",
+          userId: "U123",
+          allowedWhen: "private-direct-conversation",
+          binding: {
+            type: "slack-direct-conversation",
+            teamId: TEST_TEAM_ID,
+            channelId: "D123",
+            signature: "v1=test",
+          },
+        } as SchedulerToolContext["credentialSubject"],
+      }),
+    );
+
+    await expect(rejected).rejects.toThrow(AgentPluginToolInputError);
+    await expect(rejected).rejects.toThrow(
+      "Active Slack credential subject is invalid.",
+    );
+    await expect(
+      schedulerStore().listTasksForTeam(TEST_TEAM_ID),
+    ).resolves.toEqual([]);
+  });
+
+  it("rejects invalid scheduled task routing context at the store boundary", async () => {
+    await createTask();
+    const task = (await schedulerStore().listTasks()).at(0);
+    if (!task) {
+      throw new Error("Expected scheduled task to be created");
+    }
+
+    await expect(
+      schedulerStore().saveTask({
+        ...task,
+        id: "sched_bad_destination",
+        destination: {
+          platform: "slack",
+          teamId: "D_BAD_TEAM",
+          channelId: "D123",
+        },
+      }),
+    ).rejects.toThrow("Scheduled task routing context is invalid.");
+    await expect(
+      schedulerStore().getTask("sched_bad_destination"),
+    ).resolves.toBe(undefined);
+
+    await expect(
+      schedulerStore().saveTask({
+        ...task,
+        id: "sched_bad_credential_subject",
+        destination: {
+          platform: "slack",
+          teamId: TEST_TEAM_ID,
+          channelId: "D123",
+        },
+        credentialSubject: {
+          type: "user",
+          userId: "U123",
+          allowedWhen: "private-direct-conversation",
+          binding: {
+            type: "slack-direct-conversation",
+            teamId: TEST_TEAM_ID,
+            channelId: "D123",
+            signature: "v1=test",
+          },
+        } as ScheduledTask["credentialSubject"],
+      }),
+    ).rejects.toThrow("Scheduled task routing context is invalid.");
+    await expect(
+      schedulerStore().getTask("sched_bad_credential_subject"),
+    ).resolves.toBe(undefined);
   });
 
   it("creates explicit one-off reminders without a second confirmation", async () => {
@@ -517,13 +630,66 @@ describe("Slack schedule tools", () => {
     );
   });
 
+  it("binds tasks to the raw conversation channel, not the assistant context channel", async () => {
+    // The scheduler receives an active Destination built from the raw
+    // conversation channel by runtime wiring. Management works from any
+    // context with the same destination.
+    //
+    // In practice: a DM opened via Slack’s “Ask Junior” panel from #js-alerts
+    // has getAgentPluginTools build destination.channelId = DDM rather than
+    // CJS (assistant source). Both creation and management from that DM use
+    // DDM, so the destination never drifts.
+    const dmCtx = createContext({ channelId: "DDM" });
+    const created = (await createTask(dmCtx)) as { task: { id: string } };
+    const taskId = created.task.id;
+
+    // Task is bound to the DM channel, not any assistant source channel.
+    await expect(schedulerStore().getTask(taskId)).resolves.toMatchObject({
+      destination: { channelId: "DDM" },
+    });
+
+    // Any context that resolves to the same DM channel can list and manage.
+    const listed = await executeTool(
+      createSlackScheduleListTasksTool(createContext({ channelId: "DDM" })),
+      {},
+    );
+    expect(listed).toMatchObject({
+      ok: true,
+      tasks: [{ id: taskId }],
+    });
+
+    const deleted = await executeTool(
+      createSlackScheduleDeleteTaskTool(createContext({ channelId: "DDM" })),
+      { task_id: taskId },
+    );
+    expect(deleted).toMatchObject({
+      ok: true,
+      task: { id: taskId, status: "deleted" },
+    });
+  });
+
+  it("rejects management from a different conversation channel", async () => {
+    // A task created in Alice’s DM cannot be managed from Bob’s DM.
+    const created = (await createTask(
+      createContext({ channelId: "DALICE" }),
+    )) as { task: { id: string } };
+
+    await expect(
+      executeTool(
+        createSlackScheduleDeleteTaskTool(createContext({ channelId: "DBOB" })),
+        { task_id: created.task.id },
+      ),
+    ).rejects.toThrow(
+      "Scheduled task can only be managed from the Slack destination where it was created.",
+    );
+  });
+
   it("allows another requester to manage tasks in the same Slack destination", async () => {
     const context = createContext();
     const created = (await createTask(context)) as {
       task: { id: string };
     };
     const otherRequester = createContext({
-      threadTs: "1700000003.000000",
       requester: {
         userId: "U999",
         userName: "alice",
@@ -601,15 +767,36 @@ describe("Slack schedule tools", () => {
     expect(tasks[0]?.credentialSubject).toBeUndefined();
   });
 
-  it("normalizes Slack conversation ids before storing destinations", async () => {
-    const result = await createTask(
-      createContext({ channelId: "slack:D123:1700000000.000" }),
-      {
-        schedule: "In 1 minute",
-        next_run_at: "2026-05-27T00:25:23.000Z",
-        recurrence: undefined,
-      },
-    );
+  it("rejects non-canonical Slack destinations before storing tasks", async () => {
+    const context = createContext({ channelId: "D123" });
+    await expect(
+      createTask(
+        {
+          ...context,
+          destination: {
+            platform: "slack",
+            teamId: TEST_TEAM_ID,
+            channelId: "slack:D123:1700000000.000",
+          },
+        },
+        {
+          schedule: "In 1 minute",
+          next_run_at: "2026-05-27T00:25:23.000Z",
+          recurrence: undefined,
+        },
+      ),
+    ).rejects.toThrow("Active Slack destination channel is invalid.");
+    await expect(
+      schedulerStore().listTasksForTeam(TEST_TEAM_ID),
+    ).resolves.toEqual([]);
+  });
+
+  it("stores canonical Slack destinations directly", async () => {
+    const result = await createTask(createContext({ channelId: "D123" }), {
+      schedule: "In 1 minute",
+      next_run_at: "2026-05-27T00:25:23.000Z",
+      recurrence: undefined,
+    });
 
     expect(result).toMatchObject({
       ok: true,
@@ -806,8 +993,8 @@ describe("Slack schedule tools", () => {
       status: "active",
       nextRunAtMs: scheduledNextRunAtMs,
       destination: {
-        teamId: context.teamId,
-        channelId: context.channelId,
+        teamId: context.destination?.teamId,
+        channelId: context.destination?.channelId,
       },
       createdBy: {
         slackUserId: context.requester?.userId,
@@ -893,6 +1080,70 @@ describe("Slack schedule tools", () => {
       status: "pending",
     });
     expect(second).toBeUndefined();
+  });
+});
+
+describe("Slack schedule tool wiring via getAgentPluginTools", () => {
+  // These tests exercise the real agent-hooks.ts path where the runtime-owned
+  // Destination is passed through to the scheduler plugin.
+
+  beforeEach(async () => {
+    await disconnectStateAdapter();
+  });
+
+  afterEach(async () => {
+    await disconnectStateAdapter();
+  });
+
+  it("scheduler tools bind to the runtime-owned destination", async () => {
+    // Verifies that the real getAgentPluginTools wiring passes Destination
+    // through to the scheduler, which stores it as the task destination.
+    const previous = setAgentPlugins([schedulerPlugin()]);
+    try {
+      const TEAM_ID = `TWIRING${Date.now()}`;
+      const tools = getAgentPluginTools({
+        channelId: "DDM",
+        destination: {
+          platform: "slack",
+          teamId: TEAM_ID,
+          channelId: "DDM",
+        },
+        teamId: TEAM_ID,
+        requester: { userId: "U123", userName: "alice", fullName: "Alice" },
+        sandbox: {} as Parameters<typeof getAgentPluginTools>[0]["sandbox"],
+      });
+
+      expect(tools).toHaveProperty("slackScheduleCreateTask");
+
+      // Create a task through the real wired tool.
+      const result = await executeTool(tools.slackScheduleCreateTask, {
+        task: "Wiring test: post a weekly digest.",
+        schedule: "Every Monday at 9am",
+        timezone: "America/Los_Angeles",
+        next_run_at: "2026-06-09T16:00:00.000Z",
+        recurrence: "weekly",
+      });
+
+      expect(result).toMatchObject({ ok: true });
+      const taskId = (result as { task: { id: string } }).task.id;
+
+      // Task destination must be the raw DM channel, NOT the assistant context.
+      const stored = await createSchedulerStore(
+        createPluginState("scheduler"),
+      ).getTask(taskId);
+      expect(stored).toMatchObject({
+        destination: { channelId: "DDM", teamId: TEAM_ID },
+        conversationAccess: { audience: "direct", visibility: "private" },
+      });
+      // DM-based task gets a credential subject (private-direct exception).
+      expect(stored?.credentialSubject).toMatchObject({
+        type: "user",
+        userId: "U123",
+        allowedWhen: "private-direct-conversation",
+      });
+    } finally {
+      setAgentPlugins(previous);
+    }
   });
 });
 

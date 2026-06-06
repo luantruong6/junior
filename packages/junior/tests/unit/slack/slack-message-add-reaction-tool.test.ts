@@ -24,11 +24,6 @@ describe("slackMessageAddReaction tool", () => {
     const tool = createSlackMessageAddReactionTool(
       {
         channelId: "C123",
-        channelCapabilities: {
-          canCreateCanvas: true,
-          canPostToChannel: true,
-          canAddReactions: true,
-        },
         messageTs: "1700000000.100",
         sandbox: {} as any,
       },
@@ -53,11 +48,6 @@ describe("slackMessageAddReaction tool", () => {
     const tool = createSlackMessageAddReactionTool(
       {
         channelId: "C123",
-        channelCapabilities: {
-          canCreateCanvas: true,
-          canPostToChannel: true,
-          canAddReactions: true,
-        },
         messageTs: "1700000000.100",
         sandbox: {} as any,
       },
@@ -87,11 +77,6 @@ describe("slackMessageAddReaction tool", () => {
     const tool = createSlackMessageAddReactionTool(
       {
         channelId: "C123",
-        channelCapabilities: {
-          canCreateCanvas: true,
-          canPostToChannel: true,
-          canAddReactions: true,
-        },
         messageTs: "1700000000.100",
         sandbox: {} as any,
       },

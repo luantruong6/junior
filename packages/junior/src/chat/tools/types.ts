@@ -1,10 +1,10 @@
 import type { FileUpload } from "chat";
+import type { Destination } from "@sentry/junior-plugin-api";
 import type { McpToolManager } from "@/chat/mcp/tool-manager";
 import type { SandboxWorkspace } from "@/chat/sandbox/workspace";
 import type { ThreadArtifactsState } from "@/chat/state/artifacts";
 import type { Skill } from "@/chat/skills";
 import type { LoadSkillMetadata } from "@/chat/tools/skill/load-skill";
-import type { ChannelCapabilities } from "@/chat/tools/channel-capabilities";
 import type { AdvisorToolRuntimeContext } from "@/chat/tools/advisor/tool";
 
 export interface ImageGenerateToolDeps {
@@ -44,8 +44,31 @@ export interface ToolHooks {
 
 export interface ToolRuntimeContext {
   advisor?: AdvisorToolRuntimeContext;
+  /**
+   * Raw Slack channel/conversation container for this turn: `C...`, `D...`,
+   * or `G...`. Never overridden by assistant context. Stable binding key for
+   * state scoped to a Slack conversation. Passed to plugin hooks as-is via
+   * `ToolRegistrationHookContext.channelId`.
+   */
   channelId?: string;
-  channelCapabilities: ChannelCapabilities;
+
+  /**
+   * Slack channel used by first-class delivery tools when assistant context
+   * points at a source channel different from the raw conversation channel.
+   */
+  deliveryChannelId?: string;
+
+  /**
+   * Opaque Junior conversation/session identity for this turn.
+   * Interactive Slack turns use `slack:{channelId}:{threadTs}`.
+   * Scheduled/API turns use an internal id such as `agent-dispatch:{id}`.
+   * Do not parse as Slack unless the value starts with `slack:`.
+   */
+  conversationId?: string;
+
+  /** Runtime-owned destination for provider-neutral side effects. */
+  destination?: Destination;
+
   requester?: {
     userId?: string;
     userName?: string;

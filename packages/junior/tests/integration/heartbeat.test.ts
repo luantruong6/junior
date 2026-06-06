@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { defineJuniorPlugin } from "@sentry/junior-plugin-api";
+import {
+  defineJuniorPlugin,
+  type Destination,
+} from "@sentry/junior-plugin-api";
 import { createHeartbeatContext } from "@/chat/agent-dispatch/context";
 import { recoverStaleDispatches } from "@/chat/agent-dispatch/heartbeat";
 import {
@@ -35,6 +38,11 @@ vi.hoisted(() => {
 
 const TEST_NOW_MS = Date.parse("2026-05-26T12:05:00.000Z");
 const TEST_RUN_AT_MS = Date.parse("2026-05-26T12:00:00.000Z");
+const SLACK_DESTINATION = {
+  platform: "slack",
+  teamId: "T123",
+  channelId: "C123",
+} satisfies Destination;
 
 function schedulerStore() {
   return createSchedulerStore(createPluginState("scheduler"));
@@ -46,11 +54,7 @@ function createTask(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
     id: "sched_plugin_1",
     createdAtMs: nextRunAtMs,
     createdBy: { slackUserId: "U123" },
-    destination: {
-      platform: "slack",
-      teamId: "T123",
-      channelId: "C123",
-    },
+    destination: SLACK_DESTINATION,
     nextRunAtMs,
     schedule: {
       description: "Once at noon",
@@ -230,6 +234,7 @@ describe("trusted plugin heartbeat", () => {
       conversationId,
       sessionId,
       sliceId: 2,
+      destination: SLACK_DESTINATION,
       state: "awaiting_resume",
       resumeReason: "timeout",
       piMessages: [
@@ -257,6 +262,7 @@ describe("trusted plugin heartbeat", () => {
     expect(queue.sentRecords()).toEqual([
       {
         conversationId,
+        destination: SLACK_DESTINATION,
         idempotencyKey: expect.stringContaining(
           `timeout:${conversationId}:${sessionId}:`,
         ),
@@ -280,6 +286,7 @@ describe("trusted plugin heartbeat", () => {
       conversationId,
       sessionId,
       sliceId: 1,
+      destination: SLACK_DESTINATION,
       state: "awaiting_resume",
       resumeReason: "yield",
       piMessages: [
@@ -307,6 +314,7 @@ describe("trusted plugin heartbeat", () => {
     expect(queue.sentRecords()).toEqual([
       {
         conversationId,
+        destination: SLACK_DESTINATION,
         idempotencyKey: expect.stringContaining(
           `timeout:${conversationId}:${sessionId}:`,
         ),
@@ -330,6 +338,7 @@ describe("trusted plugin heartbeat", () => {
       conversationId,
       sessionId,
       sliceId: 2,
+      destination: SLACK_DESTINATION,
       state: "awaiting_resume",
       resumeReason: "timeout",
       piMessages: [
@@ -613,6 +622,70 @@ describe("trusted plugin heartbeat", () => {
         nowMs: Date.parse("2026-05-26T12:05:00.000Z"),
       }),
     ).resolves.toBe(0);
+    await expect(getDispatchRecord(created.record.id)).resolves.toMatchObject({
+      status: "failed",
+      errorMessage: "Dispatch exceeded retry attempts.",
+    });
+  });
+
+  it("fails stale dispatches when the locked row no longer parses", async () => {
+    const created = await createOrGetDispatch({
+      plugin: "scheduler",
+      nowMs: Date.parse("2026-05-26T12:00:00.000Z"),
+      options: {
+        idempotencyKey: "run-exhausted-corrupt-row",
+        destination: {
+          platform: "slack",
+          teamId: "T123",
+          channelId: "C123",
+        },
+        input: "Run the scheduled task.",
+      },
+    });
+    await withDispatchLock(created.record.id, async (state) => {
+      const record = await state.get<DispatchRecord>(
+        getDispatchStorageKey(created.record.id),
+      );
+      if (!record) {
+        throw new Error("Expected dispatch record to exist");
+      }
+      await updateDispatchRecord(state, {
+        ...record,
+        attempt: record.maxAttempts,
+        lastCallbackAtMs: Date.parse("2026-05-26T12:00:00.000Z"),
+      });
+    });
+
+    const state = getStateAdapter();
+    await state.connect();
+    const storageKey = getDispatchStorageKey(created.record.id);
+    const current = await state.get<DispatchRecord>(storageKey);
+    if (!current) {
+      throw new Error("Expected dispatch record to exist");
+    }
+    const corruptRecord = {
+      ...(current as unknown as Record<string, unknown>),
+    };
+    delete corruptRecord.destination;
+    const originalGet = state.get.bind(state);
+    let recordReads = 0;
+    state.get = (async (key: string) => {
+      if (key === storageKey && recordReads++ === 1) {
+        return corruptRecord;
+      }
+      return await originalGet(key);
+    }) as typeof state.get;
+
+    try {
+      await expect(
+        recoverStaleDispatches({
+          nowMs: Date.parse("2026-05-26T12:05:00.000Z"),
+        }),
+      ).resolves.toBe(0);
+    } finally {
+      state.get = originalGet;
+    }
+
     await expect(getDispatchRecord(created.record.id)).resolves.toMatchObject({
       status: "failed",
       errorMessage: "Dispatch exceeded retry attempts.",
@@ -1035,52 +1108,6 @@ describe("trusted plugin heartbeat", () => {
       status: "blocked",
       statusReason: expect.stringContaining(
         "Scheduled task prompt could not be built",
-      ),
-    });
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  it("blocks scheduled runs with invalid dispatch destinations without stopping the heartbeat", async () => {
-    const fetchMock = vi.fn(async () => {
-      return new Response("Accepted", { status: 202 });
-    });
-    global.fetch = fetchMock as typeof fetch;
-    setAgentPlugins([schedulerPlugin()]);
-    const store = schedulerStore();
-    await store.saveTask({
-      ...createTask(),
-      id: "sched_plugin_bad_destination",
-      destination: {
-        platform: "slack",
-        teamId: "D_BAD_TEAM",
-        channelId: "D123",
-      },
-    });
-
-    const waitUntil = createWaitUntilCollector();
-    const response = await heartbeat(
-      new Request("https://example.invalid/api/internal/heartbeat", {
-        headers: { authorization: "Bearer heartbeat-secret" },
-      }),
-      waitUntil.fn,
-    );
-    expect(response.status).toBe(202);
-    await waitUntil.flush();
-
-    await expect(
-      store.getRun(`sched_plugin_bad_destination:${TEST_RUN_AT_MS}`),
-    ).resolves.toMatchObject({
-      status: "blocked",
-      errorMessage: expect.stringContaining(
-        "Scheduled task dispatch could not be created",
-      ),
-    });
-    await expect(
-      store.getTask("sched_plugin_bad_destination"),
-    ).resolves.toMatchObject({
-      status: "blocked",
-      statusReason: expect.stringContaining(
-        "Scheduled task dispatch could not be created",
       ),
     });
     expect(fetchMock).not.toHaveBeenCalled();

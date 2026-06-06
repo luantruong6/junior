@@ -2,6 +2,10 @@ import { randomUUID } from "node:crypto";
 import { Type } from "@sinclair/typebox";
 import {
   AgentPluginToolInputError,
+  agentPluginCredentialSubjectSchema,
+  destinationSchema,
+  type AgentPluginCredentialSubject,
+  type Destination,
   type AgentPluginRequester,
   type AgentPluginState,
   type AgentPluginToolDefinition,
@@ -14,26 +18,16 @@ import type {
   ScheduledCalendarFrequency,
   ScheduledTask,
   ScheduledTaskConversationAccess,
-  ScheduledTaskCredentialSubject,
-  ScheduledTaskDestination,
   ScheduledTaskPrincipal,
   ScheduledTaskRecurrence,
   ScheduledTaskStatus,
 } from "./types";
 
 export interface SchedulerToolContext {
-  channelCapabilities: {
-    canAddReactions: boolean;
-    canCreateCanvas: boolean;
-    canPostToChannel: boolean;
-  };
-  channelId?: string;
-  credentialSubject?: ScheduledTaskCredentialSubject;
-  messageTs?: string;
+  credentialSubject?: AgentPluginCredentialSubject;
+  destination?: Destination;
   requester?: AgentPluginRequester;
   state: AgentPluginState;
-  teamId?: string;
-  threadTs?: string;
   userText?: string;
 }
 
@@ -41,29 +35,38 @@ const TASK_ID_PREFIX = "sched";
 const MAX_LISTED_TASKS = 50;
 const DEFAULT_SCHEDULE_TIMEZONE = "America/Los_Angeles";
 
+type SchemaIssue = {
+  code: string;
+  path: readonly PropertyKey[];
+};
+
 function throwToolInputError(error: string): never {
   throw new AgentPluginToolInputError(error);
 }
 
-function requireActiveDestination(
-  context: SchedulerToolContext,
-): ScheduledTaskDestination {
-  const channelId = normalizeSlackConversationId(context.channelId);
-  if (!channelId) {
-    throwToolInputError("No active Slack channel context is available.");
-  }
-  if (!context.teamId) {
-    throwToolInputError("No active Slack workspace context is available.");
-  }
-  if (!isSlackTeamId(context.teamId)) {
-    throwToolInputError("Active Slack workspace context is invalid.");
+function requireActiveDestination(context: SchedulerToolContext): Destination {
+  const parsed = destinationSchema.safeParse(context.destination);
+  if (!parsed.success) {
+    const destination = context.destination as Partial<Destination> | undefined;
+    const issues = parsed.error.issues as readonly SchemaIssue[];
+    if (!destination || destination.platform !== "slack") {
+      throwToolInputError("No active Slack destination is available.");
+    }
+    if (issues.some((issue) => issue.code === "unrecognized_keys")) {
+      throwToolInputError(
+        "Active Slack destination must not include unknown fields.",
+      );
+    }
+    if (issues.some((issue) => issue.path[0] === "channelId")) {
+      throwToolInputError("Active Slack destination channel is invalid.");
+    }
+    if (issues.some((issue) => issue.path[0] === "teamId")) {
+      throwToolInputError("Active Slack destination workspace is invalid.");
+    }
+    throwToolInputError("No active Slack destination is available.");
   }
 
-  return {
-    platform: "slack",
-    teamId: context.teamId,
-    channelId,
-  };
+  return parsed.data;
 }
 
 function requireRequester(
@@ -91,28 +94,12 @@ function tool<TInput = any>(
   return definition;
 }
 
-function normalizeSlackConversationId(
-  value: string | undefined,
-): string | undefined {
-  if (!value) return undefined;
-  const trimmed = value.trim();
-  if (!trimmed) return undefined;
-  if (!trimmed.startsWith("slack:")) return trimmed;
-
-  const parts = trimmed.split(":");
-  return parts[1]?.trim() || undefined;
-}
-
 function isDmChannel(channelId: string): boolean {
-  return normalizeSlackConversationId(channelId)?.startsWith("D") ?? false;
-}
-
-function isSlackTeamId(value: string): boolean {
-  return /^T[A-Z0-9]+$/.test(value);
+  return channelId.startsWith("D");
 }
 
 function getConversationAccess(
-  destination: ScheduledTaskDestination,
+  destination: Destination,
 ): ScheduledTaskConversationAccess {
   if (isDmChannel(destination.channelId)) {
     return { audience: "direct", visibility: "private" };
@@ -128,8 +115,8 @@ function getConversationAccess(
 
 function getCredentialSubject(args: {
   access: ScheduledTaskConversationAccess;
-  subject: ScheduledTaskCredentialSubject | undefined;
-}): ScheduledTaskCredentialSubject | undefined {
+  subject: AgentPluginCredentialSubject | undefined;
+}): AgentPluginCredentialSubject | undefined {
   if (
     args.access.audience !== "direct" ||
     args.access.visibility !== "private"
@@ -139,21 +126,26 @@ function getCredentialSubject(args: {
   if (!args.subject) {
     return undefined;
   }
+  const subject = agentPluginCredentialSubjectSchema.safeParse(args.subject);
+  if (!subject.success) {
+    throwToolInputError("Active Slack credential subject is invalid.");
+  }
   return {
-    type: args.subject.type,
-    userId: args.subject.userId,
-    allowedWhen: args.subject.allowedWhen,
+    type: subject.data.type,
+    userId: subject.data.userId,
+    allowedWhen: subject.data.allowedWhen,
   };
 }
 
 function sameDestination(
   task: ScheduledTask,
-  destination: ScheduledTaskDestination,
+  destination: Destination,
 ): boolean {
+  const taskDestination = task.destination;
   return (
-    task.destination.platform === destination.platform &&
-    task.destination.teamId === destination.teamId &&
-    task.destination.channelId === destination.channelId
+    taskDestination.platform === "slack" &&
+    taskDestination.teamId === destination.teamId &&
+    taskDestination.channelId === destination.channelId
   );
 }
 

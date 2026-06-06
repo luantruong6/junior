@@ -1,4 +1,5 @@
 import { createHmac } from "node:crypto";
+import type { Destination } from "@sentry/junior-plugin-api";
 import {
   createWaitUntilCollector,
   type WaitUntilCollector,
@@ -10,6 +11,7 @@ export interface TurnResumeTestClientOptions {
 
 export interface TurnResumeTestRequest {
   conversationId: string;
+  destination: Destination;
   expectedVersion: number;
   sessionId: string;
 }
@@ -32,12 +34,10 @@ export class TurnResumeTestClient {
     });
   }
 
-  legacyRequest(payload: TurnResumeTestRequest): Request {
-    const body = JSON.stringify({
-      conversationId: payload.conversationId,
-      expectedCheckpointVersion: payload.expectedVersion,
-      sessionId: payload.sessionId,
-    });
+  requestWithoutDestination(
+    payload: Omit<TurnResumeTestRequest, "destination">,
+  ): Request {
+    const body = JSON.stringify(payload);
     const timestamp = Date.now().toString();
     return this.buildRequest({
       body,
@@ -47,6 +47,20 @@ export class TurnResumeTestClient {
   }
 
   request(payload: TurnResumeTestRequest): Request {
+    const body = JSON.stringify(payload);
+    const timestamp = Date.now().toString();
+    return this.buildRequest({
+      body,
+      signature: this.sign(body, timestamp),
+      timestamp,
+    });
+  }
+
+  requestWithLegacyCheckpointVersion(
+    payload: Omit<TurnResumeTestRequest, "expectedVersion"> & {
+      expectedCheckpointVersion: number;
+    },
+  ): Request {
     const body = JSON.stringify(payload);
     const timestamp = Date.now().toString();
     return this.buildRequest({

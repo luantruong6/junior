@@ -1,74 +1,124 @@
-import type { BoundDispatchOptions, DispatchOptions } from "./types";
+import {
+  dispatchOptionsSchema,
+  type DispatchOptions,
+} from "@sentry/junior-plugin-api";
+import type { BoundDispatchOptions } from "./types";
 import { verifySlackDirectCredentialSubject } from "@/chat/credentials/subject";
 import { isDmChannel } from "@/chat/slack/client";
-import { isSlackConversationId, isSlackTeamId } from "@/chat/slack/ids";
-import { isActorUserId } from "@/chat/services/requester-identity";
 
-const MAX_DISPATCH_INPUT_LENGTH = 32_000;
-const MAX_IDEMPOTENCY_KEY_LENGTH = 512;
-const MAX_METADATA_KEYS = 20;
-const MAX_METADATA_KEY_LENGTH = 128;
-const MAX_METADATA_VALUE_LENGTH = 512;
+function hasIssueAtPath(
+  issues: Array<{ code: string; path: PropertyKey[]; message: string }>,
+  path: PropertyKey[],
+): boolean {
+  return issues.some(
+    (issue) =>
+      issue.path.length === path.length &&
+      issue.path.every((value, index) => value === path[index]),
+  );
+}
+
+function hasIssueUnderPath(
+  issues: Array<{ code: string; path: PropertyKey[]; message: string }>,
+  path: PropertyKey[],
+): boolean {
+  return issues.some((issue) =>
+    path.every((value, index) => issue.path[index] === value),
+  );
+}
+
+function dispatchOptionsErrorMessage(
+  issues: Array<{ code: string; path: PropertyKey[]; message: string }>,
+): string {
+  if (hasIssueAtPath(issues, [])) {
+    const unknownKeys = issues.some(
+      (issue) => issue.code === "unrecognized_keys",
+    );
+    return unknownKeys
+      ? "Dispatch options must not include unknown fields"
+      : "Dispatch options are required";
+  }
+  if (
+    issues.some(
+      (issue) =>
+        issue.code === "unrecognized_keys" && issue.path[0] === "destination",
+    )
+  ) {
+    return "Dispatch destination must not include unknown fields";
+  }
+  if (
+    issues.some(
+      (issue) =>
+        issue.code === "unrecognized_keys" &&
+        issue.path[0] === "credentialSubject",
+    )
+  ) {
+    return "Dispatch credentialSubject binding is runtime-owned";
+  }
+  if (hasIssueAtPath(issues, ["destination"])) {
+    return "Dispatch destination platform must be slack";
+  }
+  if (hasIssueUnderPath(issues, ["destination", "teamId"])) {
+    return "Dispatch destination teamId must be a Slack team id";
+  }
+  if (hasIssueUnderPath(issues, ["destination", "channelId"])) {
+    return "Dispatch destination channelId must be a Slack channel id";
+  }
+  if (hasIssueUnderPath(issues, ["idempotencyKey"])) {
+    const tooLong = issues.some(
+      (issue) => issue.path[0] === "idempotencyKey" && issue.code === "too_big",
+    );
+    return tooLong
+      ? "Dispatch idempotencyKey exceeds the maximum length"
+      : "Dispatch idempotencyKey is required";
+  }
+  if (hasIssueUnderPath(issues, ["input"])) {
+    const tooLong = issues.some(
+      (issue) => issue.path[0] === "input" && issue.code === "too_big",
+    );
+    return tooLong
+      ? "Dispatch input exceeds the maximum length"
+      : "Dispatch input is required";
+  }
+  if (hasIssueUnderPath(issues, ["credentialSubject", "userId"])) {
+    return "Dispatch credentialSubject userId is required";
+  }
+  if (hasIssueUnderPath(issues, ["credentialSubject", "allowedWhen"])) {
+    return "Dispatch credentialSubject allowedWhen must be private-direct-conversation";
+  }
+  if (hasIssueUnderPath(issues, ["credentialSubject"])) {
+    return "Dispatch credentialSubject type must be user";
+  }
+  const metadataIssue = issues.find(
+    (issue) =>
+      issue.path[0] === "metadata" &&
+      (issue.message === "Dispatch metadata has too many keys" ||
+        issue.message === "Dispatch metadata key exceeds the maximum length" ||
+        issue.message === "Dispatch metadata value exceeds the maximum length"),
+  );
+  if (metadataIssue) {
+    return metadataIssue.message;
+  }
+  if (hasIssueUnderPath(issues, ["metadata"])) {
+    return "Dispatch metadata values must be strings";
+  }
+  return "Dispatch options are invalid";
+}
 
 /** Validate plugin-provided dispatch options before core persists them. */
-export function validateDispatchOptions(options: DispatchOptions): void {
-  if (!options.idempotencyKey.trim()) {
-    throw new Error("Dispatch idempotencyKey is required");
+export function validateDispatchOptions(
+  options: unknown,
+): asserts options is DispatchOptions {
+  const parsed = dispatchOptionsSchema.safeParse(options);
+  if (!parsed.success) {
+    throw new Error(dispatchOptionsErrorMessage(parsed.error.issues));
   }
-  if (options.idempotencyKey.length > MAX_IDEMPOTENCY_KEY_LENGTH) {
-    throw new Error("Dispatch idempotencyKey exceeds the maximum length");
-  }
-  if (options.destination.platform !== "slack") {
-    throw new Error("Dispatch destination platform must be slack");
-  }
-  if (!isSlackTeamId(options.destination.teamId)) {
-    throw new Error("Dispatch destination teamId must be a Slack team id");
-  }
-  if (!isSlackConversationId(options.destination.channelId)) {
-    throw new Error(
-      "Dispatch destination channelId must be a Slack channel id",
-    );
-  }
-  if (!options.input.trim()) {
-    throw new Error("Dispatch input is required");
-  }
-  if (options.input.length > MAX_DISPATCH_INPUT_LENGTH) {
-    throw new Error("Dispatch input exceeds the maximum length");
-  }
-  if (options.credentialSubject) {
-    if (options.credentialSubject.type !== "user") {
-      throw new Error("Dispatch credentialSubject type must be user");
-    }
-    if (!isActorUserId(options.credentialSubject.userId)) {
-      throw new Error("Dispatch credentialSubject userId is required");
-    }
-    if (
-      options.credentialSubject.allowedWhen !== "private-direct-conversation"
-    ) {
-      throw new Error(
-        "Dispatch credentialSubject allowedWhen must be private-direct-conversation",
-      );
-    }
-    if (!isDmChannel(options.destination.channelId)) {
+  const candidate = parsed.data;
+  const { credentialSubject, destination } = candidate;
+  if (credentialSubject !== undefined) {
+    if (!isDmChannel(destination.channelId)) {
       throw new Error(
         "Dispatch credentialSubject requires a private direct Slack destination",
       );
-    }
-  }
-  const metadata = options.metadata ?? {};
-  const entries = Object.entries(metadata);
-  if (entries.length > MAX_METADATA_KEYS) {
-    throw new Error("Dispatch metadata has too many keys");
-  }
-  for (const [key, value] of entries) {
-    if (!key.trim() || typeof value !== "string") {
-      throw new Error("Dispatch metadata values must be strings");
-    }
-    if (key.length > MAX_METADATA_KEY_LENGTH) {
-      throw new Error("Dispatch metadata key exceeds the maximum length");
-    }
-    if (value.length > MAX_METADATA_VALUE_LENGTH) {
-      throw new Error("Dispatch metadata value exceeds the maximum length");
     }
   }
 }

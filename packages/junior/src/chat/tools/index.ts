@@ -1,3 +1,4 @@
+import { resolveChannelCapabilities } from "@/chat/tools/channel-capabilities";
 import { createBashTool } from "@/chat/tools/sandbox/bash";
 import { createEditFileTool } from "@/chat/tools/sandbox/edit-file";
 import { createFindFilesTool } from "@/chat/tools/sandbox/find-files";
@@ -13,6 +14,7 @@ import { createReadFileTool } from "@/chat/tools/sandbox/read-file";
 import { createReportProgressTool } from "@/chat/tools/runtime/report-progress";
 import { createSlackChannelListMessagesTool } from "@/chat/tools/slack/channel-list-messages";
 import { createSlackChannelPostMessageTool } from "@/chat/tools/slack/channel-post-message";
+import { getSlackDeliveryChannelId } from "@/chat/tools/slack/context";
 import { createSlackMessageAddReactionTool } from "@/chat/tools/slack/message-add-reaction";
 import {
   createSlackCanvasCreateTool,
@@ -125,13 +127,15 @@ export function createTools(
     tools.callMcpTool = createCallMcpToolTool(context.mcpToolManager);
   }
 
-  const { channelCapabilities } = context;
+  const outputChannelId = getSlackDeliveryChannelId(context);
+  const outputCapabilities = resolveChannelCapabilities(outputChannelId);
+  const rawChannelCapabilities = resolveChannelCapabilities(context.channelId);
 
-  if (channelCapabilities.canCreateCanvas) {
+  if (outputCapabilities.canCreateCanvas) {
     tools.slackCanvasCreate = createSlackCanvasCreateTool(context, state);
   }
 
-  if (channelCapabilities.canPostToChannel) {
+  if (outputCapabilities.canPostToChannel) {
     tools.slackChannelPostMessage = createSlackChannelPostMessageTool(
       context,
       state,
@@ -140,7 +144,7 @@ export function createTools(
       createSlackChannelListMessagesTool(context);
   }
 
-  if (channelCapabilities.canAddReactions) {
+  if (rawChannelCapabilities.canAddReactions) {
     tools.slackMessageAddReaction = createSlackMessageAddReactionTool(
       context,
       state,

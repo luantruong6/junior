@@ -8,6 +8,7 @@
  */
 import type { Message, SentMessage, Thread } from "chat";
 import type { SlackAdapter } from "@chat-adapter/slack";
+import type { Destination } from "@sentry/junior-plugin-api";
 import { botConfig } from "@/chat/config";
 import { getSlackMessageTs } from "@/chat/slack/message";
 import {
@@ -36,7 +37,6 @@ import {
   getAssistantThreadContext,
   getChannelId,
   getMessageTs,
-  getTeamId,
   getThreadId,
   getThreadTs,
   getRunId,
@@ -266,6 +266,7 @@ export function createReplyToThread(deps: ReplyExecutorDeps) {
     message: Message,
     options: {
       beforeFirstResponsePost?: () => Promise<void>;
+      destination: Destination;
       explicitMention?: boolean;
       onInputCommitted?: () => Promise<void>;
       onToolInvocation?: (invocation: TurnToolInvocation) => void;
@@ -277,7 +278,7 @@ export function createReplyToThread(deps: ReplyExecutorDeps) {
         inject: (messages: QueuedTurnMessage[]) => Promise<void>,
       ) => Promise<QueuedTurnMessage[]>;
       shouldYield?: () => boolean;
-    } = {},
+    },
   ) {
     if (message.author.isMe) {
       return;
@@ -296,7 +297,8 @@ export function createReplyToThread(deps: ReplyExecutorDeps) {
     const threadTs = getThreadTs(threadId);
     const assistantThreadContext = getAssistantThreadContext(message);
     const messageTs = getMessageTs(message);
-    const teamId = getTeamId(message);
+    const destination = options.destination;
+    const teamId = destination.teamId;
     const runId = getRunId(thread, message);
     const conversationId = threadId ?? runId;
 
@@ -527,6 +529,7 @@ export function createReplyToThread(deps: ReplyExecutorDeps) {
             state: "running",
             surface: "slack",
             requester,
+            destination,
             traceId: getActiveTraceId(),
           }).catch((error) => {
             logException(
@@ -739,6 +742,7 @@ export function createReplyToThread(deps: ReplyExecutorDeps) {
               omittedImageAttachmentCount,
               userAttachments,
               slackConversation,
+              destination,
               surface: "slack",
               turnDeadlineAtMs: getTurnRequestDeadline()?.deadlineAtMs,
               correlation: {
@@ -926,6 +930,7 @@ export function createReplyToThread(deps: ReplyExecutorDeps) {
               state: "completed",
               conversationTitle: titleUpdateResult?.title,
               requester,
+              destination,
               traceId: getActiveTraceId(),
             });
           }
@@ -974,11 +979,13 @@ export function createReplyToThread(deps: ReplyExecutorDeps) {
             if (
               conversationIdForResume &&
               sessionIdForResume &&
-              typeof version === "number"
+              typeof version === "number" &&
+              destination
             ) {
               try {
                 await deps.services.scheduleTurnTimeoutResume({
                   conversationId: conversationIdForResume,
+                  destination,
                   sessionId: sessionIdForResume,
                   expectedVersion: version,
                 });
@@ -1087,6 +1094,7 @@ export function createReplyToThread(deps: ReplyExecutorDeps) {
                   startedAtMs: message.metadata.dateSent.getTime(),
                   state: "failed",
                   requester,
+                  destination,
                   traceId: getActiveTraceId(),
                 });
                 const sessionRecord = await getAgentTurnSessionRecord(

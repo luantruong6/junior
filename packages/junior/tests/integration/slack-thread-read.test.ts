@@ -13,11 +13,6 @@ function createContext(
 ): ToolRuntimeContext {
   return {
     channelId: "C_CURRENT",
-    channelCapabilities: {
-      canCreateCanvas: true,
-      canPostToChannel: true,
-      canAddReactions: true,
-    },
     sandbox: {} as any,
     ...overrides,
   };
@@ -178,6 +173,57 @@ describe("slackThreadRead", () => {
     // No extra API call for same-channel private reads
     expect(getCapturedSlackApiCalls("conversations.info")).toHaveLength(0);
     expect(getCapturedSlackApiCalls("conversations.replies")).toHaveLength(1);
+  });
+
+  it("reads a private group channel from assistant context during DM turns", async () => {
+    queueSlackApiResponse("conversations.replies", {
+      body: conversationsRepliesPage({
+        threadTs: "1700000000.100000",
+        messages: [
+          {
+            ts: "1700000000.100000",
+            thread_ts: "1700000000.100000",
+            user: "U1",
+            text: "private context root",
+          },
+        ],
+      }),
+    });
+
+    const tool = createSlackThreadReadTool(
+      createContext({
+        channelId: "D_DM",
+        deliveryChannelId: "G_PRIVATE",
+      }),
+    );
+    const result = await executeTool(tool, {
+      channel_id: "G_PRIVATE",
+      ts: "1700000000.100000",
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      channel_id: "G_PRIVATE",
+      count: 1,
+    });
+    expect(getCapturedSlackApiCalls("conversations.replies")).toHaveLength(1);
+  });
+
+  it("blocks reading a private group channel from a DM conversation without assistant context", async () => {
+    const tool = createSlackThreadReadTool(
+      createContext({ channelId: "D_DM" }),
+    );
+    const result = await executeTool(tool, {
+      channel_id: "G_PRIVATE",
+      ts: "1700000000.100000",
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      channel_id: "G_PRIVATE",
+    });
+    expect(result.error).toContain("private channel");
+    expect(getCapturedSlackApiCalls("conversations.replies")).toHaveLength(0);
   });
 
   it("blocks reading a private channel that is not the current channel", async () => {

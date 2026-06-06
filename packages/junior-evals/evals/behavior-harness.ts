@@ -4,6 +4,7 @@ import { generateKeyPairSync } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { fileURLToPath } from "node:url";
 import type { Message } from "chat";
+import type { Destination } from "@sentry/junior-plugin-api";
 import {
   interceptTestHttp,
   resetTestGitHubHttpFixtures,
@@ -19,11 +20,10 @@ import type { AssistantLifecycleEvent } from "@/chat/runtime/slack-runtime";
 import type { JuniorRuntimeServiceOverrides } from "@/chat/app/services";
 import { createUserTokenStore } from "@/chat/capabilities/factory";
 import type { EmittedLogRecord } from "@/chat/logging";
-import { determineThreadMessageKind } from "@/chat/ingress/message-router";
 import {
-  createThreadMessageDispatcher,
   type ThreadMessageKind,
-} from "@/chat/queue/thread-message-dispatcher";
+  determineThreadMessageKind,
+} from "@/chat/ingress/message-router";
 import {
   deleteMcpAuthSessionsForUserProvider,
   deleteMcpServerSessionId,
@@ -65,6 +65,7 @@ import {
   readCapturedSlackApiCalls,
   type CapturedSlackApiCall,
 } from "@junior-tests/msw/captured-slack-api-calls";
+import { createSlackDestination } from "@/chat/destination";
 import { ALL as sandboxEgressProxyALL } from "@/handlers/sandbox-egress-proxy";
 import { createMockImageGenerateDeps } from "./fixtures/image-generate";
 
@@ -392,6 +393,7 @@ const EVAL_PACKAGE_ROOT = path.resolve(
 type HarnessStateAdapter = ReturnType<typeof getStateAdapter>;
 
 const THREAD_STATE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const EVAL_SLACK_TEAM_ID = "TEVAL";
 
 function resolveEvalRelativePath(entry: string): string {
   return path.isAbsolute(entry)
@@ -418,6 +420,17 @@ function buildRuntimeThreadId(fixture: EvalEventThreadFixture): string {
     return `slack:${fixture.channel_id}:${fixture.thread_ts}`;
   }
   return fixture.id;
+}
+
+function createEvalDestination(thread: TestThread): Destination {
+  const destination = createSlackDestination({
+    teamId: EVAL_SLACK_TEAM_ID,
+    channelId: thread.channelId,
+  });
+  if (!destination) {
+    throw new Error("Eval Slack destination requires a Slack channel id");
+  }
+  return destination;
 }
 
 // ---------------------------------------------------------------------------
@@ -956,7 +969,7 @@ function toIncomingMessage(event: MentionEvent | SubscribedMessageEvent) {
     runId: event.thread.run_id,
     raw: {
       channel: event.thread.channel_id,
-      team_id: "TEVAL",
+      team_id: EVAL_SLACK_TEAM_ID,
       ts: messageTs,
       thread_ts: event.thread.thread_ts,
     },
@@ -1520,18 +1533,11 @@ async function processEvents(args: {
   scenario: EvalScenario;
   env: HarnessEnvironment;
   slackRuntime: ReturnType<typeof createSlackRuntime>;
-  dispatch: ReturnType<typeof createThreadMessageDispatcher>;
   getThreadRecord: (fixture: EvalEventThreadFixture) => EvalThreadRecord;
   readyQueueDeliveries: QueueDelivery[];
 }): Promise<void> {
-  const {
-    scenario,
-    env,
-    slackRuntime,
-    dispatch,
-    getThreadRecord,
-    readyQueueDeliveries,
-  } = args;
+  const { scenario, env, slackRuntime, getThreadRecord, readyQueueDeliveries } =
+    args;
 
   const consumedOauthStates = new Set<string>();
   const consumedMcpAuthSessions = new Set<string>();
@@ -1559,11 +1565,20 @@ async function processEvents(args: {
     if (!current) {
       return false;
     }
-    await dispatch({
-      kind: current.kind,
-      thread: current.thread,
-      message: current.message,
-    });
+    const destination = createEvalDestination(current.thread);
+    if (current.kind === "new_mention") {
+      await slackRuntime.handleNewMention(current.thread, current.message, {
+        destination,
+      });
+    } else {
+      await slackRuntime.handleSubscribedMessage(
+        current.thread,
+        current.message,
+        {
+          destination,
+        },
+      );
+    }
     return true;
   };
 
@@ -1587,7 +1602,7 @@ async function processEvents(args: {
   ): Promise<void> => {
     const lifecycleEvent: AssistantLifecycleEvent = {
       threadId: event.thread.id,
-      channelId: event.thread.channel_id ?? "C_EVAL",
+      channelId: event.thread.channel_id ?? "CEVAL",
       threadTs: event.thread.thread_ts ?? "0",
       userId: event.user_id ?? "U-eval",
     };
@@ -1740,13 +1755,11 @@ export async function runEvalScenario(
       getSlackAdapter: () => slackAdapter as any,
       services,
     });
-    const dispatch = createThreadMessageDispatcher({ runtime: slackRuntime });
 
     await processEvents({
       scenario,
       env,
       slackRuntime,
-      dispatch,
       getThreadRecord,
       readyQueueDeliveries,
     });

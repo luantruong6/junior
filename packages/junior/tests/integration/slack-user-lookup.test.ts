@@ -343,11 +343,6 @@ describe("slackUserLookup", () => {
         {},
         {
           channelId: "C_TEST",
-          channelCapabilities: {
-            canCreateCanvas: true,
-            canPostToChannel: true,
-            canAddReactions: true,
-          },
           sandbox: {} as any,
         },
       );
