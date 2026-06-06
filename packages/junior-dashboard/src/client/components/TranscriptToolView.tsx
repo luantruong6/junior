@@ -11,6 +11,7 @@ import { cn } from "../styles";
 import type { TranscriptPart } from "../types";
 import { ToolFrame } from "./ToolFrame";
 import { isPreviewableValue } from "./transcriptPreview";
+import { HighlightText } from "./transcriptSearch";
 
 /** Render a tool call/result pair in rich or raw transcript mode. */
 export function TranscriptToolView(props: {
@@ -58,7 +59,7 @@ export function TranscriptToolView(props: {
         raw
         signature={
           <strong className="min-w-0 break-words font-bold text-[#d6d6d6]">
-            {toolName}
+            <HighlightText text={toolName} />
           </strong>
         }
       >
@@ -83,7 +84,7 @@ export function TranscriptToolView(props: {
       signature={
         <>
           <strong className="min-w-0 break-words font-bold text-[#d6d6d6]">
-            {toolName}
+            <HighlightText text={toolName} />
           </strong>
           {isPreviewableValue(input) ? (
             <code className="min-w-0 break-words font-[inherit] text-[#b8b8b8] max-md:hidden">
