@@ -443,6 +443,23 @@ export type AgentPluginAuthorization = z.output<
   typeof agentPluginAuthorizationSchema
 >;
 
+/** Interrupt sandbox egress so Junior can start provider authorization. */
+export class EgressAuthRequired extends Error {
+  authorization?: AgentPluginAuthorization;
+
+  constructor(
+    message: string,
+    options?: {
+      authorization?: AgentPluginAuthorization;
+      cause?: unknown;
+    },
+  ) {
+    super(message, { cause: options?.cause });
+    this.name = "EgressAuthRequired";
+    this.authorization = options?.authorization;
+  }
+}
+
 /** Provider account identity resolved by a plugin OAuth hook. */
 export type AgentPluginProviderAccount = z.output<
   typeof agentPluginProviderAccountSchema
@@ -453,12 +470,28 @@ export type AgentPluginGrant = z.output<typeof agentPluginGrantSchema>;
 
 /** Request details available while selecting the grant for sandbox egress. */
 export interface AgentPluginEgressRequest {
+  /** Capped request body text when the host exposes it for provider-specific grant classification. */
+  bodyText?: string;
   method: string;
   url: string;
 }
 
 export interface EgressHookContext extends AgentPluginContext {
   request: AgentPluginEgressRequest;
+}
+
+export interface AgentPluginEgressResponse {
+  /** Snapshot of upstream response headers; mutations do not affect pass-through. */
+  headers: Headers;
+  readText(maxBytes: number): Promise<string | undefined>;
+  status: number;
+}
+
+export interface EgressResponseHookContext extends AgentPluginContext {
+  grant: AgentPluginGrant;
+  permissionDenied(message: string): void;
+  request: Omit<AgentPluginEgressRequest, "bodyText">;
+  response: AgentPluginEgressResponse;
 }
 
 /** Header mutations a plugin-issued credential lease may apply to owned domains. */
@@ -529,6 +562,7 @@ export interface AgentPluginHooks {
   issueCredential?(
     ctx: IssueCredentialHookContext,
   ): Promise<AgentPluginCredentialResult> | AgentPluginCredentialResult;
+  onEgressResponse?(ctx: EgressResponseHookContext): Promise<void> | void;
   resolveOAuthAccount?(
     ctx: ResolveOAuthAccountHookContext,
   ):

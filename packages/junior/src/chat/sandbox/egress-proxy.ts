@@ -1,5 +1,6 @@
 import { CredentialUnavailableError } from "@/chat/credentials/broker";
 import { logInfo, logWarn } from "@/chat/logging";
+import { onPluginEgressResponse } from "@/chat/plugins/credential-hooks";
 import {
   matchesSandboxEgressDomain,
   resolveSandboxEgressProviderForHost,
@@ -20,6 +21,7 @@ import {
   setSandboxEgressPermissionDeniedSignal,
   type SandboxEgressCredentialLease,
 } from "@/chat/sandbox/egress-session";
+import { EgressAuthRequired } from "@sentry/junior-plugin-api";
 import type { JWTPayload } from "jose";
 
 const OIDC_TOKEN_HEADER = "vercel-sandbox-oidc-token";
@@ -51,6 +53,8 @@ const DECODED_RESPONSE_HEADERS = new Set([
 ]);
 const UPSTREAM_TOKEN_REJECTION_STATUS = 401;
 const UPSTREAM_PERMISSION_REJECTION_STATUS = 403;
+const GRANT_SELECTION_BODY_TEXT_LIMIT_BYTES = 64 * 1024;
+const RESPONSE_BODY_TEXT_LIMIT_BYTES = 64 * 1024;
 
 /** Intercepts a credential-injected sandbox HTTP request before live forwarding. */
 export type SandboxEgressHttpInterceptor = (input: {
@@ -218,6 +222,13 @@ function permissionDeniedMessage(
   return `${provider} returned HTTP 403 after Junior injected the ${grant.name} grant. Junior forwarded the request; this is not a local runtime block.`;
 }
 
+function isEgressAuthRequired(error: unknown): error is EgressAuthRequired {
+  return (
+    error instanceof EgressAuthRequired ||
+    (error instanceof Error && error.name === "EgressAuthRequired")
+  );
+}
+
 function logSandboxEgressUpstreamRequest(input: {
   egressId: string;
   grantAccess?: "read" | "write";
@@ -363,6 +374,95 @@ async function requestBodyBytes(
     return undefined;
   }
   return await request.arrayBuffer();
+}
+
+function isGrantSelectionBodyVisible(input: {
+  provider: string;
+  upstreamUrl: URL;
+}): boolean {
+  return (
+    input.provider === "github" &&
+    input.upstreamUrl.hostname.toLowerCase() === "api.github.com" &&
+    input.upstreamUrl.pathname.toLowerCase().endsWith("/graphql")
+  );
+}
+
+function requestBodyText(body: ArrayBuffer | undefined): string | undefined {
+  if (
+    body === undefined ||
+    body.byteLength > GRANT_SELECTION_BODY_TEXT_LIMIT_BYTES
+  ) {
+    return undefined;
+  }
+  return new TextDecoder().decode(body);
+}
+
+function responseContentLength(upstream: Response): number | undefined {
+  const raw = upstream.headers.get("content-length");
+  if (!raw) {
+    return undefined;
+  }
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+async function responseTextWithinLimit(
+  upstream: Response,
+  maxBytes: number,
+): Promise<string | undefined> {
+  const limit = Math.min(
+    Math.max(0, Math.floor(maxBytes)),
+    RESPONSE_BODY_TEXT_LIMIT_BYTES,
+  );
+  if (limit <= 0) {
+    return undefined;
+  }
+  const contentLength = responseContentLength(upstream);
+  if (contentLength !== undefined && contentLength > limit) {
+    return undefined;
+  }
+  let clone: Response;
+  try {
+    clone = upstream.clone();
+  } catch {
+    return undefined;
+  }
+  const body = clone.body;
+  if (!body) {
+    return "";
+  }
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      if (!value) {
+        continue;
+      }
+      bytes += value.byteLength;
+      if (bytes > limit) {
+        await reader.cancel().catch(() => undefined);
+        return undefined;
+      }
+      chunks.push(value);
+    }
+  } catch {
+    await reader.cancel().catch(() => undefined);
+    return undefined;
+  } finally {
+    reader.releaseLock();
+  }
+  const combined = new Uint8Array(bytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(combined);
 }
 
 function requestHeaders(
@@ -530,7 +630,14 @@ export async function proxySandboxEgressRequest(
     );
   }
 
+  let body: ArrayBuffer | undefined;
+  let bodyRead = false;
+  if (isGrantSelectionBodyVisible({ provider, upstreamUrl })) {
+    body = await requestBodyBytes(request);
+    bodyRead = true;
+  }
   const grantSelection = await selectSandboxEgressGrant({
+    bodyText: requestBodyText(body),
     provider,
     method: request.method,
     upstreamUrl,
@@ -644,7 +751,9 @@ export async function proxySandboxEgressRequest(
 
   const fetchImpl = deps.fetch ?? fetch;
   const headers = requestHeaders(request, lease, upstreamUrl.hostname);
-  const body = await requestBodyBytes(request);
+  if (!bodyRead) {
+    body = await requestBodyBytes(request);
+  }
   const intercepted = await deps.interceptHttp?.({
     provider,
     request: new Request(upstreamUrl, {
@@ -664,6 +773,96 @@ export async function proxySandboxEgressRequest(
     ...(body !== undefined ? { body } : {}),
     redirect: "manual",
   });
+  try {
+    const effects = await onPluginEgressResponse({
+      provider,
+      grant: lease.grant,
+      method: request.method,
+      upstreamUrl,
+      response: {
+        headers: new Headers(upstream.headers),
+        readText: async (maxBytes) =>
+          await responseTextWithinLimit(upstream, maxBytes),
+        status: upstream.status,
+      },
+    });
+    if (effects.permissionDenied) {
+      await setSandboxEgressPermissionDeniedSignal(credentialContext, {
+        provider,
+        grant: lease.grant,
+        ...(lease.account ? { account: lease.account } : {}),
+        message: effects.permissionDenied.message,
+        source: "upstream",
+        status: upstream.status,
+        upstreamHost: upstreamUrl.hostname,
+        upstreamPath: displayedUpstreamPath(upstreamUrl),
+        ...(provider === "github" ? githubPermissionHeaders(upstream) : {}),
+      });
+      logWarn(
+        "sandbox_egress_upstream_permission_classified",
+        {},
+        {
+          ...egressAttributes({
+            egressId: activeEgressId,
+            grantAccess: lease.grant.access,
+            grantName: lease.grant.name,
+            grantReason: lease.grant.reason,
+            host: upstreamUrl.hostname,
+            method: request.method,
+            path: upstreamUrl.pathname,
+            provider,
+            status: upstream.status,
+          }),
+          ...routingAttributes(request, upstreamUrl),
+          ...upstreamPermissionAttributes(provider, upstream),
+        },
+        "Sandbox egress plugin classified upstream response as permission denied",
+      );
+    }
+  } catch (error) {
+    if (!isEgressAuthRequired(error)) {
+      throw error;
+    }
+    await clearSandboxEgressCredentialLease(
+      provider,
+      lease.grant.name,
+      credentialContext,
+    );
+    await setSandboxEgressAuthRequiredSignal(credentialContext, {
+      provider,
+      grant: lease.grant,
+      ...((error.authorization ?? lease.authorization)
+        ? { authorization: error.authorization ?? lease.authorization }
+        : {}),
+      message: error.message,
+    });
+    logWarn(
+      "sandbox_egress_upstream_auth_required_classified",
+      {},
+      {
+        ...egressAttributes({
+          egressId: activeEgressId,
+          grantAccess: lease.grant.access,
+          grantName: lease.grant.name,
+          grantReason: lease.grant.reason,
+          host: upstreamUrl.hostname,
+          method: request.method,
+          path: upstreamUrl.pathname,
+          provider,
+          status: upstream.status,
+        }),
+        ...routingAttributes(request, upstreamUrl),
+        ...upstreamPermissionAttributes(provider, upstream),
+      },
+      "Sandbox egress plugin classified upstream response as auth required",
+    );
+    await upstream.body?.cancel().catch(() => undefined);
+    return authRequiredResponse({
+      provider,
+      grant: lease.grant,
+      message: error.message,
+    });
+  }
   logSandboxEgressUpstreamRequest({
     egressId: activeEgressId,
     grantAccess: lease.grant.access,

@@ -13,6 +13,7 @@ const GITHUB_AUTH_TOKEN_ENV = "GITHUB_TOKEN";
 const GITHUB_AUTH_TOKEN_PLACEHOLDER = "ghp_host_managed_credential";
 const MAX_LEASE_MS = 60 * 60 * 1000;
 const REFRESH_BUFFER_MS = 5 * 60 * 1000;
+const GITHUB_GRAPHQL_RESPONSE_BODY_LIMIT_BYTES = 64 * 1024;
 const HTTP_READ_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 const USER_TOKEN_GRANTS = new Set(["user-read", "user-write"]);
 const CONTENTS_WRITE_REQUIREMENTS = [
@@ -701,18 +702,131 @@ function githubUserReadReason(method, upstreamUrl) {
     : undefined;
 }
 
-function githubGraphqlAccess(method, upstreamUrl) {
+function parseGitHubGraphqlOperation(bodyText) {
+  if (typeof bodyText !== "string" || bodyText.trim().length === 0) {
+    return undefined;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(bodyText);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return undefined;
+  }
+  const query = parsed.query;
+  if (typeof query !== "string") {
+    return undefined;
+  }
+  const operationName =
+    typeof parsed.operationName === "string"
+      ? parsed.operationName.trim()
+      : undefined;
+  const normalized = maskGraphqlStringLiterals(
+    query.replace(/^\s*#[^\n\r]*(?:\r?\n|$)/gm, ""),
+  ).trim();
+  if (operationName) {
+    const namedOperation = normalized.match(
+      new RegExp(
+        `\\b(query|mutation|subscription)\\s+${escapeRegExp(operationName)}\\b`,
+      ),
+    )?.[1];
+    return namedOperation ? graphqlOperationAccess(namedOperation) : undefined;
+  }
+  const operation = normalized.match(/\b(query|mutation|subscription)\b/)?.[1];
+  const operationAccess = graphqlOperationAccess(operation);
+  if (operationAccess) {
+    return operationAccess;
+  }
+  if (normalized.startsWith("{")) {
+    return "read";
+  }
+  return undefined;
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function graphqlOperationAccess(operation) {
+  if (operation === "mutation" || operation === "subscription") {
+    return "write";
+  }
+  if (operation === "query") {
+    return "read";
+  }
+  return undefined;
+}
+
+function maskGraphqlStringLiterals(query) {
+  return query.replace(/"""[\s\S]*?"""|"(?:\\.|[^"\\])*"/g, (match) =>
+    " ".repeat(match.length),
+  );
+}
+
+function githubGraphqlAccess(method, upstreamUrl, bodyText) {
   if (!isGitHubGraphqlUrl(upstreamUrl)) {
     return undefined;
   }
   if (HTTP_READ_METHODS.has(method)) {
     return "read";
   }
-  // GitHub GraphQL POST bodies can be read queries or write mutations. The
-  // egress hook intentionally does not read sandbox request bodies, so non-read
-  // methods require user-write attribution rather than risking an unattributed
-  // mutation through an installation-read token.
+  const operation = parseGitHubGraphqlOperation(bodyText);
+  if (operation) {
+    return operation;
+  }
+  // Unknown GraphQL POST bodies still require user-write attribution rather
+  // than risking an unattributed mutation through an installation-read token.
   return "write";
+}
+
+function githubGraphqlPermissionDeniedMessage(bodyText) {
+  let parsed;
+  try {
+    parsed = JSON.parse(bodyText);
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(parsed) || !Array.isArray(parsed.errors)) {
+    return undefined;
+  }
+  for (const error of parsed.errors) {
+    if (!isRecord(error) || typeof error.message !== "string") {
+      continue;
+    }
+    const message = error.message;
+    if (
+      error.type === "NOT_FOUND" &&
+      /\bCould not resolve to a Repository with the name\b/.test(message)
+    ) {
+      return `GitHub GraphQL could not access the repository: ${message}`;
+    }
+    if (/\bResource not accessible by integration\b/.test(message)) {
+      return `GitHub GraphQL denied access: ${message}`;
+    }
+  }
+  return undefined;
+}
+
+function shouldInspectGitHubGraphqlResponse(ctx) {
+  if (
+    ctx.request.method.toUpperCase() !== "POST" ||
+    ctx.response.status !== 200
+  ) {
+    return false;
+  }
+  let upstreamUrl;
+  try {
+    upstreamUrl = new URL(ctx.request.url);
+  } catch {
+    return false;
+  }
+  if (!isGitHubGraphqlUrl(upstreamUrl)) {
+    return false;
+  }
+  const contentType = ctx.response.headers.get("content-type");
+  return contentType ? /\bjson\b/i.test(contentType) : false;
 }
 
 function githubApiWriteReason(method, upstreamUrl) {
@@ -830,7 +944,11 @@ async function githubGrantForEgress(ctx) {
     return grantForAccess("write", writeReason, "user-write");
   }
 
-  const graphqlAccess = githubGraphqlAccess(method, upstreamUrl);
+  const graphqlAccess = githubGraphqlAccess(
+    method,
+    upstreamUrl,
+    ctx.request.bodyText,
+  );
   if (graphqlAccess) {
     return grantForAccess(
       graphqlAccess,
@@ -968,6 +1086,21 @@ export function githubPlugin(options = {}) {
       },
       grantForEgress(ctx) {
         return githubGrantForEgress(ctx);
+      },
+      async onEgressResponse(ctx) {
+        if (!shouldInspectGitHubGraphqlResponse(ctx)) {
+          return;
+        }
+        const bodyText = await ctx.response.readText(
+          GITHUB_GRAPHQL_RESPONSE_BODY_LIMIT_BYTES,
+        );
+        if (!bodyText) {
+          return;
+        }
+        const message = githubGraphqlPermissionDeniedMessage(bodyText);
+        if (message) {
+          ctx.permissionDenied(message);
+        }
       },
       async resolveOAuthAccount(ctx) {
         return await resolveUserAccount(ctx.tokens);
