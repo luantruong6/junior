@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Destination } from "@sentry/junior-plugin-api";
 import type { JuniorRuntimeServiceOverrides } from "@/chat/app/services";
+import type { ReplyRequestContext } from "@/chat/respond";
 import { makeAssistantStatus } from "@/chat/slack/assistant-thread/status";
 import { getSlackInterruptionMarker } from "@/chat/slack/output";
 import { RetryableTurnError } from "@/chat/runtime/turn";
@@ -1758,7 +1759,7 @@ describe("bot handlers (integration)", () => {
     expect(generatedTitleCall!.title).toBe("Today's Date");
   });
 
-  it("thread title: runs in parallel with reply delivery when generation is slow", async () => {
+  it("thread title: does not block reply delivery when generation is slow", async () => {
     const fakeAdapter = new FakeSlackAdapter();
     let resolveTitle: (() => void) | undefined;
     const { slackRuntime } = createRuntime({
@@ -1811,10 +1812,85 @@ describe("bot handlers (integration)", () => {
     await vi.waitFor(() => {
       expect(postIncludes(thread, "Today is April 16, 2026.")).toBe(true);
     });
-    expect(settled).toBe(false);
+    await vi.waitFor(() => {
+      expect(settled).toBe(true);
+    });
+    expect(
+      fakeAdapter.titleCalls.some((call) => call.title === "Today's Date"),
+    ).toBe(false);
 
     resolveTitle!();
     await turnPromise;
+    await vi.waitFor(() => {
+      expect(
+        fakeAdapter.titleCalls.some((call) => call.title === "Today's Date"),
+      ).toBe(true);
+    });
+  });
+
+  it("thread title: preserves artifact updates when title resolves before completion", async () => {
+    const fakeAdapter = new FakeSlackAdapter();
+    const { slackRuntime } = createRuntime({
+      slackAdapter: fakeAdapter,
+      services: {
+        conversationMemory: {
+          completeText: async () =>
+            ({
+              text: "Today's Date",
+              message: { role: "assistant", content: "" },
+            }) as any,
+        },
+        replyExecutor: {
+          generateAssistantReply: async (
+            _text: string,
+            context?: ReplyRequestContext,
+          ) => {
+            await vi.waitFor(() => {
+              expect(
+                fakeAdapter.titleCalls.some(
+                  (call) => call.title === "Today's Date",
+                ),
+              ).toBe(true);
+            });
+            await context?.onArtifactStateUpdated?.({
+              lastCanvasId: "F_CANVAS",
+            });
+            return {
+              text: "Today is April 16, 2026.",
+              diagnostics: {
+                assistantMessageCount: 1,
+                modelId: "test-model",
+                outcome: "success" as const,
+                toolCalls: [],
+                toolErrorCount: 0,
+                toolResultCount: 0,
+                usedPrimaryText: true,
+              },
+            };
+          },
+        },
+      },
+    });
+
+    const thread = createTestThread({ id: "slack:D_TITLE7:1700000000.000" });
+
+    await slackRuntime.handleNewMention(
+      thread,
+      createTestMessage({
+        id: "msg-title-7",
+        threadId: "slack:D_TITLE7:1700000000.000",
+        text: "what's today's date",
+        isMention: true,
+      }),
+      { destination: createTestDestination(thread) },
+    );
+
+    expect(thread.getState()).toMatchObject({
+      artifacts: {
+        assistantTitle: "Today's Date",
+        lastCanvasId: "F_CANVAS",
+      },
+    });
   });
 
   it("thread title: does not generate title on subsequent replies", async () => {

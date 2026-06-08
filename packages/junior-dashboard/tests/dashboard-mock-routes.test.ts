@@ -47,7 +47,7 @@ function reporting(): JuniorReporting {
             lastSeenAt: "2026-05-29T00:00:01.000Z",
             lastProgressAt: "2026-05-29T00:00:01.000Z",
             surface: "slack",
-            title: "Turn turn-1",
+            displayTitle: "Conversation",
             channel: "C1",
           },
         ],
@@ -82,6 +82,7 @@ function reporting(): JuniorReporting {
     async getConversation(conversationId: string) {
       return {
         conversationId,
+        displayTitle: "Conversation",
         generatedAt: "2026-05-29T00:00:00.000Z",
         turns: [
           {
@@ -93,7 +94,7 @@ function reporting(): JuniorReporting {
             lastSeenAt: "2026-05-29T00:00:01.000Z",
             lastProgressAt: "2026-05-29T00:00:01.000Z",
             surface: "slack",
-            title: "Turn turn-1",
+            displayTitle: "Conversation",
             channel: "C1",
             transcriptAvailable: true,
             transcript: [],
@@ -313,7 +314,7 @@ describe("dashboard mock conversation routes", () => {
           startedAt: "2026-05-01T00:00:00.000Z",
           status: "completed",
           surface: "slack",
-          title: "Old real turn",
+          displayTitle: "Old real turn",
         },
       ],
     });

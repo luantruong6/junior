@@ -218,13 +218,9 @@ function conversationTitle(
   detail: ConversationDetailFeed,
   conversation: Conversation | undefined,
 ): string {
-  if (conversation) return conversationDisplayTitle(conversation);
-  const firstTurn = detail.turns[0];
-  return (
-    firstTurn?.conversationTitle ??
-    readableConversationTitle(firstTurn?.title, firstTurn?.id) ??
-    "Conversation"
-  );
+  const title = detail.displayTitle.trim();
+  if (title) return title;
+  return conversation ? conversationDisplayTitle(conversation) : "Conversation";
 }
 
 function conversationRequester(
@@ -321,20 +317,6 @@ function addMetaLine(
 
 function headingText(value: string): string {
   return value.replace(/\s+/g, " ").trim() || "Untitled";
-}
-
-function readableConversationTitle(
-  title: string | undefined,
-  id: string | undefined,
-): string | undefined {
-  const normalized = title ? headingText(title) : "";
-  if (!normalized || normalized === id || normalized === `Turn ${id}`) {
-    return undefined;
-  }
-  if (/^Turn\s+\S+$/i.test(normalized)) {
-    return undefined;
-  }
-  return normalized;
 }
 
 function inlineCode(value: string): string {
