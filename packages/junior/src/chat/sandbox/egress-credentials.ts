@@ -36,22 +36,27 @@ export type SandboxEgressGrantSelection =
       source: "broker";
     };
 
-/** Signals that a plugin selected a grant but needs user authorization before issuing headers. */
-export class SandboxEgressCredentialNeededError extends Error {
+export type SandboxEgressCredentialErrorKind = "auth_required" | "unavailable";
+
+/** Signals that egress selected a grant but could not issue credential headers. */
+export class SandboxEgressCredentialError extends Error {
   readonly authorization?: AgentPluginAuthorization;
   readonly grant: AgentPluginGrant;
+  readonly kind: SandboxEgressCredentialErrorKind;
   readonly provider: string;
 
   constructor(input: {
     authorization?: AgentPluginAuthorization;
     grant: AgentPluginGrant;
+    kind: SandboxEgressCredentialErrorKind;
     message: string;
     provider: string;
   }) {
     super(input.message);
-    this.name = "SandboxEgressCredentialNeededError";
+    this.name = "SandboxEgressCredentialError";
     this.authorization = input.authorization;
     this.grant = input.grant;
+    this.kind = input.kind;
     this.provider = input.provider;
   }
 }
@@ -185,23 +190,48 @@ export async function sandboxEgressCredentialLease(
       userTokenStore: createUserTokenStore(),
     });
     if (pluginResult.type === "needed") {
-      throw new SandboxEgressCredentialNeededError({
+      throw new SandboxEgressCredentialError({
         provider,
         grant,
+        kind: "auth_required",
         authorization: pluginResult.authorization,
         message: pluginResult.message,
       });
     }
     if (pluginResult.type === "unavailable") {
-      throw new CredentialUnavailableError(provider, pluginResult.message);
+      throw new SandboxEgressCredentialError({
+        provider,
+        grant,
+        kind: "unavailable",
+        message: pluginResult.message,
+      });
     }
     lease = pluginResult.lease;
   } else {
-    lease = await issueProviderCredentialLease({
-      context: context.credentials,
-      provider,
-      reason: grant.reason ?? `sandbox-egress:${provider}:default`,
-    });
+    // Normalize broker credential-needed failures into the egress error shape.
+    // All CredentialUnavailableError throws in oauth-bearer-broker are user-actionable
+    // (missing token, scope gap, expired connection) and should trigger OAuth re-auth.
+    try {
+      lease = await issueProviderCredentialLease({
+        context: context.credentials,
+        provider,
+        reason: grant.reason ?? `sandbox-egress:${provider}:default`,
+      });
+    } catch (error) {
+      if (error instanceof CredentialUnavailableError) {
+        throw new SandboxEgressCredentialError({
+          provider,
+          grant,
+          kind: "auth_required",
+          authorization: authorizationForSandboxEgressGrant(
+            provider,
+            selection,
+          ),
+          message: error.message,
+        });
+      }
+      throw error;
+    }
   }
 
   const headerTransforms = lease.headerTransforms ?? [];

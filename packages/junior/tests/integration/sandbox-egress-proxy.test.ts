@@ -25,6 +25,7 @@ const REQUESTER_ID = "U123";
 const PROVIDER_HOST = "sandbox-egress.example.test";
 const MANAGED_PROVIDER_HOST = "managed-egress.example.test";
 const MANAGED_PROVIDER_SUBDOMAIN = "api.managed-egress.example.test";
+const OAUTH_BROKER_PROVIDER_HOST = "oauth-broker.example.test";
 const GITHUB_API_HOST = "api.github.com";
 
 type EgressPolicyModule = typeof import("@/chat/sandbox/egress-policy");
@@ -120,6 +121,7 @@ async function registerManagedEgressPlugin(input?: {
       defineJuniorPlugin({
         manifest: {
           name: "managed-egress",
+          displayName: "Managed Egress",
           description: "Managed egress integration fixture",
           capabilities: ["api"],
           domains: [MANAGED_PROVIDER_HOST, MANAGED_PROVIDER_SUBDOMAIN],
@@ -164,6 +166,40 @@ async function registerManagedEgressPlugin(input?: {
     sandbox: {
       egressTracePropagationDomains: input?.egressTracePropagationDomains,
     },
+    waitUntil(task) {
+      if (typeof task === "function") {
+        void task();
+      }
+    },
+  });
+}
+
+async function registerOAuthBrokerPlugin() {
+  const { createApp, defineJuniorPlugins } = await import("@/app");
+  await createApp({
+    plugins: defineJuniorPlugins([
+      defineJuniorPlugin({
+        manifest: {
+          name: "oauth-broker",
+          displayName: "Oauth Broker",
+          description: "OAuth broker integration fixture",
+          capabilities: ["api"],
+          credentials: {
+            type: "oauth-bearer",
+            domains: [OAUTH_BROKER_PROVIDER_HOST],
+            authTokenEnv: "OAUTH_BROKER_ACCESS_TOKEN",
+            authTokenPlaceholder: "host_managed_credential",
+          },
+          oauth: {
+            clientIdEnv: "OAUTH_BROKER_CLIENT_ID",
+            clientSecretEnv: "OAUTH_BROKER_CLIENT_SECRET",
+            authorizeEndpoint: "https://oauth-broker.example.test/authorize",
+            tokenEndpoint: "https://oauth-broker.example.test/token",
+            scope: "broker.read",
+          },
+        },
+      }),
+    ]),
     waitUntil(task) {
       if (typeof task === "function") {
         void task();
@@ -282,6 +318,84 @@ describe("sandbox egress proxy integration", () => {
     expect(response.status).toBe(200);
     await expect(response.text()).resolves.toBe("ok");
     expect(upstreamFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns auth-required via canonical egress credential error when broker has no user token", async () => {
+    // Broker-backed provider (sandbox-egress-test fixture) with no stored user OAuth token.
+    // Since the fixture has no `oauth` section, the broker throws CredentialUnavailableError
+    // for the missing-env-token case. This should be normalized to an egress credential error
+    // before reaching the proxy, and the proxy should return the canonical auth-required 401.
+    delete process.env.SANDBOX_EGRESS_TEST_TOKEN; // remove env token so broker has no credential
+
+    const credentialToken = modules.session.createSandboxEgressCredentialToken({
+      credentials: { actor: { type: "user", userId: REQUESTER_ID } },
+      egressId: EGRESS_ID,
+      ttlMs: 60_000,
+    });
+    const networkPolicy = modules.policy.buildSandboxEgressNetworkPolicy({
+      credentialToken,
+    });
+    const forwardURL = forwardUrlFor(networkPolicy, PROVIDER_HOST);
+
+    const response = await modules.proxy.proxySandboxEgressRequest(
+      proxiedRequest({ forwardURL }),
+      { verifyOidc: async () => ({ sandbox_id: EGRESS_ID }) },
+    );
+
+    expect(response.status).toBe(401);
+    const body = await response.text();
+    expect(body).toContain("junior-auth-required");
+    expect(body).toContain("provider=sandbox-egress-test");
+
+    // Auth signal should be recorded in state
+    const signal =
+      await modules.session.consumeSandboxEgressAuthRequiredSignal(EGRESS_ID);
+    expect(signal).toMatchObject({
+      provider: "sandbox-egress-test",
+      grant: expect.objectContaining({ access: "read" }),
+    });
+  });
+
+  it("records OAuth authorization metadata for broker credential gaps", async () => {
+    delete process.env.OAUTH_BROKER_ACCESS_TOKEN;
+    await registerOAuthBrokerPlugin();
+
+    const credentialToken = modules.session.createSandboxEgressCredentialToken({
+      credentials: { actor: { type: "user", userId: REQUESTER_ID } },
+      egressId: EGRESS_ID,
+      ttlMs: 60_000,
+    });
+    const networkPolicy = modules.policy.buildSandboxEgressNetworkPolicy({
+      credentialToken,
+    });
+    const forwardURL = forwardUrlFor(networkPolicy, OAUTH_BROKER_PROVIDER_HOST);
+
+    const response = await modules.proxy.proxySandboxEgressRequest(
+      proxiedRequest({
+        forwardURL,
+        upstreamHost: OAUTH_BROKER_PROVIDER_HOST,
+      }),
+      { verifyOidc: async () => ({ sandbox_id: EGRESS_ID }) },
+    );
+
+    expect(response.status).toBe(401);
+    await expect(response.text()).resolves.toContain(
+      "junior-auth-required provider=oauth-broker grant=default access=read",
+    );
+    await expect(
+      modules.session.consumeSandboxEgressAuthRequiredSignal(EGRESS_ID),
+    ).resolves.toMatchObject({
+      provider: "oauth-broker",
+      grant: {
+        name: "default",
+        access: "read",
+      },
+      authorization: {
+        type: "oauth",
+        provider: "oauth-broker",
+        scope: "broker.read",
+      },
+    });
   });
 
   it("propagates configured trace headers through real plugin egress wiring", async () => {
@@ -924,6 +1038,7 @@ describe("sandbox egress proxy integration", () => {
       modules.session.consumeSandboxEgressAuthRequiredSignal(EGRESS_ID),
     ).resolves.toMatchObject({
       provider: "github",
+      kind: "unavailable",
       grant: {
         name: "installation-read",
         access: "read",

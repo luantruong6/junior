@@ -3,6 +3,7 @@ import { PluginAuthorizationPauseError } from "@/chat/services/plugin-auth-orche
 import { AuthorizationFlowDisabledError } from "@/chat/services/auth-pause";
 import { SkillSandbox } from "@/chat/sandbox/skill-sandbox";
 import { createAgentTools } from "@/chat/tools/agent-tools";
+import { createBashTool } from "@/chat/tools/sandbox/bash";
 import type { Skill } from "@/chat/skills";
 
 const { handleToolExecutionError } = vi.hoisted(() => ({
@@ -257,13 +258,44 @@ describe("createAgentTools", () => {
     expect(editTool?.executionMode).toBe("sequential");
   });
 
+  it("marks sandbox bash as sequential", () => {
+    const sandbox = new SkillSandbox([], []);
+    const [bashTool] = createAgentTools(
+      {
+        bash: createBashTool(),
+      },
+      sandbox,
+      {},
+    );
+
+    expect(bashTool?.executionMode).toBe("sequential");
+  });
+
   it("rethrows plugin auth pauses without reporting a tool failure", async () => {
     const sandbox = new SkillSandbox([githubSkill], [githubSkill]);
     const pluginAuthOrchestration = {
-      handleCommandFailure: vi.fn(async () => {
-        throw new PluginAuthorizationPauseError("github", "link_sent");
+      maybeHandleAuthSignal: vi.fn(async () => {
+        throw new PluginAuthorizationPauseError(
+          "github",
+          "GitHub",
+          "link_sent",
+        );
       }),
     } as any;
+    const authRequired = {
+      provider: "github",
+      grant: {
+        name: "default",
+        access: "read",
+        reason: "sandbox-egress:github:read",
+      },
+      authorization: {
+        type: "oauth",
+        provider: "github",
+        scope: "repo",
+      },
+      createdAtMs: Date.now(),
+    };
     const sandboxExecutor = {
       canExecute: (toolName: string) => toolName === "bash",
       execute: vi.fn(async () => ({
@@ -278,6 +310,7 @@ describe("createAgentTools", () => {
           stderr: "bad credentials",
           stdout_truncated: false,
           stderr_truncated: false,
+          auth_required: authRequired,
         },
       })),
     } as any;
@@ -301,18 +334,19 @@ describe("createAgentTools", () => {
     await expect(
       bashTool!.execute("tool-2", { command: "gh issue view 123" }),
     ).rejects.toBeInstanceOf(PluginAuthorizationPauseError);
-    expect(pluginAuthOrchestration.handleCommandFailure).toHaveBeenCalledWith({
-      activeSkill: githubSkill,
-      command: "gh issue view 123",
-      details: expect.any(Object),
-    });
+    expect(pluginAuthOrchestration.maybeHandleAuthSignal).toHaveBeenCalledWith(
+      expect.objectContaining({
+        command: "gh issue view 123",
+        auth_required: authRequired,
+      }),
+    );
     expect(handleToolExecutionError).not.toHaveBeenCalled();
   });
 
   it("rethrows disabled authorization errors without reporting a tool failure", async () => {
     const sandbox = new SkillSandbox([githubSkill], [githubSkill]);
     const pluginAuthOrchestration = {
-      handleCommandFailure: vi.fn(async () => {
+      maybeHandleAuthSignal: vi.fn(async () => {
         throw new AuthorizationFlowDisabledError("plugin", "github");
       }),
     } as any;

@@ -1,4 +1,3 @@
-import { CredentialUnavailableError } from "@/chat/credentials/broker";
 import { logInfo, logWarn, withSpan } from "@/chat/logging";
 import { onPluginEgressResponse } from "@/chat/plugins/credential-hooks";
 import {
@@ -6,10 +5,9 @@ import {
   resolveSandboxEgressProviderForHost,
 } from "@/chat/sandbox/egress-policy";
 import {
-  authorizationForSandboxEgressGrant,
   hasSandboxEgressLeaseTransformForHost,
   sandboxEgressCredentialLease,
-  SandboxEgressCredentialNeededError,
+  SandboxEgressCredentialError,
   selectSandboxEgressGrant,
 } from "@/chat/sandbox/egress-credentials";
 import { verifyVercelSandboxOidcToken } from "@/chat/sandbox/egress-oidc";
@@ -741,15 +739,19 @@ async function proxySandboxEgressVerifiedRequest(input: {
       credentialContext,
     );
   } catch (error) {
-    if (error instanceof SandboxEgressCredentialNeededError) {
+    if (error instanceof SandboxEgressCredentialError) {
       await setSandboxEgressAuthRequiredSignal(credentialContext, {
         provider: error.provider,
         grant: error.grant,
+        kind: error.kind,
         ...(error.authorization ? { authorization: error.authorization } : {}),
         message: error.message,
       });
+      const isAuthRequired = error.kind === "auth_required";
       logWarn(
-        "sandbox_egress_credential_needed",
+        isAuthRequired
+          ? "sandbox_egress_credential_needed"
+          : "sandbox_egress_credential_unavailable",
         {},
         {
           ...egressAttributes({
@@ -765,48 +767,13 @@ async function proxySandboxEgressVerifiedRequest(input: {
           }),
           ...routingAttributes(request, upstreamUrl),
         },
-        "Sandbox egress grant needs user authorization before issuing a credential lease",
+        isAuthRequired
+          ? "Sandbox egress grant needs user authorization before issuing a credential lease"
+          : "Sandbox egress credential lease is unavailable for selected grant",
       );
       return authRequiredResponse({
         provider: error.provider,
         grant: error.grant,
-        message: error.message,
-      });
-    }
-    if (error instanceof CredentialUnavailableError) {
-      const failedGrant = grantSelection.grant;
-      const authorization = authorizationForSandboxEgressGrant(
-        error.provider,
-        grantSelection,
-      );
-      await setSandboxEgressAuthRequiredSignal(credentialContext, {
-        provider: error.provider,
-        grant: failedGrant,
-        ...(authorization ? { authorization } : {}),
-        message: error.message,
-      });
-      logWarn(
-        "sandbox_egress_credential_unavailable",
-        {},
-        {
-          ...egressAttributes({
-            egressId: activeEgressId,
-            grantAccess: failedGrant.access,
-            grantName: failedGrant.name,
-            grantReason: failedGrant.reason,
-            host: upstreamUrl.hostname,
-            method: request.method,
-            path: upstreamUrl.pathname,
-            provider,
-            status: 401,
-          }),
-          ...routingAttributes(request, upstreamUrl),
-        },
-        "Sandbox egress credential lease is unavailable for selected grant",
-      );
-      return authRequiredResponse({
-        provider: error.provider,
-        grant: failedGrant,
         message: error.message,
       });
     }
@@ -926,6 +893,7 @@ async function proxySandboxEgressVerifiedRequest(input: {
     await setSandboxEgressAuthRequiredSignal(credentialContext, {
       provider,
       grant: lease.grant,
+      kind: "auth_required",
       ...((error.authorization ?? lease.authorization)
         ? { authorization: error.authorization ?? lease.authorization }
         : {}),
@@ -1032,6 +1000,7 @@ async function proxySandboxEgressVerifiedRequest(input: {
       await setSandboxEgressAuthRequiredSignal(credentialContext, {
         provider,
         grant: lease.grant,
+        kind: "auth_required",
         ...(lease.authorization ? { authorization: lease.authorization } : {}),
         message: `Provider rejected the injected ${provider} credential.`,
       });
