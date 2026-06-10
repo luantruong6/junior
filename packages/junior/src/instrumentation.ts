@@ -1,4 +1,8 @@
 import * as Sentry from "@/chat/sentry";
+import {
+  getDeploymentServiceVersion,
+  getDeploymentTelemetryAttributes,
+} from "@/deployment";
 
 function getSampleRate(value: string | undefined, fallback: number): number {
   if (!value) return fallback;
@@ -22,6 +26,8 @@ export function initSentry(): void {
 
   const dsn = process.env.SENTRY_DSN;
   const enableLogs = getBoolean(process.env.SENTRY_ENABLE_LOGS, Boolean(dsn));
+  const serviceVersion = getDeploymentServiceVersion();
+  const deploymentSpanAttributes = getDeploymentTelemetryAttributes();
 
   Sentry.init({
     dsn,
@@ -29,13 +35,26 @@ export function initSentry(): void {
       process.env.SENTRY_ENVIRONMENT ??
       process.env.VERCEL_ENV ??
       process.env.NODE_ENV,
-    release: process.env.SENTRY_RELEASE ?? process.env.VERCEL_GIT_COMMIT_SHA,
+    release: serviceVersion,
     tracesSampleRate: getSampleRate(process.env.SENTRY_TRACES_SAMPLE_RATE, 1),
     sendDefaultPii: true,
     enabled: Boolean(dsn),
     enableLogs,
     registerEsmLoaderHooks: false,
     streamGenAiSpans: true,
+    // Keep deployment identity centralized so every emitted Sentry span carries it.
+    beforeSendSpan(span) {
+      if (Object.keys(deploymentSpanAttributes).length === 0) {
+        return span;
+      }
+
+      span.data = {
+        ...span.data,
+        ...deploymentSpanAttributes,
+      };
+
+      return span;
+    },
     integrations: [
       Sentry.vercelAIIntegration({
         recordInputs: true,

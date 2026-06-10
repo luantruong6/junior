@@ -17,6 +17,7 @@ import type {
 import { toOptionalNumber, toOptionalString } from "@/chat/coerce";
 import * as Sentry from "@/chat/sentry";
 import type { AgentTurnUsage } from "@/chat/usage";
+import { getDeploymentTelemetryAttributes } from "@/deployment";
 
 type Primitive = string | number | boolean;
 type AttributeValue = Primitive | string[];
@@ -129,6 +130,7 @@ function normalizeGenAiFinishReasons(value: unknown): unknown {
 
 const contextStorage = new AsyncLocalStorage<LogAttributes>();
 const logRecordSinks = new Set<(record: EmittedLogRecord) => void>();
+const deploymentLogAttributes = getDeploymentTelemetryAttributes();
 type ConsoleTextStyle = Parameters<typeof styleText>[0];
 const LOGTAPE_BODY_KEY = "__logtape_body";
 const ROOT_LOGGER_CATEGORY = ["junior"] as const;
@@ -1124,11 +1126,17 @@ function emitRecord(
   const contextAttributes = ownsLogTapeBackend
     ? undefined
     : contextStorage.getStore();
-  const attributes = mergeAttributes(contextAttributes, traceAttributes, {
-    "event.name": normalizedEventName,
-    ...(source ? { "app.log.source": source } : {}),
-    ...attrs,
-  });
+  const attributes = mergeAttributes(
+    contextAttributes,
+    traceAttributes,
+    {
+      "event.name": normalizedEventName,
+      ...(source ? { "app.log.source": source } : {}),
+      ...attrs,
+    },
+    // Deployment identity is process-owned and must win over event-local attrs.
+    deploymentLogAttributes,
+  );
 
   if (usesDirectEmissionFallback) {
     emitDirect(level, normalizedEventName, message, attributes);

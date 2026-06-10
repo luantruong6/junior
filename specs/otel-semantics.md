@@ -3,7 +3,7 @@
 ## Metadata
 
 - Created: 2026-02-25
-- Last Edited: 2026-05-30
+- Last Edited: 2026-06-09
 
 ## Purpose
 
@@ -33,6 +33,7 @@ This file is the canonical attribute and naming map for instrumentation in this 
 
 - `service.name`
 - `service.version`
+- `deployment.id`
 - `deployment.environment.name`
 - `trace_id`
 - `span_id`
