@@ -1,0 +1,230 @@
+/**
+ * Local chat CLI command.
+ *
+ * This module owns terminal argument parsing and output delivery for `junior
+ * chat`; the agent runtime stays behind the local runner, and invalid CLI input
+ * must fail before conversation state is created.
+ */
+import {
+  stdin as defaultStdin,
+  stderr as defaultStderr,
+  stdout as defaultStdout,
+} from "node:process";
+import { randomUUID } from "node:crypto";
+import * as readline from "node:readline/promises";
+import { normalizeLocalConversationId } from "@/chat/local/conversation";
+import type { LocalAgentReply } from "@/chat/local/runner";
+
+export const CHAT_USAGE = "usage: junior chat\n       junior chat -p <message>";
+
+export type ChatCommandOptions =
+  | { mode: "interactive" }
+  | { message: string; mode: "prompt" };
+
+export interface ChatIo {
+  error: (line: string) => Promise<void> | void;
+  input: NodeJS.ReadableStream;
+  output: NodeJS.WritableStream;
+  write: (text: string) => Promise<void> | void;
+}
+
+const DEFAULT_IO: ChatIo = {
+  error: (line) => writeStream(defaultStderr, `${line}\n`),
+  input: defaultStdin,
+  output: defaultStdout,
+  write: (text) => writeStream(defaultStdout, text),
+};
+
+class ChatOutputError extends Error {
+  constructor(error: unknown) {
+    super(errorMessage(error));
+    this.name = "ChatOutputError";
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** Deliver text-only local replies and turn unsupported files/output errors into failed delivery. */
+async function deliverReply(io: ChatIo, reply: LocalAgentReply): Promise<void> {
+  try {
+    const files = reply.files ?? [];
+    if (files.length > 0) {
+      const names = files
+        .map((file) =>
+          typeof file.filename === "string" && file.filename.trim()
+            ? file.filename
+            : "generated file",
+        )
+        .join(", ");
+      throw new Error(`Local chat cannot deliver files yet: ${names}`);
+    }
+    await io.write(formatReply(reply));
+  } catch (error) {
+    throw new ChatOutputError(error);
+  }
+}
+
+async function reportStatus(io: ChatIo, status: string): Promise<void> {
+  try {
+    await io.error(status);
+  } catch (error) {
+    throw new ChatOutputError(error);
+  }
+}
+
+function writeStream(
+  stream: NodeJS.WritableStream,
+  text: string,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    stream.write(text, (error?: Error | null) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+/** Keep local chat ephemeral by default; Redis is opt-in via an explicit adapter. */
+function defaultStateAdapterForLocalChat(): void {
+  if (process.env.JUNIOR_STATE_ADAPTER) {
+    return;
+  }
+  process.env.JUNIOR_STATE_ADAPTER = "memory";
+}
+
+function parseChatArgs(argv: string[]): ChatCommandOptions | undefined {
+  if (argv.length === 0) {
+    return { mode: "interactive" };
+  }
+
+  if (argv[0] !== "-p") {
+    return undefined;
+  }
+
+  const message = argv.slice(1).join(" ").trim();
+  if (!message) {
+    return undefined;
+  }
+
+  return { message, mode: "prompt" };
+}
+
+function formatReply(reply: LocalAgentReply): string {
+  const lines: string[] = [];
+  const text = reply.text.trim();
+  if (text) {
+    lines.push(text);
+  }
+
+  return `${lines.join("\n") || "[empty response]"}\n`;
+}
+
+/** Create a fresh local conversation id for one CLI process invocation. */
+function newRunConversationId(): string {
+  const conversationId = normalizeLocalConversationId({
+    alias: `run-${randomUUID()}`,
+  });
+  if (!conversationId) {
+    throw new Error("Invalid local conversation name");
+  }
+  return conversationId;
+}
+
+async function runPrompt(
+  options: Extract<ChatCommandOptions, { mode: "prompt" }>,
+  io: ChatIo,
+): Promise<number> {
+  defaultStateAdapterForLocalChat();
+  const conversationId = newRunConversationId();
+
+  const { runLocalAgentTurn } = await import("@/chat/local/runner");
+  const result = await runLocalAgentTurn(
+    {
+      conversationId,
+      message: options.message,
+    },
+    {
+      deliverReply: async (reply) => {
+        await deliverReply(io, reply);
+      },
+      onStatus: async (status) => {
+        await reportStatus(io, status);
+      },
+    },
+  );
+  return result.outcome === "success" ? 0 : 1;
+}
+
+async function runInteractive(io: ChatIo): Promise<void> {
+  defaultStateAdapterForLocalChat();
+  const conversationId = newRunConversationId();
+
+  const { runLocalAgentTurn } = await import("@/chat/local/runner");
+  const rl = readline.createInterface({
+    input: io.input,
+    output: io.output,
+    terminal: true,
+  });
+  try {
+    while (true) {
+      const message = (await rl.question("junior> ")).trim();
+      if (!message) {
+        continue;
+      }
+      if (message === "/exit" || message === "/quit") {
+        break;
+      }
+      try {
+        await runLocalAgentTurn(
+          {
+            conversationId,
+            message,
+          },
+          {
+            deliverReply: async (reply) => {
+              await deliverReply(io, reply);
+            },
+            onStatus: async (status) => {
+              await reportStatus(io, status);
+            },
+          },
+        );
+      } catch (error) {
+        if (error instanceof ChatOutputError) {
+          throw error;
+        }
+        await reportStatus(io, errorMessage(error));
+      }
+    }
+  } finally {
+    rl.close();
+  }
+}
+
+/** Run the local Junior chat command. */
+export async function runChat(
+  argv: string[],
+  io: ChatIo = DEFAULT_IO,
+): Promise<number> {
+  const options = parseChatArgs(argv);
+  if (!options) {
+    await io.error(CHAT_USAGE);
+    return 1;
+  }
+
+  try {
+    if (options.mode === "prompt") {
+      return await runPrompt(options, io);
+    }
+    await runInteractive(io);
+    return 0;
+  } catch (error) {
+    await io.error(errorMessage(error));
+    return 1;
+  }
+}

@@ -1,8 +1,41 @@
 import type { ToolRuntimeContext } from "@/chat/tools/types";
+import type { SlackDestination } from "@sentry/junior-plugin-api";
+import type { SlackSource } from "@sentry/junior-plugin-api";
+import type { SlackRequester } from "@/chat/requester";
 
-/** Resolve the Slack channel used by first-class delivery tools. */
-export function getSlackDeliveryChannelId(
+export interface SlackToolContext {
+  destination?: SlackDestination;
+  source: SlackSource;
+  requester?: SlackRequester;
+  destinationChannelId?: string;
+  messageTs?: string;
+  sourceChannelId: string;
+  teamId: string;
+  threadTs?: string;
+}
+
+/** Resolve Slack-specific tool context from the active source/destination/requester. */
+export function getSlackToolContext(
   context: ToolRuntimeContext,
-): string | undefined {
-  return context.deliveryChannelId ?? context.channelId;
+): SlackToolContext | undefined {
+  if (context.source.platform !== "slack") {
+    return undefined;
+  }
+  return {
+    destination:
+      context.destination?.platform === "slack"
+        ? context.destination
+        : undefined,
+    source: context.source,
+    requester:
+      context.requester?.platform === "slack" ? context.requester : undefined,
+    destinationChannelId:
+      context.destination?.platform === "slack"
+        ? context.destination.channelId
+        : undefined,
+    messageTs: context.source.messageTs,
+    sourceChannelId: context.source.channelId,
+    teamId: context.source.teamId,
+    threadTs: context.source.threadTs,
+  };
 }

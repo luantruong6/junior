@@ -1,12 +1,13 @@
 import { Type } from "@sinclair/typebox";
 import { postSlackMessage } from "@/chat/slack/outbound";
 import { tool } from "@/chat/tools/definition";
+import { ToolInputError } from "@/chat/tools/execution/tool-input-error";
 import { createOperationKey } from "@/chat/tools/idempotency";
-import { getSlackDeliveryChannelId } from "@/chat/tools/slack/context";
-import type { ToolRuntimeContext, ToolState } from "@/chat/tools/types";
+import type { SlackToolContext } from "@/chat/tools/slack/context";
+import type { ToolState } from "@/chat/tools/types";
 
 export function createSlackChannelPostMessageTool(
-  context: ToolRuntimeContext,
+  context: SlackToolContext,
   state: ToolState,
 ) {
   return tool({
@@ -20,12 +21,9 @@ export function createSlackChannelPostMessageTool(
       }),
     }),
     execute: async ({ text }) => {
-      const targetChannelId = getSlackDeliveryChannelId(context);
+      const targetChannelId = context.destinationChannelId;
       if (!targetChannelId) {
-        return {
-          ok: false,
-          error: "No active channel context is available for posting",
-        };
+        throw new ToolInputError("No active Slack destination is available.");
       }
 
       const operationKey = createOperationKey("slackChannelPostMessage", {

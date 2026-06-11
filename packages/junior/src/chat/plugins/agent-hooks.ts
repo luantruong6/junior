@@ -8,12 +8,14 @@ import type {
   PluginOperationalTone,
   SlackConversationLink,
   JuniorPluginRegistration,
+  SlackToolRegistrationHookContext,
 } from "@sentry/junior-plugin-api";
 import { logInfo } from "@/chat/logging";
 import { createAgentPluginLogger } from "@/chat/plugins/logging";
 import { createPluginState } from "@/chat/plugins/state";
 import { SANDBOX_WORKSPACE_ROOT } from "@/chat/sandbox/paths";
 import type { ToolDefinition } from "@/chat/tools/definition";
+import { getSlackToolContext } from "@/chat/tools/slack/context";
 import type { ToolRuntimeContext } from "@/chat/tools/types";
 import type {
   SandboxCommandInput,
@@ -148,32 +150,60 @@ export function getAgentPluginTools(
       continue;
     }
     const log = createAgentPluginLogger(plugin.name);
-    // Plugins receive the raw Slack conversation channel. The dispatch
-    // destination is the provider-neutral address for autonomous work.
     const destination = context.destination;
-    const credentialSubject = createSlackDirectCredentialSubject({
-      channelId: context.channelId,
-      teamId: context.teamId,
-      userId: context.requester?.userId,
-    });
-    const pluginCapabilities = resolveChannelCapabilities(context.channelId);
-    const pluginTools = hook({
-      plugin: { name: plugin.name },
-      log,
-      requester: context.requester,
-      channelCapabilities: pluginCapabilities,
-      channelId: context.channelId,
-      conversationId: context.conversationId,
-      ...(credentialSubject ? { credentialSubject } : {}),
-      ...(destination ? { destination } : {}),
-      teamId: context.teamId,
-      messageTs: context.messageTs,
-      threadTs: context.threadTs,
-      userText: context.userText,
-      state: createPluginState(plugin.name, {
-        legacyStatePrefixes: plugin.legacyStatePrefixes,
-      }),
-    });
+    const slackToolContext = getSlackToolContext(context);
+    const credentialSubject = slackToolContext
+      ? createSlackDirectCredentialSubject({
+          channelId: slackToolContext.sourceChannelId,
+          teamId: slackToolContext.teamId,
+          userId: slackToolContext.requester?.userId,
+        })
+      : undefined;
+    const slackContext: SlackToolRegistrationHookContext | undefined =
+      slackToolContext
+        ? {
+            channelCapabilities: resolveChannelCapabilities(
+              slackToolContext.sourceChannelId,
+            ),
+            ...(credentialSubject ? { credentialSubject } : {}),
+          }
+        : undefined;
+    const pluginContext =
+      context.source.platform === "slack"
+        ? {
+            plugin: { name: plugin.name },
+            log,
+            requester:
+              context.requester?.platform === "slack"
+                ? context.requester
+                : undefined,
+            conversationId: context.conversationId,
+            destination:
+              destination?.platform === "slack" ? destination : undefined,
+            slack: slackContext!,
+            source: context.source,
+            userText: context.userText,
+            state: createPluginState(plugin.name, {
+              legacyStatePrefixes: plugin.legacyStatePrefixes,
+            }),
+          }
+        : {
+            plugin: { name: plugin.name },
+            log,
+            requester:
+              context.requester?.platform === "local"
+                ? context.requester
+                : undefined,
+            conversationId: context.conversationId,
+            destination:
+              destination?.platform === "local" ? destination : undefined,
+            source: context.source,
+            userText: context.userText,
+            state: createPluginState(plugin.name, {
+              legacyStatePrefixes: plugin.legacyStatePrefixes,
+            }),
+          };
+    const pluginTools = hook(pluginContext);
     for (const [name, tool] of Object.entries(pluginTools)) {
       if (!AGENT_PLUGIN_TOOL_NAME_RE.test(name)) {
         throw new Error(

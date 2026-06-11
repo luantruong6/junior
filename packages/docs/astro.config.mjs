@@ -138,6 +138,7 @@ export default defineConfig({
           label: "CLI",
           items: [
             { label: "junior init", link: "/cli/init/" },
+            { label: "junior chat", link: "/cli/chat/" },
             { label: "junior check", link: "/cli/check/" },
             {
               label: "junior snapshot create",
@@ -169,6 +170,10 @@ export default defineConfig({
           items: [
             { label: "Development", link: "/contribute/development/" },
             { label: "Testing", link: "/contribute/testing/" },
+            {
+              label: "Local Agent Validation",
+              link: "/contribute/local-agent-validation/",
+            },
             {
               label: "Documentation Guidelines",
               link: "/contribute/documentation-guidelines/",

@@ -27,6 +27,7 @@ Co-Authored-By: (agent model name) <email>
 - Use `/skill-writer` skill when creating or updating skills.
 - Prefer integration tests for most product/runtime changes that need real wiring.
 - Use evals as the integration-style layer for agent/prompt/natural-language behavior. See `packages/junior-evals/README.md`.
+- For any non-Slack-specific product/runtime/prompt/tool/plugin behavior change, use the local agent as the first manual behavior check. Follow `packages/docs/src/content/docs/contribute/local-agent-validation.md`; from this monorepo, run it with `pnpm cli -- chat ...`, which uses `apps/example` as the canonical local validation app.
 - Run evals from Codex as escalated host commands when they need real Vercel Sandbox/network access; use `pnpm evals` for the full suite.
 - If evals fail from missing or expired Gateway/Vercel credentials, run `pnpm dev:env` to refresh secrets before retrying.
 - Use instrumentation conventions from `specs/instrumentation.md`.
@@ -114,6 +115,7 @@ Co-Authored-By: (agent model name) <email>
 - `specs/data-redaction-policy.md` (conversation privacy classification and raw payload redaction policy)
 - `specs/chat-architecture.md` (chat composition, service, and test-seam architecture contract)
 - `specs/task-execution.md` (durable conversation mailbox, queue wake-up, lease, and heartbeat execution contract)
+- `specs/local-agent.md` (local CLI/local adapter user flows, identity, state, and delivery contract)
 - `specs/agent-turn-handling.md` (agent user-message response policy: reply/silence, tool use, Slack side effects, resumed runs, and completion)
 - `specs/slack-agent-delivery.md` (Slack entry surfaces, reply delivery, continuation, files, images, and resume behavior contract)
 - `specs/slack-outbound-contract.md` (Slack outbound boundary, message/file/reaction safety rules, and markdown-to-`mrkdwn` ownership)

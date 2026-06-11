@@ -14,7 +14,7 @@ import { createReadFileTool } from "@/chat/tools/sandbox/read-file";
 import { createReportProgressTool } from "@/chat/tools/runtime/report-progress";
 import { createSlackChannelListMessagesTool } from "@/chat/tools/slack/channel-list-messages";
 import { createSlackChannelPostMessageTool } from "@/chat/tools/slack/channel-post-message";
-import { getSlackDeliveryChannelId } from "@/chat/tools/slack/context";
+import { getSlackToolContext } from "@/chat/tools/slack/context";
 import { createSlackMessageAddReactionTool } from "@/chat/tools/slack/message-add-reaction";
 import {
   createSlackCanvasCreateTool,
@@ -107,15 +107,6 @@ export function createTools(
       hooks,
       hooks.toolOverrides?.imageGenerate,
     ),
-    slackCanvasRead: createSlackCanvasReadTool(),
-    slackCanvasEdit: createSlackCanvasEditTool(state),
-    slackCanvasWrite: createSlackCanvasWriteTool(state),
-    slackThreadRead: createSlackThreadReadTool(context),
-    slackUserLookup: createSlackUserLookupTool(),
-    slackListCreate: createSlackListCreateTool(state),
-    slackListAddItems: createSlackListAddItemsTool(state),
-    slackListGetItems: createSlackListGetItemsTool(state),
-    slackListUpdateItem: createSlackListUpdateItemTool(state),
   };
 
   if (context.advisor) {
@@ -127,28 +118,48 @@ export function createTools(
     tools.callMcpTool = createCallMcpToolTool(context.mcpToolManager);
   }
 
-  const outputChannelId = getSlackDeliveryChannelId(context);
-  const outputCapabilities = resolveChannelCapabilities(outputChannelId);
-  const rawChannelCapabilities = resolveChannelCapabilities(context.channelId);
+  const slackContext = getSlackToolContext(context);
+  if (slackContext) {
+    tools.slackCanvasRead = createSlackCanvasReadTool();
+    tools.slackCanvasEdit = createSlackCanvasEditTool(state);
+    tools.slackCanvasWrite = createSlackCanvasWriteTool(state);
+    tools.slackThreadRead = createSlackThreadReadTool(slackContext);
+    tools.slackUserLookup = createSlackUserLookupTool();
+    tools.slackListCreate = createSlackListCreateTool(state);
+    tools.slackListAddItems = createSlackListAddItemsTool(state);
+    tools.slackListGetItems = createSlackListGetItemsTool(state);
+    tools.slackListUpdateItem = createSlackListUpdateItemTool(state);
 
-  if (outputCapabilities.canCreateCanvas) {
-    tools.slackCanvasCreate = createSlackCanvasCreateTool(context, state);
-  }
-
-  if (outputCapabilities.canPostToChannel) {
-    tools.slackChannelPostMessage = createSlackChannelPostMessageTool(
-      context,
-      state,
+    const outputChannelId = slackContext.destinationChannelId;
+    const outputCapabilities = outputChannelId
+      ? resolveChannelCapabilities(outputChannelId)
+      : undefined;
+    const rawChannelCapabilities = resolveChannelCapabilities(
+      slackContext.sourceChannelId,
     );
-    tools.slackChannelListMessages =
-      createSlackChannelListMessagesTool(context);
-  }
 
-  if (rawChannelCapabilities.canAddReactions) {
-    tools.slackMessageAddReaction = createSlackMessageAddReactionTool(
-      context,
-      state,
-    );
+    if (outputCapabilities?.canCreateCanvas) {
+      tools.slackCanvasCreate = createSlackCanvasCreateTool(
+        slackContext,
+        state,
+      );
+    }
+
+    if (outputCapabilities?.canPostToChannel) {
+      tools.slackChannelPostMessage = createSlackChannelPostMessageTool(
+        slackContext,
+        state,
+      );
+      tools.slackChannelListMessages =
+        createSlackChannelListMessagesTool(slackContext);
+    }
+
+    if (rawChannelCapabilities.canAddReactions) {
+      tools.slackMessageAddReaction = createSlackMessageAddReactionTool(
+        slackContext,
+        state,
+      );
+    }
   }
 
   for (const [name, pluginTool] of Object.entries(

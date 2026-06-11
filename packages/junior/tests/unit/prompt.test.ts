@@ -3,10 +3,33 @@ import { buildSystemPrompt, buildTurnContextPrompt } from "@/chat/prompt";
 
 describe("prompt builders", () => {
   it("returns a byte-stable static system prompt", () => {
-    const systemPrompt = buildSystemPrompt();
+    const source = {
+      platform: "slack" as const,
+      teamId: "T123",
+      channelId: "C123",
+    };
+    const systemPrompt = buildSystemPrompt({ source });
 
-    expect(buildSystemPrompt.length).toBe(0);
-    expect(buildSystemPrompt()).toBe(systemPrompt);
+    expect(buildSystemPrompt({ source })).toBe(systemPrompt);
+  });
+
+  it("returns a byte-stable local system prompt variant", () => {
+    const source = {
+      platform: "local" as const,
+      conversationId: "local:test:run-test",
+    };
+    const systemPrompt = buildSystemPrompt({ source });
+
+    expect(buildSystemPrompt({ source })).toBe(systemPrompt);
+    expect(systemPrompt).not.toBe(
+      buildSystemPrompt({
+        source: {
+          platform: "slack",
+          teamId: "T123",
+          channelId: "C123",
+        },
+      }),
+    );
   });
 
   it("omits empty runtime context sections", () => {

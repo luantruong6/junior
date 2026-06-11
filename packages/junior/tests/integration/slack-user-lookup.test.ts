@@ -342,7 +342,16 @@ describe("slackUserLookup", () => {
         [],
         {},
         {
-          channelId: "C_TEST",
+          source: {
+            platform: "slack",
+            teamId: "T_TEST",
+            channelId: "C_TEST",
+          },
+          destination: {
+            platform: "slack",
+            teamId: "T_TEST",
+            channelId: "C_TEST",
+          },
           sandbox: {} as any,
         },
       );

@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import { createSlackChannelListMessagesTool } from "@/chat/tools/slack/channel-list-messages";
 import { createSlackChannelPostMessageTool } from "@/chat/tools/slack/channel-post-message";
 import { createSlackMessageAddReactionTool } from "@/chat/tools/slack/message-add-reaction";
-import type { ToolRuntimeContext, ToolState } from "@/chat/tools/types";
+import type { SlackToolContext } from "@/chat/tools/slack/context";
+import type { ToolState } from "@/chat/tools/types";
 import {
   chatGetPermalinkOk,
   chatPostMessageOk,
@@ -34,14 +35,28 @@ function createToolState(): ToolState {
 }
 
 function createContext(
-  userText: string,
-  overrides: Partial<ToolRuntimeContext> = {},
-): ToolRuntimeContext {
+  _userText: string,
+  overrides: Partial<SlackToolContext> = {},
+): SlackToolContext {
+  const sourceChannelId = overrides.sourceChannelId ?? "C123";
+  const destinationChannelId =
+    overrides.destinationChannelId ?? sourceChannelId;
   return {
-    channelId: "C123",
+    destination: {
+      platform: "slack",
+      teamId: "T123",
+      channelId: destinationChannelId,
+    },
+    source: {
+      platform: "slack",
+      teamId: "T123",
+      channelId: sourceChannelId,
+      messageTs: "1700000000.321",
+    },
+    destinationChannelId,
     messageTs: "1700000000.321",
-    userText,
-    sandbox: {} as any,
+    sourceChannelId,
+    teamId: "T123",
     ...overrides,
   };
 }
@@ -84,8 +99,8 @@ describe("slack channel tools", () => {
 
   it("uses assistant context channel for channel delivery tools in DM turns", async () => {
     const context = createContext("share this in the current channel", {
-      channelId: "D123",
-      deliveryChannelId: "C_SHARED",
+      sourceChannelId: "D123",
+      destinationChannelId: "C_SHARED",
     });
     queueSlackApiResponse("chat.postMessage", {
       body: chatPostMessageOk({

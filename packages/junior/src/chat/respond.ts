@@ -8,7 +8,7 @@
  * should stay outside this file.
  */
 import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
-import type { Destination } from "@sentry/junior-plugin-api";
+import type { Destination, Source } from "@sentry/junior-plugin-api";
 import { THREAD_STATE_TTL_MS, type FileUpload } from "chat";
 import { botConfig } from "@/chat/config";
 import {
@@ -57,6 +57,7 @@ import type { ToolDefinition } from "@/chat/tools/definition";
 import { toActiveMcpCatalogSummaries } from "@/chat/tools/skill/mcp-tool-summary";
 import type {
   ImageGenerateToolDeps,
+  ToolRuntimeContext,
   WebFetchToolDeps,
   WebSearchToolDeps,
 } from "@/chat/tools/types";
@@ -198,7 +199,7 @@ export interface ReplyRequestContext {
   credentialContext?: CredentialContext;
   requester?: Requester;
   slackConversation?: SlackConversationContext;
-  destination?: Destination;
+  destination: Destination;
   surface?: AgentTurnSurface;
   correlation?: {
     conversationId?: string;
@@ -258,6 +259,8 @@ export interface ReplyRequestContext {
     params: Record<string, unknown>;
   }) => void;
 }
+
+export type AssistantReplyRequestContext = ReplyRequestContext;
 
 export interface ReplyRequestAttachment {
   data?: Buffer;
@@ -319,19 +322,100 @@ function requesterFromContext(
   context: ReplyRequestContext,
 ): StoredSlackRequester | undefined {
   const identity = actorRequesterFromContext(context);
-  return identity ? toStoredSlackRequester(identity) : undefined;
+  return identity?.platform === "slack"
+    ? toStoredSlackRequester(identity)
+    : undefined;
+}
+
+/** Reject requester identities that do not belong to the active destination. */
+function assertRequesterDestinationMatch(context: ReplyRequestContext): void {
+  const { destination, requester } = context;
+  if (!requester) {
+    return;
+  }
+  if (requester.platform !== destination.platform) {
+    throw new TypeError(
+      `Requester platform "${requester.platform}" does not match destination platform "${destination.platform}"`,
+    );
+  }
+  if (
+    requester.platform === "slack" &&
+    destination.platform === "slack" &&
+    requester.teamId !== destination.teamId
+  ) {
+    throw new TypeError("Slack requester team does not match destination team");
+  }
+}
+
+/** Reject legacy Slack correlation fields that conflict with the destination. */
+function assertCorrelationDestinationMatch(context: ReplyRequestContext): void {
+  const { correlation, destination } = context;
+  if (destination.platform !== "slack") {
+    return;
+  }
+  if (
+    correlation?.channelId !== undefined &&
+    correlation.channelId !== destination.channelId
+  ) {
+    throw new TypeError(
+      "Slack correlation channel does not match destination channel",
+    );
+  }
+  if (
+    correlation?.teamId !== undefined &&
+    correlation.teamId !== destination.teamId
+  ) {
+    throw new TypeError(
+      "Slack correlation team does not match destination team",
+    );
+  }
 }
 
 function actorRequesterFromContext(
   context: ReplyRequestContext,
 ): Requester | undefined {
   return createRequester(context.requester, {
+    platform:
+      context.requester?.platform ??
+      (context.destination?.platform === "slack" ? "slack" : undefined),
     teamId:
-      context.destination?.teamId ??
+      (context.destination?.platform === "slack"
+        ? context.destination.teamId
+        : undefined) ??
       context.correlation?.teamId ??
-      context.requester?.teamId,
+      (context.requester?.platform === "slack"
+        ? context.requester.teamId
+        : undefined),
     userId: context.correlation?.requesterId,
   });
+}
+
+function toolInvocationSource(context: ReplyRequestContext): Source {
+  if (context.destination.platform !== "slack") {
+    return context.destination;
+  }
+  return {
+    platform: "slack",
+    teamId: context.destination.teamId,
+    channelId: context.destination.channelId,
+    ...(context.correlation?.messageTs
+      ? { messageTs: context.correlation.messageTs }
+      : {}),
+    ...(context.correlation?.threadTs
+      ? { threadTs: context.correlation.threadTs }
+      : {}),
+  };
+}
+
+function toolInvocationDestination(context: ReplyRequestContext): Destination {
+  if (context.destination.platform !== "slack" || !context.toolChannelId) {
+    return context.destination;
+  }
+  return {
+    platform: "slack",
+    teamId: context.destination.teamId,
+    channelId: context.toolChannelId,
+  };
 }
 
 function surfaceFromContext(
@@ -479,8 +563,14 @@ function buildSteeringPiMessage(message: ReplySteeringMessage): PiMessage {
 /** Run a full agent turn: discover skills, execute tools, and return the assistant reply. */
 export async function generateAssistantReply(
   messageText: string,
-  context: ReplyRequestContext = {},
+  context: AssistantReplyRequestContext,
 ): Promise<AssistantReply> {
+  if (!context.destination) {
+    throw new TypeError("Assistant reply generation requires a destination");
+  }
+  assertRequesterDestinationMatch(context);
+  assertCorrelationDestinationMatch(context);
+
   const replyStartedAtMs = Date.now();
   const configuredTurnDeadlineAtMs = replyStartedAtMs + botConfig.turnTimeoutMs;
   const contextTurnDeadlineAtMs =
@@ -875,12 +965,18 @@ export async function generateAssistantReply(
     };
 
     // ── MCP auth orchestration ───────────────────────────────────────
+    const slackDestination =
+      context.destination.platform === "slack"
+        ? context.destination
+        : undefined;
+    const slackChannelId = slackDestination?.channelId;
+
     const mcpAuth = createMcpAuthOrchestration(
       {
         conversationId: sessionConversationId,
         sessionId,
         requesterId: authRequesterId,
-        channelId: context.correlation?.channelId,
+        channelId: slackChannelId,
         destination: context.destination,
         threadTs: context.correlation?.threadTs,
         toolChannelId: context.toolChannelId,
@@ -900,7 +996,7 @@ export async function generateAssistantReply(
         conversationId: sessionConversationId,
         sessionId,
         requesterId: authRequesterId,
-        channelId: context.correlation?.channelId,
+        channelId: slackChannelId,
         destination: context.destination,
         threadTs: context.correlation?.threadTs,
         userMessage: userInput,
@@ -937,6 +1033,46 @@ export async function generateAssistantReply(
         skill.disableModelInvocation !== true ||
         skill.name === invokedSkill?.name,
     );
+    const commonToolRuntimeContext = {
+      conversationId: sessionConversationId,
+      userText: userInput,
+      artifactState: context.artifactState,
+      configuration: configurationValues,
+      mcpToolManager: turnMcpToolManager,
+      sandbox,
+      advisor: {
+        config: botConfig.advisor,
+        conversationId: sessionConversationId,
+        conversationPrivacy,
+        logContext: spanContext,
+        getTools: () => advisorTools,
+        streamFn: createTracedStreamFn({ conversationPrivacy }),
+      },
+    };
+    const toolSource = toolInvocationSource(context);
+    const toolDestination = toolInvocationDestination(context);
+    let toolRuntimeContext: ToolRuntimeContext;
+    if (toolSource.platform === "slack") {
+      toolRuntimeContext = {
+        ...commonToolRuntimeContext,
+        ...(toolDestination.platform === "slack"
+          ? { destination: toolDestination }
+          : {}),
+        requester:
+          actorRequester?.platform === "slack" ? actorRequester : undefined,
+        source: toolSource,
+      };
+    } else {
+      toolRuntimeContext = {
+        ...commonToolRuntimeContext,
+        ...(toolDestination.platform === "local"
+          ? { destination: toolDestination }
+          : {}),
+        requester:
+          actorRequester?.platform === "local" ? actorRequester : undefined,
+        source: toolSource,
+      };
+    }
     const tools = createTools(
       loadableSkills,
       {
@@ -990,29 +1126,7 @@ export async function generateAssistantReply(
           };
         },
       },
-      {
-        channelId: context.correlation?.channelId,
-        conversationId: sessionConversationId,
-        deliveryChannelId: context.toolChannelId,
-        destination: context.destination,
-        requester: actorRequester,
-        teamId: context.correlation?.teamId,
-        messageTs: context.correlation?.messageTs,
-        threadTs: context.correlation?.threadTs,
-        userText: userInput,
-        artifactState: context.artifactState,
-        configuration: configurationValues,
-        mcpToolManager: turnMcpToolManager,
-        sandbox,
-        advisor: {
-          config: botConfig.advisor,
-          conversationId: sessionConversationId,
-          conversationPrivacy,
-          logContext: spanContext,
-          getTools: () => advisorTools,
-          streamFn: createTracedStreamFn({ conversationPrivacy }),
-        },
-      },
+      toolRuntimeContext,
     );
 
     const toolGuidance = Object.entries(
@@ -1055,7 +1169,7 @@ export async function generateAssistantReply(
     const activeMcpCatalogs = toActiveMcpCatalogSummaries(
       turnMcpToolManager.getActiveToolCatalog(),
     );
-    baseInstructions = buildSystemPrompt();
+    baseInstructions = buildSystemPrompt({ source: toolSource });
     const needsBootstrapContext = !hasRuntimeTurnContext(priorPiMessages ?? []);
     const turnContextPrompt = needsBootstrapContext
       ? buildTurnContextPrompt({
@@ -1568,6 +1682,7 @@ export async function generateAssistantReply(
       sandboxId: currentSandboxExecutor.getSandboxId(),
       sandboxDependencyProfileHash:
         currentSandboxExecutor.getDependencyProfileHash(),
+      piMessages: [...agent.state.messages],
       durationMs: Date.now() - replyStartedAtMs,
       generatedFileCount: generatedFiles.length,
       shouldTrace,

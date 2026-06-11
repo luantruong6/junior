@@ -84,7 +84,7 @@ import { type ThreadArtifactsState } from "@/chat/state/artifacts";
 import { lookupSlackUser } from "@/chat/slack/user";
 import {
   toStoredSlackRequester,
-  type Requester,
+  type SlackRequester,
   type StoredSlackRequester,
 } from "@/chat/requester";
 import { ensureSlackMessageActorIdentity } from "@/chat/services/message-actor-identity";
@@ -120,6 +120,7 @@ import {
   stripRuntimeTurnContext,
   trimTrailingAssistantMessages,
 } from "@/chat/respond-helpers";
+import { requireSlackDestination } from "@/chat/destination";
 
 function collectCanvasUrls(artifacts: Partial<ThreadArtifactsState>) {
   return new Set(
@@ -130,7 +131,7 @@ function collectCanvasUrls(artifacts: Partial<ThreadArtifactsState>) {
   );
 }
 
-function turnRequester(requester: Requester): StoredSlackRequester {
+function turnRequester(requester: SlackRequester): StoredSlackRequester {
   return toStoredSlackRequester(requester);
 }
 
@@ -297,7 +298,10 @@ export function createReplyToThread(deps: ReplyExecutorDeps) {
     const threadTs = getThreadTs(threadId);
     const assistantThreadContext = getAssistantThreadContext(message);
     const messageTs = getMessageTs(message);
-    const destination = options.destination;
+    const destination = requireSlackDestination(
+      options.destination,
+      "Slack reply execution",
+    );
     const teamId = destination.teamId;
     const runId = getRunId(thread, message);
     const conversationId = threadId ?? runId;

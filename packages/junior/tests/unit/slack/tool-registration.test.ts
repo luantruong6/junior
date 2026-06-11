@@ -1,12 +1,40 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createTools } from "@/chat/tools";
+import type { ToolRuntimeContext } from "@/chat/tools/types";
 import { schedulerPlugin } from "@sentry/junior-scheduler";
 import { setAgentPlugins } from "@/chat/plugins/agent-hooks";
 const noopSandbox = {} as any;
 
-function ctx(channelId?: string) {
+function ctx(): Extract<ToolRuntimeContext, { source: { platform: "local" } }>;
+function ctx(
+  channelId: string,
+): Extract<ToolRuntimeContext, { source: { platform: "slack" } }>;
+function ctx(channelId?: string): ToolRuntimeContext {
+  if (!channelId) {
+    return {
+      destination: {
+        platform: "local" as const,
+        conversationId: "local:test:tool-registration",
+      },
+      source: {
+        platform: "local" as const,
+        conversationId: "local:test:tool-registration",
+      },
+      sandbox: noopSandbox,
+    };
+  }
+
   return {
-    channelId,
+    destination: {
+      platform: "slack" as const,
+      teamId: "T123",
+      channelId,
+    },
+    source: {
+      platform: "slack" as const,
+      teamId: "T123",
+      channelId,
+    },
     sandbox: noopSandbox,
   };
 }
@@ -44,7 +72,11 @@ describe("Slack tool registration", () => {
       {},
       {
         ...ctx("D12345"),
-        deliveryChannelId: "C12345",
+        destination: {
+          platform: "slack",
+          teamId: "T123",
+          channelId: "C12345",
+        },
       },
     );
 
@@ -66,7 +98,6 @@ describe("Slack tool registration", () => {
           teamId: "T123",
           channelId: "C12345",
         },
-        teamId: "T123",
         requester: {
           platform: "slack",
           teamId: "T123",
@@ -89,7 +120,6 @@ describe("Slack tool registration", () => {
       {},
       {
         ...ctx("C12345"),
-        teamId: "T123",
       },
     );
 
@@ -104,8 +134,31 @@ describe("Slack tool registration", () => {
     const tools = createTools([], {}, ctx());
 
     expect(tools).not.toHaveProperty("slackCanvasCreate");
+    expect(tools).not.toHaveProperty("slackCanvasRead");
     expect(tools).not.toHaveProperty("slackChannelPostMessage");
     expect(tools).not.toHaveProperty("slackChannelListMessages");
     expect(tools).not.toHaveProperty("slackMessageAddReaction");
+  });
+
+  it("does not register Slack tools for local destinations", () => {
+    const tools = createTools(
+      [],
+      {},
+      {
+        destination: {
+          platform: "local",
+          conversationId: "local:test:run-test",
+        },
+        source: {
+          platform: "local",
+          conversationId: "local:test:run-test",
+        },
+        sandbox: noopSandbox,
+      },
+    );
+
+    expect(
+      Object.keys(tools).filter((name) => name.startsWith("slack")),
+    ).toEqual([]);
   });
 });

@@ -2,6 +2,9 @@ import { z } from "zod";
 
 const slackTeamIdSchema = z.string().regex(/^T[A-Z0-9]+$/);
 const slackConversationIdSchema = z.string().regex(/^(C|G|D)[A-Z0-9]+$/);
+const localConversationIdSchema = z
+  .string()
+  .regex(/^local:[a-z0-9_-]+:[a-z0-9][a-z0-9_-]*$/);
 const exactActorUserIdSchema = z
   .string()
   .min(1)
@@ -12,14 +15,48 @@ const nonBlankStringSchema = z
   .string()
   .refine((value) => value.trim().length > 0);
 
-/** Runtime-owned provider-neutral address for routing future work or side effects. */
-export const destinationSchema = z
+/** Runtime-owned Slack address for routing future work or side effects. */
+export const slackDestinationSchema = z
   .object({
     platform: z.literal("slack"),
     teamId: slackTeamIdSchema,
     channelId: slackConversationIdSchema,
   })
   .strict();
+
+/** Runtime-owned local CLI conversation address. */
+export const localDestinationSchema = z
+  .object({
+    platform: z.literal("local"),
+    conversationId: localConversationIdSchema,
+  })
+  .strict();
+
+/** Runtime-owned provider-neutral address for routing future work or side effects. */
+export const destinationSchema = z.discriminatedUnion("platform", [
+  slackDestinationSchema,
+  localDestinationSchema,
+]);
+
+/** Runtime-owned Slack coordinates for the inbound invocation. */
+export const slackSourceSchema = z
+  .object({
+    platform: z.literal("slack"),
+    teamId: slackTeamIdSchema,
+    channelId: slackConversationIdSchema,
+    messageTs: nonBlankStringSchema.optional(),
+    threadTs: nonBlankStringSchema.optional(),
+  })
+  .strict();
+
+/** Runtime-owned local CLI coordinates for the inbound invocation. */
+export const localSourceSchema = localDestinationSchema;
+
+/** Runtime-owned provider-neutral coordinates for the inbound invocation. */
+export const sourceSchema = z.discriminatedUnion("platform", [
+  slackSourceSchema,
+  localSourceSchema,
+]);
 
 /** Stable user credential subject shape accepted from plugins. */
 export const agentPluginCredentialSubjectSchema = z
@@ -30,17 +67,34 @@ export const agentPluginCredentialSubjectSchema = z
   })
   .strict();
 
-/** Runtime-provided requester identity visible to plugin hooks. */
-export const requesterSchema = z
+/** Shared exact actor profile fields for platform-scoped requesters. */
+const requesterProfileSchema = {
+  email: nonBlankStringSchema.optional(),
+  fullName: nonBlankStringSchema.optional(),
+  userId: exactActorUserIdSchema,
+  userName: nonBlankStringSchema.optional(),
+};
+
+export const slackRequesterSchema = z
   .object({
+    ...requesterProfileSchema,
     platform: z.literal("slack"),
     teamId: slackTeamIdSchema,
-    userId: exactActorUserIdSchema,
-    userName: nonBlankStringSchema.optional(),
-    fullName: nonBlankStringSchema.optional(),
-    email: nonBlankStringSchema.optional(),
   })
   .strict();
+
+export const localRequesterSchema = z
+  .object({
+    ...requesterProfileSchema,
+    platform: z.literal("local"),
+  })
+  .strict();
+
+/** Runtime-provided requester identity visible to plugin hooks. */
+export const requesterSchema = z.discriminatedUnion("platform", [
+  slackRequesterSchema,
+  localRequesterSchema,
+]);
 
 const dispatchMetadataSchema = z
   .record(z.string(), z.string())
@@ -84,13 +138,18 @@ export const dispatchOptionsSchema = z
   .object({
     idempotencyKey: nonBlankStringSchema.pipe(z.string().max(512)),
     credentialSubject: agentPluginCredentialSubjectSchema.optional(),
-    destination: destinationSchema,
+    destination: slackDestinationSchema,
     input: nonBlankStringSchema.pipe(z.string().max(32_000)),
     metadata: dispatchMetadataSchema.optional(),
   })
   .strict();
 
 export type Requester = z.output<typeof requesterSchema>;
+export type SlackRequester = z.output<typeof slackRequesterSchema>;
+export type LocalRequester = z.output<typeof localRequesterSchema>;
+export type Source = z.output<typeof sourceSchema>;
+export type SlackSource = Extract<Source, { platform: "slack" }>;
+export type LocalSource = Extract<Source, { platform: "local" }>;
 
 export interface AgentPluginMetadata {
   name: string;
@@ -124,6 +183,32 @@ export interface AgentPluginContext {
   log: AgentPluginLogger;
   plugin: AgentPluginMetadata;
 }
+
+interface BaseInvocationContext {
+  /**
+   * Opaque Junior conversation/session identity for this invocation.
+   * Interactive Slack turns use `slack:{channelId}:{threadTs}`.
+   */
+  conversationId?: string;
+}
+
+export interface SlackInvocationContext extends BaseInvocationContext {
+  /** Runtime-owned default outbound destination for this invocation, if any. */
+  destination?: SlackDestination;
+  requester?: SlackRequester;
+  /** Runtime-owned source where the invocation came from. */
+  source: SlackSource;
+}
+
+export interface LocalInvocationContext extends BaseInvocationContext {
+  /** Runtime-owned default outbound destination for this invocation, if any. */
+  destination?: LocalDestination;
+  requester?: LocalRequester;
+  /** Runtime-owned source where the invocation came from. */
+  source: LocalSource;
+}
+
+export type InvocationContext = LocalInvocationContext | SlackInvocationContext;
 
 export interface AgentPluginSandbox {
   juniorRoot: string;
@@ -190,23 +275,20 @@ export interface AgentPluginToolDefinition<TInput = unknown> {
   execute?: AgentPluginToolExecute<TInput>;
 }
 
-export interface ToolRegistrationHookContext extends AgentPluginContext {
+export interface SlackToolRegistrationHookContext {
   /**
-   * Capabilities of `channelId` — the raw conversation channel exposed to
-   * this plugin. Recomputed from `channelId`, not from `destination`.
+   * Capabilities of the source Slack conversation exposed to this plugin.
+   * Recomputed from `source.channelId`, not from `destination`.
    */
-  channelCapabilities?: {
+  channelCapabilities: {
     canAddReactions: boolean;
     canCreateCanvas: boolean;
     canPostToChannel: boolean;
   };
-  /**
-   * The raw Slack channel ID for this conversation — the DM or channel where
-   * this turn is happening, without any assistant-context-source override.
-   * Use this as the stable binding key for state scoped to a Slack conversation.
-   * `channelCapabilities` describes this channel.
-   */
-  channelId?: string;
+  credentialSubject?: AgentPluginCredentialSubject;
+}
+
+interface BaseToolRegistrationHookContext extends AgentPluginContext {
   /**
    * Opaque Junior conversation/session identity for this turn.
    * Interactive Slack turns use `slack:{channelId}:{threadTs}`.
@@ -214,26 +296,40 @@ export interface ToolRegistrationHookContext extends AgentPluginContext {
    * Do not parse as Slack unless the value starts with `slack:`.
    */
   conversationId?: string;
-  credentialSubject?: AgentPluginCredentialSubject;
-  /**
-   * Runtime-owned destination suitable for future autonomous dispatch. For
-   * Slack, this is the raw conversation channel, not a thread timestamp or
-   * assistant-context source channel.
-   */
-  destination?: Destination;
-  messageTs?: string;
-  requester?: Requester;
   state: AgentPluginState;
-  teamId?: string;
-  threadTs?: string;
   userText?: string;
 }
+
+interface SlackToolRegistrationContext
+  extends BaseToolRegistrationHookContext, SlackInvocationContext {
+  slack: SlackToolRegistrationHookContext;
+}
+
+interface LocalToolRegistrationContext
+  extends BaseToolRegistrationHookContext, LocalInvocationContext {
+  slack?: never;
+}
+
+export type ToolRegistrationHookContext =
+  | LocalToolRegistrationContext
+  | SlackToolRegistrationContext;
 
 export type AgentPluginCredentialSubject = z.output<
   typeof agentPluginCredentialSubjectSchema
 >;
 
 export type Destination = z.output<typeof destinationSchema>;
+
+export type SlackDestination = Extract<Destination, { platform: "slack" }>;
+
+export type LocalDestination = Extract<Destination, { platform: "local" }>;
+
+/** Narrow a runtime destination to the Slack-specific address shape. */
+export function isSlackDestination(
+  destination: Destination | undefined,
+): destination is SlackDestination {
+  return destination?.platform === "slack";
+}
 
 export type DispatchOptions = z.output<typeof dispatchOptionsSchema>;
 

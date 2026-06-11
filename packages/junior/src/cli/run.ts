@@ -1,7 +1,8 @@
 export const CLI_USAGE =
-  "usage: junior init <dir>\n       junior snapshot create\n       junior check [dir]\n       junior upgrade";
+  "usage: junior init <dir>\n       junior snapshot create\n       junior check [dir]\n       junior upgrade\n       junior chat\n       junior chat -p <message>";
 
 interface CliHandlers {
+  runChat: (argv: string[]) => Promise<number>;
   runInit: (dir: string) => Promise<void>;
   runSnapshotCreate: () => Promise<void>;
   runCheck: (dir?: string) => Promise<void>;
@@ -16,13 +17,24 @@ const DEFAULT_IO: CliIo = {
   error: console.error,
 };
 
+/** Strip Node's leading argv separator while preserving command-level flags. */
+function normalizeCliArgv(argv: string[]): string[] {
+  return argv[0] === "--" ? argv.slice(1) : argv;
+}
+
 /** Dispatch CLI arguments to command handlers and return a process exit code. */
 export async function runCli(
   argv: string[],
   handlers: CliHandlers,
   io: CliIo = DEFAULT_IO,
 ): Promise<number> {
-  const [command, subcommand, ...rest] = argv;
+  const [command, subcommand, ...rest] = normalizeCliArgv(argv);
+
+  if (command === "chat") {
+    return await handlers.runChat(
+      subcommand === undefined ? [] : [subcommand, ...rest],
+    );
+  }
 
   if (command === "init") {
     if (!subcommand || rest.length > 0) {

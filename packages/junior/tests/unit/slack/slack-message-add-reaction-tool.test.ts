@@ -1,11 +1,30 @@
 import { describe, expect, it, vi } from "vitest";
 import { createSlackMessageAddReactionTool } from "@/chat/tools/slack/message-add-reaction";
+import type { SlackToolContext } from "@/chat/tools/slack/context";
 
 const addReactionToMessage = vi.fn();
 
 vi.mock("@/chat/slack/outbound", () => ({
   addReactionToMessage: (...args: unknown[]) => addReactionToMessage(...args),
 }));
+
+const TEST_SLACK_CONTEXT: SlackToolContext = {
+  destination: {
+    platform: "slack",
+    teamId: "T123",
+    channelId: "C123",
+  },
+  source: {
+    platform: "slack",
+    teamId: "T123",
+    channelId: "C123",
+    messageTs: "1700000000.100",
+  },
+  destinationChannelId: "C123",
+  messageTs: "1700000000.100",
+  sourceChannelId: "C123",
+  teamId: "T123",
+};
 
 function createState() {
   const cache = new Map<string, unknown>();
@@ -22,11 +41,7 @@ describe("slackMessageAddReaction tool", () => {
   it("rejects non-alias emoji input", async () => {
     addReactionToMessage.mockReset();
     const tool = createSlackMessageAddReactionTool(
-      {
-        channelId: "C123",
-        messageTs: "1700000000.100",
-        sandbox: {} as any,
-      },
+      TEST_SLACK_CONTEXT,
       createState() as any,
     );
     if (!tool.execute) {
@@ -46,11 +61,7 @@ describe("slackMessageAddReaction tool", () => {
     addReactionToMessage.mockReset();
     addReactionToMessage.mockResolvedValue({ ok: true });
     const tool = createSlackMessageAddReactionTool(
-      {
-        channelId: "C123",
-        messageTs: "1700000000.100",
-        sandbox: {} as any,
-      },
+      TEST_SLACK_CONTEXT,
       createState() as any,
     );
     if (!tool.execute) {
@@ -75,11 +86,7 @@ describe("slackMessageAddReaction tool", () => {
     addReactionToMessage.mockReset();
     addReactionToMessage.mockResolvedValue({ ok: true });
     const tool = createSlackMessageAddReactionTool(
-      {
-        channelId: "C123",
-        messageTs: "1700000000.100",
-        sandbox: {} as any,
-      },
+      TEST_SLACK_CONTEXT,
       createState() as any,
     );
     if (!tool.execute) {

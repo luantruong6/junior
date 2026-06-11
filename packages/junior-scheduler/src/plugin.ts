@@ -1,9 +1,9 @@
 import {
   defineJuniorPlugin,
-  type Destination,
   type Dispatch,
   type AgentPluginToolDefinition,
   type PluginOperationalReportContent,
+  type SlackDestination,
   type ToolRegistrationHookContext,
 } from "@sentry/junior-plugin-api";
 import { buildScheduledTaskRunPrompt } from "./prompt";
@@ -54,10 +54,16 @@ function createSchedulerToolContext(
   ctx: ToolRegistrationHookContext,
 ): SchedulerToolContext {
   return {
-    credentialSubject: ctx.credentialSubject,
-    destination:
-      ctx.destination?.platform === "slack" ? ctx.destination : undefined,
-    requester: ctx.requester,
+    credentialSubject: ctx.slack?.credentialSubject,
+    source:
+      ctx.source.platform === "slack"
+        ? {
+            platform: "slack",
+            teamId: ctx.source.teamId,
+            channelId: ctx.source.channelId,
+          }
+        : undefined,
+    requester: ctx.requester?.platform === "slack" ? ctx.requester : undefined,
     state: ctx.state,
     userText: ctx.userText,
   };
@@ -183,7 +189,7 @@ function formatTimestamp(timestampMs: number | undefined): string {
     : "none";
 }
 
-function destinationLabel(destination: Destination): string {
+function destinationLabel(destination: SlackDestination): string {
   if (destination.channelId.startsWith("D")) {
     return "Direct Message";
   }
@@ -365,9 +371,8 @@ export function createSchedulerPlugin() {
     hooks: {
       tools(ctx) {
         if (
-          !ctx.destination ||
-          ctx.destination.platform !== "slack" ||
-          !ctx.requester?.userId
+          ctx.source.platform !== "slack" ||
+          ctx.requester?.platform !== "slack"
         ) {
           return {} as Record<string, AgentPluginToolDefinition<any>>;
         }

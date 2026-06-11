@@ -2,12 +2,10 @@ import { Type } from "@sinclair/typebox";
 import { SlackActionError } from "@/chat/slack/client";
 import { listChannelMessages } from "@/chat/slack/channel";
 import { tool } from "@/chat/tools/definition";
-import { getSlackDeliveryChannelId } from "@/chat/tools/slack/context";
-import type { ToolRuntimeContext } from "@/chat/tools/types";
+import { ToolInputError } from "@/chat/tools/execution/tool-input-error";
+import type { SlackToolContext } from "@/chat/tools/slack/context";
 
-export function createSlackChannelListMessagesTool(
-  context: ToolRuntimeContext,
-) {
+export function createSlackChannelListMessagesTool(context: SlackToolContext) {
   return tool({
     description:
       "List channel messages from Slack history in the active channel context. Use when the user asks for recent or historical channel context outside this thread. Do not use for live monitoring or when current thread context already answers the question.",
@@ -62,12 +60,9 @@ export function createSlackChannelListMessagesTool(
       inclusive,
       max_pages,
     }) => {
-      const targetChannelId = getSlackDeliveryChannelId(context);
+      const targetChannelId = context.destinationChannelId;
       if (!targetChannelId) {
-        return {
-          ok: false,
-          error: "No active channel context is available for history lookup",
-        };
+        throw new ToolInputError("No active Slack destination is available.");
       }
 
       let result;

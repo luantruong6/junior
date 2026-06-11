@@ -4,11 +4,12 @@ import {
   AgentPluginToolInputError,
   agentPluginCredentialSubjectSchema,
   destinationSchema,
+  isSlackDestination,
   type AgentPluginCredentialSubject,
-  type Destination,
-  type Requester,
   type AgentPluginState,
   type AgentPluginToolDefinition,
+  type SlackDestination,
+  type SlackRequester,
 } from "@sentry/junior-plugin-api";
 import { buildCalendarRecurrence, parseScheduleTimestamp } from "./cadence";
 import { sanitizeScheduledTaskPrincipal } from "./identity";
@@ -25,8 +26,8 @@ import type {
 
 export interface SchedulerToolContext {
   credentialSubject?: AgentPluginCredentialSubject;
-  destination?: Destination;
-  requester?: Requester;
+  requester?: SlackRequester;
+  source?: SlackDestination;
   state: AgentPluginState;
   userText?: string;
 }
@@ -44,26 +45,32 @@ function throwToolInputError(error: string): never {
   throw new AgentPluginToolInputError(error);
 }
 
-function requireActiveDestination(context: SchedulerToolContext): Destination {
-  const parsed = destinationSchema.safeParse(context.destination);
+function requireActiveConversation(
+  context: SchedulerToolContext,
+): SlackDestination {
+  const parsed = destinationSchema.safeParse(context.source);
   if (!parsed.success) {
-    const destination = context.destination as Partial<Destination> | undefined;
+    const source = context.source as Partial<SlackDestination> | undefined;
     const issues = parsed.error.issues as readonly SchemaIssue[];
-    if (!destination || destination.platform !== "slack") {
-      throwToolInputError("No active Slack destination is available.");
+    if (!source || source.platform !== "slack") {
+      throwToolInputError("No active Slack conversation is available.");
     }
     if (issues.some((issue) => issue.code === "unrecognized_keys")) {
       throwToolInputError(
-        "Active Slack destination must not include unknown fields.",
+        "Active Slack conversation must not include unknown fields.",
       );
     }
     if (issues.some((issue) => issue.path[0] === "channelId")) {
-      throwToolInputError("Active Slack destination channel is invalid.");
+      throwToolInputError("Active Slack conversation channel is invalid.");
     }
     if (issues.some((issue) => issue.path[0] === "teamId")) {
-      throwToolInputError("Active Slack destination workspace is invalid.");
+      throwToolInputError("Active Slack conversation workspace is invalid.");
     }
-    throwToolInputError("No active Slack destination is available.");
+    throwToolInputError("No active Slack conversation is available.");
+  }
+
+  if (!isSlackDestination(parsed.data)) {
+    throwToolInputError("No active Slack conversation is available.");
   }
 
   return parsed.data;
@@ -72,6 +79,9 @@ function requireActiveDestination(context: SchedulerToolContext): Destination {
 function requireRequester(
   context: SchedulerToolContext,
 ): ScheduledTaskPrincipal {
+  if (context.requester?.platform !== "slack") {
+    throwToolInputError("No active Slack requester context is available.");
+  }
   const userId = context.requester?.userId?.trim();
   if (!userId || userId.toLowerCase() === "unknown") {
     throwToolInputError("No active Slack requester context is available.");
@@ -99,7 +109,7 @@ function isDmChannel(channelId: string): boolean {
 }
 
 function getConversationAccess(
-  destination: Destination,
+  destination: SlackDestination,
 ): ScheduledTaskConversationAccess {
   if (isDmChannel(destination.channelId)) {
     return { audience: "direct", visibility: "private" };
@@ -139,7 +149,7 @@ function getCredentialSubject(args: {
 
 function sameDestination(
   task: ScheduledTask,
-  destination: Destination,
+  destination: SlackDestination,
 ): boolean {
   const taskDestination = task.destination;
   return (
@@ -153,14 +163,14 @@ async function getWritableTask(args: {
   context: SchedulerToolContext;
   taskId: string;
 }): Promise<ScheduledTask> {
-  const destination = requireActiveDestination(args.context);
+  const destination = requireActiveConversation(args.context);
 
   const task = await createSchedulerStore(args.context.state).getTask(
     args.taskId,
   );
   if (!task || task.status === "deleted") {
     throwToolInputError(
-      "Scheduled task was not found in the active destination.",
+      "Scheduled task was not found in the active Slack conversation.",
     );
   }
 
@@ -369,7 +379,7 @@ export function createSlackScheduleCreateTaskTool(
       ),
     }),
     execute: async (input) => {
-      const destination = requireActiveDestination(context);
+      const destination = requireActiveConversation(context);
       const requester = requireRequester(context);
 
       const nowMs = Date.now();
@@ -426,7 +436,7 @@ export function createSlackScheduleCreateTaskTool(
   });
 }
 
-/** Create a tool that lists scheduled tasks for the active Slack destination. */
+/** Create a tool that lists scheduled tasks for the active Slack conversation. */
 export function createSlackScheduleListTasksTool(
   context: SchedulerToolContext,
 ) {
@@ -436,7 +446,7 @@ export function createSlackScheduleListTasksTool(
     annotations: { readOnlyHint: true, destructiveHint: false },
     inputSchema: Type.Object({}),
     execute: async () => {
-      const destination = requireActiveDestination(context);
+      const destination = requireActiveConversation(context);
 
       const tasks = await createSchedulerStore(context.state).listTasksForTeam(
         destination.teamId,
@@ -455,19 +465,19 @@ export function createSlackScheduleListTasksTool(
   });
 }
 
-/** Create a tool that edits a scheduled task in the active Slack destination. */
+/** Create a tool that edits a scheduled task in the active Slack conversation. */
 export function createSlackScheduleUpdateTaskTool(
   context: SchedulerToolContext,
 ) {
   return tool({
     description:
-      "Edit, pause, resume, or reschedule an existing Junior scheduled task in the active Slack conversation. Use only task IDs returned for this destination. Do not move scheduled tasks across conversations.",
+      "Edit, pause, resume, or reschedule an existing Junior scheduled task in the active Slack conversation. Use only task IDs returned for this conversation. Do not move scheduled tasks across conversations.",
     executionMode: "sequential",
     inputSchema: Type.Object({
       task_id: Type.String({
         minLength: 1,
         description:
-          "ID of the task to update. Must be from this active Slack destination.",
+          "ID of the task to update. Must be from this active Slack conversation.",
       }),
       task: Type.Optional(Type.String({ minLength: 1, maxLength: 4000 })),
       schedule: Type.Optional(Type.String({ minLength: 1, maxLength: 300 })),
@@ -573,19 +583,19 @@ export function createSlackScheduleUpdateTaskTool(
   });
 }
 
-/** Create a tool that removes a scheduled task from the active Slack destination. */
+/** Create a tool that removes a scheduled task from the active Slack conversation. */
 export function createSlackScheduleDeleteTaskTool(
   context: SchedulerToolContext,
 ) {
   return tool({
     description:
-      "Delete one scheduled Junior task from the active Slack conversation. Use only task IDs returned for this destination. Do not delete schedules from threads, other channels, or another user's DM.",
+      "Delete one scheduled Junior task from the active Slack conversation. Use only task IDs returned for this conversation. Do not delete schedules from threads, other channels, or another user's DM.",
     executionMode: "sequential",
     inputSchema: Type.Object({
       task_id: Type.String({
         minLength: 1,
         description:
-          "ID of the task to delete. Must be from this active Slack destination.",
+          "ID of the task to delete. Must be from this active Slack conversation.",
       }),
     }),
     execute: async ({ task_id }) => {
@@ -615,13 +625,13 @@ export function createSlackScheduleRunTaskNowTool(
 ) {
   return tool({
     description:
-      "Queue an existing active scheduled Junior task to run as soon as possible, without changing its cadence. Use when the user asks to run an existing scheduled task now. Use only task IDs returned for this destination.",
+      "Queue an existing active scheduled Junior task to run as soon as possible, without changing its cadence. Use when the user asks to run an existing scheduled task now. Use only task IDs returned for this conversation.",
     executionMode: "sequential",
     inputSchema: Type.Object({
       task_id: Type.String({
         minLength: 1,
         description:
-          "ID of the active task to run now. Must be from this active Slack destination.",
+          "ID of the active task to run now. Must be from this active Slack conversation.",
       }),
     }),
     execute: async ({ task_id }) => {
