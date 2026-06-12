@@ -2,7 +2,7 @@
  * Plugin authorization pause orchestration.
  *
  * This module detects plugin credential failures from the sandbox egress layer
- * and maps them onto the same paused-turn contract used by MCP auth. It owns
+ * and maps them onto the same paused-run contract used by MCP auth. It owns
  * provider attribution, private-link delivery/reuse, session-log recording,
  * and credential cleanup.
  *
@@ -47,7 +47,8 @@ export class PluginCredentialFailureError extends Error {
   }
 }
 
-export interface PluginAuthOrchestrationDeps {
+export interface PluginAuthOrchestrationInput {
+  abortAgent: () => void;
   conversationId?: string;
   sessionId?: string;
   requesterId?: string;
@@ -56,8 +57,8 @@ export interface PluginAuthOrchestrationDeps {
   threadTs?: string;
   userMessage: string;
   channelConfiguration?: ChannelConfigurationService;
-  currentPendingAuth?: ConversationPendingAuthState;
-  onPendingAuth?: (
+  pendingAuth?: ConversationPendingAuthState;
+  recordPendingAuth?: (
     pendingAuth: ConversationPendingAuthState,
   ) => void | Promise<void>;
   authorizationFlowMode?: AuthorizationFlowMode;
@@ -68,7 +69,7 @@ export interface PluginAuthOrchestration {
   /**
    * Inspect a sandbox tool result for an `auth_required` signal from the
    * egress proxy. If one is present and an OAuth flow is available, parks the
-   * current turn and sends the user an authorization link. No-ops when the
+   * current run and sends the user an authorization link. No-ops when the
    * result carries no auth signal.
    */
   maybeHandleAuthSignal: (details: unknown) => Promise<void>;
@@ -121,11 +122,10 @@ function authorizationId(args: {
 }
 
 /**
- * Start plugin OAuth from a sandbox egress auth signal and park the turn.
+ * Start plugin OAuth from a sandbox egress auth signal and park the run.
  */
 export function createPluginAuthOrchestration(
-  deps: PluginAuthOrchestrationDeps,
-  abortAgent: () => void,
+  input: PluginAuthOrchestrationInput,
 ): PluginAuthOrchestration {
   let pendingPause: PluginAuthorizationPauseError | undefined;
 
@@ -139,33 +139,44 @@ export function createPluginAuthOrchestration(
     if (pendingPause) {
       throw pendingPause;
     }
-    if (!deps.requesterId || !getPluginOAuthConfig(provider)) {
+    if (!input.requesterId || !getPluginOAuthConfig(provider)) {
       throw new Error(`Cannot start plugin authorization for ${provider}`);
     }
-    if (deps.authorizationFlowMode === "disabled") {
+    if (input.authorizationFlowMode === "disabled") {
       throw new AuthorizationFlowDisabledError("plugin", provider);
+    }
+    const recordPendingAuth = input.sessionId
+      ? input.recordPendingAuth
+      : undefined;
+    if (input.sessionId && !recordPendingAuth) {
+      throw new Error(
+        `Missing pending auth recorder for plugin authorization pause "${provider}"`,
+      );
     }
 
     const providerLabel = formatProviderLabel(provider);
-    const reusingPendingLink = canReusePendingAuthLink({
-      pendingAuth: deps.currentPendingAuth,
-      kind: "plugin",
-      provider,
-      requesterId: deps.requesterId,
-      ...(options?.scope ? { scope: options.scope } : {}),
-    });
+    const reusingPendingLink = input.sessionId
+      ? canReusePendingAuthLink({
+          pendingAuth: input.pendingAuth,
+          kind: "plugin",
+          provider,
+          requesterId: input.requesterId,
+          sessionId: input.sessionId,
+          ...(options?.scope ? { scope: options.scope } : {}),
+        })
+      : false;
 
     if (!reusingPendingLink) {
       const oauthResult = await startOAuthFlow(provider, {
-        requesterId: deps.requesterId,
-        channelId: deps.channelId,
-        destination: deps.destination,
-        threadTs: deps.threadTs,
-        userMessage: deps.userMessage,
-        channelConfiguration: deps.channelConfiguration,
+        requesterId: input.requesterId,
+        channelId: input.channelId,
+        destination: input.destination,
+        threadTs: input.threadTs,
+        userMessage: input.userMessage,
+        channelConfiguration: input.channelConfiguration,
         ...(options?.scope ? { scope: options.scope } : {}),
-        resumeConversationId: deps.conversationId,
-        resumeSessionId: deps.sessionId,
+        resumeConversationId: input.conversationId,
+        resumeSessionId: input.sessionId,
       });
 
       if (!oauthResult.ok) {
@@ -180,34 +191,34 @@ export function createPluginAuthOrchestration(
 
     if (
       options?.unlinkExistingProvider &&
-      deps.requesterId &&
-      deps.userTokenStore
+      input.requesterId &&
+      input.userTokenStore
     ) {
-      await unlinkProvider(deps.requesterId, provider, deps.userTokenStore);
+      await unlinkProvider(input.requesterId, provider, input.userTokenStore);
     }
 
-    if (deps.sessionId) {
-      await deps.onPendingAuth?.({
+    if (input.sessionId && recordPendingAuth) {
+      await recordPendingAuth({
         kind: "plugin",
         provider,
-        requesterId: deps.requesterId,
+        requesterId: input.requesterId,
         ...(options?.scope ? { scope: options.scope } : {}),
-        sessionId: deps.sessionId,
+        sessionId: input.sessionId,
         linkSentAtMs: reusingPendingLink
-          ? deps.currentPendingAuth!.linkSentAtMs
+          ? input.pendingAuth!.linkSentAtMs
           : Date.now(),
       });
     }
-    if (deps.conversationId && deps.sessionId) {
+    if (input.conversationId && input.sessionId) {
       await recordAuthorizationRequested({
-        conversationId: deps.conversationId,
+        conversationId: input.conversationId,
         kind: "plugin",
         provider,
-        requesterId: deps.requesterId,
+        requesterId: input.requesterId,
         authorizationId: authorizationId({
           kind: "plugin",
           provider,
-          sessionId: deps.sessionId,
+          sessionId: input.sessionId,
         }),
         delivery: reusingPendingLink
           ? "private_link_reused"
@@ -220,7 +231,7 @@ export function createPluginAuthOrchestration(
       providerLabel,
       reusingPendingLink ? "link_already_sent" : "link_sent",
     );
-    abortAgent();
+    input.abortAgent();
     throw pendingPause;
   };
 
@@ -249,8 +260,8 @@ export function createPluginAuthOrchestration(
         );
       }
 
-      if (!deps.requesterId || !deps.userTokenStore) {
-        if (deps.authorizationFlowMode === "disabled") {
+      if (!input.requesterId || !input.userTokenStore) {
+        if (input.authorizationFlowMode === "disabled") {
           throw new AuthorizationFlowDisabledError("plugin", provider);
         }
         throw new PluginCredentialFailureError(
