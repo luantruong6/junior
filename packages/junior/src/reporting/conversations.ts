@@ -1,7 +1,7 @@
 /**
  * Conversation reporting joins the activity index with turn-session summaries.
  *
- * The conversation record is the live execution source of truth; turn-session
+ * The conversation record is the queryable activity source; turn-session
  * records add run/transcript detail, and privacy rules decide whether raw
  * transcript payloads can leave this module.
  */
@@ -12,7 +12,12 @@ import {
 } from "@/chat/conversation-privacy";
 import type { PiMessage } from "@/chat/pi/messages";
 import { buildSystemPrompt } from "@/chat/prompt";
-import type { Destination } from "@sentry/junior-plugin-api";
+import type {
+  AgentPluginConversationStatus,
+  AgentPluginConversations,
+  AgentPluginConversationSummary,
+  Destination,
+} from "@sentry/junior-plugin-api";
 import {
   buildSentryConversationUrl,
   buildSentryTraceUrl,
@@ -33,13 +38,19 @@ import {
   type AgentTurnSessionSummary,
 } from "@/chat/state/turn-session";
 import type { StoredSlackRequester } from "@/chat/requester";
-import {
-  getConversation,
-  listConversationsByActivity,
-  type Conversation as StoredConversation,
-  type Source,
-} from "@/chat/task-execution/store";
 import type { AgentTurnUsage } from "@/chat/usage";
+import { getConfiguredConversationStore } from "@/chat/conversations/configured";
+import type {
+  Conversation as StoredConversation,
+  ConversationSource,
+  ConversationStore,
+} from "@/chat/conversations/store";
+
+export type {
+  AgentPluginConversationStatus,
+  AgentPluginConversations,
+  AgentPluginConversationSummary,
+};
 
 const HUNG_TURN_PROGRESS_MS = 5 * 60 * 1000;
 const SAFE_METADATA_KEY_LIMIT = 20;
@@ -47,6 +58,16 @@ const PRIVATE_CONVERSATION_LABEL = "Private Conversation";
 const CONVERSATION_FEED_LIMIT = 50;
 const CONVERSATION_STATS_LIMIT = 5_000;
 const RECENT_CONVERSATION_STATS_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+interface ConversationReaderOptions {
+  conversationStore?: ConversationStore;
+}
+
+function conversationStore(
+  options: ConversationReaderOptions = {},
+): ConversationStore {
+  return options.conversationStore ?? getConfiguredConversationStore();
+}
 
 export type ConversationReportStatus =
   | "active"
@@ -224,7 +245,7 @@ function surfaceFromSummary(
 }
 
 function surfaceFromSource(
-  source: Source | undefined,
+  source: ConversationSource | undefined,
   conversationId: string,
 ): ConversationSurface {
   if (source === "slack" || source === "api" || source === "scheduler") {
@@ -345,10 +366,10 @@ function statusFromConversation(
   fallback: ConversationReportStatus | undefined,
   nowMs: number,
 ): ConversationReportStatus {
+  if (fallback) {
+    return fallback;
+  }
   if (conversation.execution.status === "idle") {
-    if (fallback === "failed" || fallback === "superseded") {
-      return fallback;
-    }
     return "completed";
   }
   const updatedAtMs =
@@ -394,6 +415,32 @@ function titleFromConversation(args: {
   );
 }
 
+function channelNameFromConversation(
+  conversation: StoredConversation,
+  details?: ConversationDetailsRecord,
+): string | undefined {
+  const effectiveChannelName = details?.channelName ?? conversation.channelName;
+  const slackThread = parseSlackThreadId(conversation.conversationId);
+  if (!effectiveChannelName && !slackThread) {
+    return undefined;
+  }
+  const slackConversation = resolveSlackConversationContextFromThreadId({
+    threadId: conversation.conversationId,
+    channelName: effectiveChannelName,
+  });
+  if (
+    resolveConversationPrivacy({
+      conversationId: conversation.conversationId,
+    }) !== "public"
+  ) {
+    return (
+      formatSlackConversationRedactedLabel(slackConversation) ??
+      (slackConversation ? undefined : PRIVATE_CONVERSATION_LABEL)
+    );
+  }
+  return effectiveChannelName;
+}
+
 function applyConversationIndexMetadata(args: {
   conversation: StoredConversation;
   details?: ConversationDetailsRecord;
@@ -410,8 +457,7 @@ function applyConversationIndexMetadata(args: {
       : args.report.surface);
   const slackThread = parseSlackThreadId(args.conversation.conversationId);
   const effectiveChannelName =
-    args.details?.channelName ??
-    args.conversation.channelName ??
+    channelNameFromConversation(args.conversation, args.details) ??
     args.report.channelName;
   const requesterIdentity =
     requesterIdentityReport(args.details?.originRequester) ??
@@ -426,10 +472,6 @@ function applyConversationIndexMetadata(args: {
     reportTime(args.report.lastSeenAt) ?? 0,
     args.conversation.lastActivityAtMs,
   );
-  const lastProgressAtMs = Math.max(
-    reportTime(args.report.lastProgressAt) ?? 0,
-    args.conversation.execution.updatedAtMs ?? args.conversation.updatedAtMs,
-  );
   return {
     ...args.report,
     displayTitle: titleFromConversation({
@@ -439,7 +481,6 @@ function applyConversationIndexMetadata(args: {
     }),
     status,
     lastSeenAt: new Date(lastSeenAtMs).toISOString(),
-    lastProgressAt: new Date(lastProgressAtMs).toISOString(),
     surface,
     ...(requesterIdentity ? { requesterIdentity } : {}),
     ...(slackThread ? { channel: slackThread.channelId } : {}),
@@ -462,6 +503,7 @@ function sessionReportFromConversation(
     details?.originRequester ?? conversation.requester,
   );
   const slackThread = parseSlackThreadId(conversation.conversationId);
+  const channelName = channelNameFromConversation(conversation, details);
   return {
     conversationId: conversation.conversationId,
     cumulativeDurationMs: 0,
@@ -476,9 +518,7 @@ function sessionReportFromConversation(
     surface,
     ...(requesterIdentity ? { requesterIdentity } : {}),
     ...(slackThread ? { channel: slackThread.channelId } : {}),
-    ...((details?.channelName ?? conversation.channelName)
-      ? { channelName: details?.channelName ?? conversation.channelName }
-      : {}),
+    ...(channelName ? { channelName } : {}),
     ...(sentryConversationUrl ? { sentryConversationUrl } : {}),
   };
 }
@@ -1159,9 +1199,12 @@ async function reportsFromConversations(args: {
 }
 
 /** Read the recent conversation feed for reporting consumers. */
-export async function readConversationFeed(): Promise<ConversationFeed> {
+export async function readConversationFeed(
+  options: ConversationReaderOptions = {},
+): Promise<ConversationFeed> {
+  const store = conversationStore(options);
   const nowMs = Date.now();
-  const conversations = await listConversationsByActivity({
+  const conversations = await store.listByActivity({
     limit: CONVERSATION_FEED_LIMIT,
   });
   const detailsByConversationId = await getConversationDetailsForIds(
@@ -1190,10 +1233,13 @@ export async function readConversationFeed(): Promise<ConversationFeed> {
 }
 
 /** Read aggregate conversation statistics for reporting consumers. */
-export async function readConversationStatsReport(): Promise<ConversationStatsReport> {
+export async function readConversationStatsReport(
+  options: ConversationReaderOptions = {},
+): Promise<ConversationStatsReport> {
+  const store = conversationStore(options);
   const nowMs = Date.now();
   const generatedAt = new Date(nowMs).toISOString();
-  const conversations = await listConversationsByActivity({
+  const conversations = await store.listByActivity({
     limit: CONVERSATION_STATS_LIMIT + 1,
   });
   const truncated = conversations.length > CONVERSATION_STATS_LIMIT;
@@ -1226,15 +1272,63 @@ export async function readConversationStatsReport(): Promise<ConversationStatsRe
   });
 }
 
+/** List recent conversation summaries for plugin operational reports. */
+export async function listRecentConversationSummaries(
+  options: {
+    limit?: number;
+  } & ConversationReaderOptions = {},
+): Promise<AgentPluginConversationSummary[]> {
+  const store = conversationStore(options);
+  const nowMs = Date.now();
+  const limit = Math.max(0, Math.min(100, Math.floor(options.limit ?? 25)));
+  const conversations = await store.listByActivity({
+    limit,
+  });
+  const detailsByConversationId = await getConversationDetailsForIds(
+    conversations.map((conversation) => conversation.conversationId),
+  );
+  const reportsByConversation = await reportsFromConversations({
+    conversations,
+    detailsByConversationId,
+    nowMs,
+  });
+  return conversations.map((conversation) => {
+    const details = detailsByConversationId.get(conversation.conversationId);
+    const surface = surfaceFromSource(
+      conversation.source,
+      conversation.conversationId,
+    );
+    const channelName = channelNameFromConversation(conversation, details);
+    const report = newestRun(
+      reportsByConversation.get(conversation.conversationId) ?? [
+        sessionReportFromConversation(conversation, nowMs, details),
+      ],
+    );
+    return {
+      conversationId: conversation.conversationId,
+      displayTitle: titleFromConversation({ conversation, details, surface }),
+      lastActivityAt: new Date(conversation.lastActivityAtMs).toISOString(),
+      lastUpdatedAt: new Date(
+        conversation.execution.updatedAtMs ?? conversation.updatedAtMs,
+      ).toISOString(),
+      status: report.status,
+      ...(channelName ? { channelName } : {}),
+      ...(conversation.source ? { source: conversation.source } : {}),
+    };
+  });
+}
+
 /** Read one conversation transcript for reporting consumers. */
 export async function readConversationReport(
   conversationId: string,
+  options: ConversationReaderOptions = {},
 ): Promise<ConversationReport> {
+  const store = conversationStore(options);
   const nowMs = Date.now();
   const [rawSummaries, details, conversation] = await Promise.all([
     listAgentTurnSessionSummariesForConversation(conversationId),
     getConversationDetails(conversationId),
-    getConversation({ conversationId }),
+    store.get({ conversationId }),
   ]);
   const summaries = rawSummaries.sort(
     (left, right) =>

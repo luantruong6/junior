@@ -28,10 +28,12 @@ import {
 } from "@/chat/task-execution/worker";
 import { processConversationQueueMessage } from "@/chat/task-execution/vercel-callback";
 import { createVercelConversationWorkQueue } from "@/chat/task-execution/vercel-queue";
+import type { ConversationStore } from "@/chat/conversations/store";
 import {
   signConversationQueueMessage,
   verifySignedConversationQueueMessage,
 } from "@/chat/task-execution/queue-signing";
+import type { ConversationWorkQueue } from "@/chat/task-execution/queue";
 import { disconnectStateAdapter, getStateAdapter } from "@/chat/state/adapter";
 import {
   CONVERSATION_ID,
@@ -51,6 +53,28 @@ const OTHER_SLACK_DESTINATION = {
   channelId: "C456",
 } as const;
 const CONVERSATION_WORK_STATE_KEY = `junior:conversation:${CONVERSATION_ID}`;
+
+function failingMetadataStore(): ConversationStore {
+  return {
+    get: vi.fn(async () => undefined),
+    recordActivity: vi.fn(),
+    recordExecution: vi.fn(async () => {
+      throw new Error("metadata unavailable");
+    }),
+    listByActivity: vi.fn(async () => []),
+  };
+}
+
+function metadataEventsStore(events: string[]): ConversationStore {
+  return {
+    get: vi.fn(async () => undefined),
+    recordActivity: vi.fn(),
+    recordExecution: vi.fn(async () => {
+      events.push("metadata");
+    }),
+    listByActivity: vi.fn(async () => []),
+  };
+}
 
 describe("conversation work execution", () => {
   const originalJuniorSecret = process.env.JUNIOR_SECRET;
@@ -91,10 +115,57 @@ describe("conversation work execution", () => {
     const state = await getConversationWorkState({
       conversationId: CONVERSATION_ID,
     });
+    expect(state?.execution.inboundMessageIds).toEqual(["m1"]);
     expect(state?.messages).toHaveLength(1);
     expect(state ? countPendingConversationMessages(state) : 0).toBe(1);
     expect(queue.sendAttempts()).toHaveLength(1);
     expect(queue.sentRecords()).toHaveLength(1);
+  });
+
+  it("keeps queue wake-up when conversation metadata update fails", async () => {
+    const queue = createConversationWorkQueueTestAdapter();
+
+    await expect(
+      appendAndEnqueueInboundMessage({
+        conversationStore: failingMetadataStore(),
+        message: inboundMessage("m1"),
+        nowMs: 2_000,
+        queue,
+      }),
+    ).resolves.toMatchObject({ status: "appended", queueMessageId: "queue-1" });
+
+    const work = await getConversationWorkState({
+      conversationId: CONVERSATION_ID,
+    });
+    expect(work?.messages).toHaveLength(1);
+    expect(queue.sentRecords()).toEqual([
+      {
+        conversationId: CONVERSATION_ID,
+        destination: SLACK_DESTINATION,
+        idempotencyKey: "m1",
+      },
+    ]);
+  });
+
+  it("sends queue wake-up before conversation metadata update", async () => {
+    const events: string[] = [];
+    const queue: ConversationWorkQueue = {
+      send: vi.fn(async () => {
+        events.push("queue");
+        return { messageId: "queue-1" };
+      }),
+    };
+
+    await expect(
+      appendAndEnqueueInboundMessage({
+        conversationStore: metadataEventsStore(events),
+        message: inboundMessage("m1"),
+        nowMs: 2_000,
+        queue,
+      }),
+    ).resolves.toMatchObject({ status: "appended", queueMessageId: "queue-1" });
+
+    expect(events).toEqual(["queue", "metadata"]);
   });
 
   it("does not overwrite malformed persisted conversation work", async () => {

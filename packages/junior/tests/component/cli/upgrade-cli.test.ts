@@ -1,25 +1,32 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { disconnectStateAdapter, getStateAdapter } from "@/chat/state/adapter";
 import {
+  appendInboundMessage,
   CONVERSATION_ACTIVE_INDEX_KEY,
   CONVERSATION_BY_ACTIVITY_INDEX_KEY,
   requestConversationWork,
 } from "@/chat/task-execution/store";
+import { createSqlStore } from "@/chat/conversations/sql/store";
 import type { PiMessage } from "@/chat/pi/messages";
 import { persistThreadStateById } from "@/chat/runtime/thread-state";
 import { upsertAgentTurnSessionRecord } from "@/chat/state/turn-session";
 import { runUpgradeMigrations } from "@/cli/upgrade";
+import { migrateConversationsToSql } from "@/cli/upgrade/migrations/conversations-sql";
+import { redisConversationStateMigration } from "@/cli/upgrade/migrations/redis-conversation-state";
 import {
   CONVERSATION_ID,
   SLACK_DESTINATION,
   inboundMessage,
 } from "../../fixtures/conversation-work";
+import { createLocalJuniorSqlFixture } from "../../fixtures/sql";
 
 const ORIGINAL_ENV = vi.hoisted(() => {
   const original = {
+    JUNIOR_DATABASE_URL: process.env.JUNIOR_DATABASE_URL,
     JUNIOR_STATE_ADAPTER: process.env.JUNIOR_STATE_ADAPTER,
   };
   process.env.JUNIOR_STATE_ADAPTER = "memory";
+  delete process.env.JUNIOR_DATABASE_URL;
   return original;
 });
 const OTHER_SLACK_DESTINATION = {
@@ -70,11 +77,12 @@ describe("upgrade CLI migrations", () => {
 
   afterEach(async () => {
     await disconnectStateAdapter();
+    restoreEnv("JUNIOR_DATABASE_URL", ORIGINAL_ENV.JUNIOR_DATABASE_URL);
     restoreEnv("JUNIOR_STATE_ADAPTER", ORIGINAL_ENV.JUNIOR_STATE_ADAPTER);
     vi.restoreAllMocks();
   });
 
-  it("migrates legacy conversation work records into conversation records", async () => {
+  it("requires SQL before running upgrade migrations", async () => {
     const stateAdapter = getStateAdapter();
     await stateAdapter.connect();
     const legacyMessage = inboundMessage("m1");
@@ -97,64 +105,137 @@ describe("upgrade CLI migrations", () => {
     ]);
     const logs: string[] = [];
 
-    const results = await runUpgradeMigrations({
-      io: { info: (line) => logs.push(line) },
-      stateAdapter,
-    });
-
-    expect(results).toEqual([
-      {
-        existing: 0,
-        migrated: 1,
-        missing: 1,
-        scanned: 2,
-      },
-    ]);
+    await expect(
+      runUpgradeMigrations({
+        io: { info: (line) => logs.push(line) },
+        stateAdapter,
+      }),
+    ).rejects.toThrow(
+      "Junior SQL database URL is required for conversation metadata upgrade",
+    );
     await expect(
       stateAdapter.get(`junior:conversation-work:state:${CONVERSATION_ID}`),
-    ).resolves.toBeNull();
+    ).resolves.toEqual(legacyWork);
     await expect(
       stateAdapter.get("junior:conversation-work:index"),
-    ).resolves.toBeNull();
-    await expect(
-      stateAdapter.get(`junior:conversation:${CONVERSATION_ID}`),
-    ).resolves.toMatchObject({
-      schemaVersion: 1,
-      conversationId: CONVERSATION_ID,
-      createdAtMs: 1_000,
-      destination: SLACK_DESTINATION,
-      lastActivityAtMs: 1_100,
-      source: "slack",
-      updatedAtMs: 2_000,
-      execution: {
-        inboundMessageIds: ["m1"],
-        lastEnqueuedAtMs: 1_500,
-        pendingCount: 1,
-        pendingMessages: [expect.objectContaining({ inboundMessageId: "m1" })],
-        status: "pending",
-        updatedAtMs: 2_000,
-      },
-    });
+    ).resolves.toEqual([CONVERSATION_ID, "missing-conversation"]);
     await expect(
       stateAdapter.get(CONVERSATION_BY_ACTIVITY_INDEX_KEY),
-    ).resolves.toEqual([
-      {
-        conversationId: CONVERSATION_ID,
-        score: 1_100,
-      },
-    ]);
+    ).resolves.toBeNull();
     await expect(
       stateAdapter.get(CONVERSATION_ACTIVE_INDEX_KEY),
-    ).resolves.toEqual([
+    ).resolves.toBeNull();
+    expect(logs).toEqual([]);
+  });
+
+  it("migrates legacy conversation work before SQL conversation backfill", async () => {
+    const stateAdapter = getStateAdapter();
+    await stateAdapter.connect();
+    const legacyMessage = inboundMessage("legacy-sql");
+    await stateAdapter.set(
+      `junior:conversation-work:state:${CONVERSATION_ID}`,
       {
+        schemaVersion: 1,
         conversationId: CONVERSATION_ID,
-        score: 2_000,
+        destination: SLACK_DESTINATION,
+        messages: [legacyMessage],
+        needsRun: true,
+        updatedAtMs: 2_000,
       },
-    ]);
-    expect(logs).toEqual([
-      "Running migration migrate-redis-conversation-state...",
-      "Finished migration migrate-redis-conversation-state: scanned=2 migrated=1 existing=0 missing=1",
-    ]);
+    );
+    await stateAdapter.set("junior:conversation-work:index", [CONVERSATION_ID]);
+    const fixture = await createLocalJuniorSqlFixture();
+    const sqlStore = createSqlStore(fixture.executor);
+
+    try {
+      const context = {
+        io: { info: () => {} },
+        sqlDatabaseUrl: "postgres://configured.example.test/neon",
+        stateAdapter,
+      };
+      const results = [
+        await redisConversationStateMigration.run(context),
+        await migrateConversationsToSql(context, { target: sqlStore }),
+      ];
+
+      expect(results).toEqual([
+        {
+          existing: 0,
+          migrated: 1,
+          missing: 0,
+          scanned: 1,
+        },
+        {
+          existing: 0,
+          migrated: 1,
+          missing: 0,
+          scanned: 1,
+        },
+      ]);
+      await expect(
+        stateAdapter.get(`junior:conversation:${CONVERSATION_ID}`),
+      ).resolves.toMatchObject({
+        conversationId: CONVERSATION_ID,
+        execution: {
+          inboundMessageIds: ["legacy-sql"],
+          pendingCount: 1,
+          status: "pending",
+        },
+      });
+      const sqlConversation = await sqlStore.get({
+        conversationId: CONVERSATION_ID,
+      });
+      expect(sqlConversation).toMatchObject({
+        conversationId: CONVERSATION_ID,
+        execution: {
+          status: "pending",
+        },
+      });
+      expect(sqlConversation?.execution).not.toHaveProperty("pendingCount");
+      expect(sqlConversation?.execution).not.toHaveProperty("pendingMessages");
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it("copies a bounded SQL conversation backfill slice", async () => {
+    const stateAdapter = getStateAdapter();
+    await stateAdapter.connect();
+    const fixture = await createLocalJuniorSqlFixture();
+    const sqlStore = createSqlStore(fixture.executor);
+
+    try {
+      for (let index = 0; index < 3; index++) {
+        const conversationId = `slack:C123:page-${index}`;
+        await appendInboundMessage({
+          message: inboundMessage(`page-${index}`, { conversationId }),
+          nowMs: 1_000 + index,
+          state: stateAdapter,
+        });
+      }
+
+      await expect(
+        migrateConversationsToSql(
+          {
+            io: { info: () => {} },
+            sqlDatabaseUrl: "postgres://configured.example.test/neon",
+            stateAdapter,
+          },
+          { batchSize: 2, target: sqlStore },
+        ),
+      ).resolves.toEqual({
+        existing: 0,
+        migrated: 2,
+        missing: 0,
+        scanned: 2,
+      });
+      await expect(sqlStore.listByActivity({ limit: 10 })).resolves.toEqual([
+        expect.objectContaining({ conversationId: "slack:C123:page-2" }),
+        expect.objectContaining({ conversationId: "slack:C123:page-1" }),
+      ]);
+    } finally {
+      await fixture.close();
+    }
   });
 
   it("seeds active awaiting continuations into conversation work", async () => {
@@ -177,19 +258,17 @@ describe("upgrade CLI migrations", () => {
     });
     await persistActiveTurn(CONVERSATION_ID, "turn-timeout");
 
-    const results = await runUpgradeMigrations({
-      io: { info: () => {} },
-      stateAdapter,
+    await expect(
+      redisConversationStateMigration.run({
+        io: { info: () => {} },
+        stateAdapter,
+      }),
+    ).resolves.toEqual({
+      existing: 0,
+      migrated: 1,
+      missing: 0,
+      scanned: 1,
     });
-
-    expect(results).toEqual([
-      {
-        existing: 0,
-        migrated: 1,
-        missing: 0,
-        scanned: 1,
-      },
-    ]);
     await expect(
       stateAdapter.get(`junior:conversation:${CONVERSATION_ID}`),
     ).resolves.toMatchObject({
@@ -235,19 +314,17 @@ describe("upgrade CLI migrations", () => {
     );
     await stateAdapter.set("junior:conversation-work:index", [CONVERSATION_ID]);
 
-    const results = await runUpgradeMigrations({
-      io: { info: () => {} },
-      stateAdapter,
+    await expect(
+      redisConversationStateMigration.run({
+        io: { info: () => {} },
+        stateAdapter,
+      }),
+    ).resolves.toEqual({
+      existing: 1,
+      migrated: 0,
+      missing: 0,
+      scanned: 1,
     });
-
-    expect(results).toEqual([
-      {
-        existing: 1,
-        migrated: 0,
-        missing: 0,
-        scanned: 1,
-      },
-    ]);
     await expect(
       stateAdapter.get(`junior:conversation-work:state:${CONVERSATION_ID}`),
     ).resolves.toBeNull();
@@ -314,7 +391,7 @@ describe("upgrade CLI migrations", () => {
     await stateAdapter.set("junior:conversation-work:index", [CONVERSATION_ID]);
 
     await expect(
-      runUpgradeMigrations({
+      redisConversationStateMigration.run({
         io: { info: () => {} },
         stateAdapter,
       }),
@@ -348,7 +425,7 @@ describe("upgrade CLI migrations", () => {
     await stateAdapter.set("junior:conversation-work:index", [CONVERSATION_ID]);
 
     await expect(
-      runUpgradeMigrations({
+      redisConversationStateMigration.run({
         io: { info: () => {} },
         stateAdapter,
       }),
@@ -368,17 +445,68 @@ describe("upgrade CLI migrations", () => {
     });
 
     await expect(
-      runUpgradeMigrations({
+      redisConversationStateMigration.run({
         io: { info: () => {} },
         stateAdapter,
       }),
-    ).resolves.toEqual([
-      {
-        existing: 0,
-        migrated: 0,
-        missing: 0,
-        scanned: 0,
-      },
-    ]);
+    ).resolves.toEqual({
+      existing: 0,
+      migrated: 0,
+      missing: 0,
+      scanned: 0,
+    });
+  });
+
+  it("backfills retained conversation record into SQL when configured", async () => {
+    const stateAdapter = getStateAdapter();
+    await stateAdapter.connect();
+    await requestConversationWork({
+      conversationId: CONVERSATION_ID,
+      destination: SLACK_DESTINATION,
+      nowMs: 2_000,
+      state: stateAdapter,
+    });
+    const fixture = await createLocalJuniorSqlFixture();
+    const sqlStore = createSqlStore(fixture.executor);
+
+    try {
+      const context = {
+        io: { info: () => {} },
+        sqlDatabaseUrl: "postgres://configured.example.test/neon",
+        stateAdapter,
+      };
+      const results = [
+        await redisConversationStateMigration.run(context),
+        await migrateConversationsToSql(context, { target: sqlStore }),
+      ];
+
+      expect(results).toEqual([
+        {
+          existing: 0,
+          migrated: 0,
+          missing: 0,
+          scanned: 0,
+        },
+        {
+          existing: 0,
+          migrated: 1,
+          missing: 0,
+          scanned: 1,
+        },
+      ]);
+      const sqlConversation = await sqlStore.get({
+        conversationId: CONVERSATION_ID,
+      });
+      expect(sqlConversation).toMatchObject({
+        conversationId: CONVERSATION_ID,
+        destination: SLACK_DESTINATION,
+        execution: {
+          status: "pending",
+        },
+      });
+      expect(sqlConversation?.execution).not.toHaveProperty("pendingCount");
+    } finally {
+      await fixture.close();
+    }
   });
 });

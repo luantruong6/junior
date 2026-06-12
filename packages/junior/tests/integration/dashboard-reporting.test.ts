@@ -20,6 +20,8 @@ describe("dashboard reporting", () => {
     process.env = {
       ...ORIGINAL_ENV,
       JUNIOR_STATE_ADAPTER: "memory",
+      DATABASE_URL: undefined,
+      JUNIOR_DATABASE_URL: undefined,
     };
     vi.resetModules();
     const { disconnectStateAdapter } = await import("@/chat/state/adapter");
@@ -106,6 +108,87 @@ describe("dashboard reporting", () => {
         titleSourceMessageId: "msg-1",
       },
     );
+  });
+
+  it("lists recent conversations through reporting", async () => {
+    const { getConfiguredConversationStore } =
+      await import("@/chat/conversations/configured");
+    const { createJuniorReporting } = await import("@/reporting");
+    const conversationStore = getConfiguredConversationStore();
+
+    await conversationStore.recordActivity({
+      conversationId: "slack:C1:111",
+      channelName: "incidents",
+      nowMs: 1_000,
+      source: "slack",
+      title: "Incident follow-up",
+    });
+
+    const reporting = createJuniorReporting();
+
+    await expect(reporting.listRecentConversations()).resolves.toEqual([
+      expect.objectContaining({
+        channelName: "incidents",
+        conversationId: "slack:C1:111",
+        displayTitle: expect.any(String),
+        source: "slack",
+        status: "completed",
+      }),
+    ]);
+  });
+
+  it("mirrors local turn sessions as local conversation summaries", async () => {
+    const { recordAgentTurnSessionSummary } =
+      await import("@/chat/state/turn-session");
+    const { getConfiguredConversationStore } =
+      await import("@/chat/conversations/configured");
+    const conversationId = "local:workspace:run-123";
+
+    await recordAgentTurnSessionSummary({
+      conversationId,
+      destination: {
+        platform: "local",
+        conversationId,
+      },
+      sessionId: "local-turn-1",
+      sliceId: 1,
+      state: "completed",
+      surface: "internal",
+      ttlMs: 60_000,
+    });
+
+    await expect(
+      getConfiguredConversationStore().get({
+        conversationId,
+      }),
+    ).resolves.toMatchObject({
+      conversationId,
+      source: "local",
+    });
+  });
+
+  it("redacts private conversation summaries", async () => {
+    const { getConfiguredConversationStore } =
+      await import("@/chat/conversations/configured");
+    const { createJuniorReporting } = await import("@/reporting");
+    const conversationStore = getConfiguredConversationStore();
+
+    await conversationStore.recordActivity({
+      conversationId: "slack:G1:222",
+      channelName: "private-incident-room",
+      nowMs: 1_000,
+      source: "slack",
+      title: "Sensitive escalation",
+    });
+
+    const summaries = await createJuniorReporting().listRecentConversations();
+
+    expect(JSON.stringify(summaries)).not.toContain("private-incident-room");
+    expect(JSON.stringify(summaries)).not.toContain("Sensitive escalation");
+    expect(summaries[0]).toMatchObject({
+      conversationId: "slack:G1:222",
+      status: "completed",
+    });
   });
 
   it("refreshes conversation context ttl without replacing origin context", async () => {
@@ -336,13 +419,13 @@ describe("dashboard reporting", () => {
     const stats = await createJuniorReporting().getConversationStats();
 
     expect(stats).toMatchObject({
-      active: 0,
+      active: 1,
       conversations: 2,
       durationMs: 5_000,
       failed: 1,
       requesters: [
         {
-          active: 0,
+          active: 1,
           conversations: 2,
           durationMs: 4_000,
           failed: 0,

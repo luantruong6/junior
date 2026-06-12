@@ -9,16 +9,22 @@ import { discoverSkills } from "@/chat/skills";
 import { homeDir } from "@/chat/discovery";
 import { GET as healthGET } from "@/handlers/health";
 import type { PluginOperationalReport } from "@sentry/junior-plugin-api";
+import { getConfiguredConversationStore } from "@/chat/conversations/configured";
 import {
   readConversationFeed,
   readConversationReport,
   readConversationStatsReport,
+  listRecentConversationSummaries,
   type ConversationFeed,
+  type AgentPluginConversationSummary,
   type ConversationReport,
   type ConversationStatsReport,
 } from "./reporting/conversations";
 
 export type {
+  AgentPluginConversationStatus,
+  AgentPluginConversations,
+  AgentPluginConversationSummary,
   ConversationFeed,
   ConversationReport,
   ConversationReportStatus,
@@ -94,6 +100,10 @@ export interface JuniorReporting {
   getSessions(): Promise<ConversationFeed>;
   /** Read aggregate conversation stats for reporting consumers. */
   getConversationStats?(): Promise<ConversationStatsReport>;
+  /** Read recent conversation summaries without transcript payloads. */
+  listRecentConversations?(options?: {
+    limit?: number;
+  }): Promise<AgentPluginConversationSummary[]>;
   /** Read sanitized operational summaries contributed by plugins. */
   getPluginOperationalReports?(): Promise<PluginOperationalReportFeed>;
   /**
@@ -137,20 +147,20 @@ async function readPlugins(): Promise<PluginReport[]> {
   }));
 }
 
-async function readPluginOperationalReports(): Promise<PluginOperationalReportFeed> {
-  const nowMs = Date.now();
-  return {
-    source: "plugins",
-    generatedAt: new Date(nowMs).toISOString(),
-    reports: await getAgentPluginOperationalReports(nowMs),
-  };
-}
-
 /** Create the read-only reporting boundary used by plugins and other consumers. */
 export function createJuniorReporting(): JuniorReporting & {
   getConversationStats(): Promise<ConversationStatsReport>;
+  listRecentConversations(options?: {
+    limit?: number;
+  }): Promise<AgentPluginConversationSummary[]>;
   getPluginOperationalReports(): Promise<PluginOperationalReportFeed>;
 } {
+  const conversationStore = getConfiguredConversationStore();
+  const listRecent = (listOptions?: { limit?: number }) =>
+    listRecentConversationSummaries({
+      ...listOptions,
+      conversationStore,
+    });
   return {
     getHealth: readHealth,
     async getRuntimeInfo() {
@@ -170,9 +180,21 @@ export function createJuniorReporting(): JuniorReporting & {
     },
     getPlugins: readPlugins,
     getSkills: readSkills,
-    getSessions: readConversationFeed,
-    getConversationStats: readConversationStatsReport,
-    getPluginOperationalReports: readPluginOperationalReports,
-    getConversation: readConversationReport,
+    getSessions: () => readConversationFeed({ conversationStore }),
+    getConversationStats: () =>
+      readConversationStatsReport({ conversationStore }),
+    listRecentConversations: listRecent,
+    getPluginOperationalReports: async () => {
+      const nowMs = Date.now();
+      return {
+        source: "plugins",
+        generatedAt: new Date(nowMs).toISOString(),
+        reports: await getAgentPluginOperationalReports(nowMs, {
+          listRecent,
+        }),
+      };
+    },
+    getConversation: (conversationId) =>
+      readConversationReport(conversationId, { conversationStore }),
   };
 }

@@ -18,8 +18,12 @@ import {
 import { commitMessages, loadMessages, loadProjection } from "./session-log";
 import type { AgentTurnUsage } from "@/chat/usage";
 import { getStateAdapter } from "./adapter";
-import { recordConversationActivity } from "@/chat/task-execution/store";
-import { logException } from "@/chat/logging";
+import {
+  getConfiguredConversationStore,
+  hasConfiguredSqlConversationStore,
+} from "@/chat/conversations/configured";
+import type { ConversationStore } from "@/chat/conversations/store";
+import { logWarn } from "@/chat/logging";
 
 const AGENT_TURN_SESSION_PREFIX = "junior:agent_turn_session";
 const AGENT_TURN_SESSION_INDEX_KEY = `${AGENT_TURN_SESSION_PREFIX}:index`;
@@ -311,28 +315,49 @@ async function appendAgentTurnSessionSummary(
   ]);
 }
 
-/** Mirror run summaries into the conversation feed without owning reply success. */
-async function recordConversationActivityBestEffort(args: {
+/** Store run summary metadata in the configured conversation store. */
+async function recordConversationActivityMetadata(args: {
+  conversationStore?: ConversationStore;
   nowMs: number;
   summary: AgentTurnSessionSummary;
 }): Promise<void> {
+  const conversationStore =
+    args.conversationStore ?? getConfiguredConversationStore();
+  const source =
+    args.summary.destination?.platform === "local"
+      ? "local"
+      : args.summary.surface;
+  const shouldRequireExistingStateConversation =
+    !args.conversationStore &&
+    args.summary.destination?.platform === "slack" &&
+    !hasConfiguredSqlConversationStore();
   try {
-    await recordConversationActivity({
+    if (shouldRequireExistingStateConversation) {
+      const existing = await conversationStore.get({
+        conversationId: args.summary.conversationId,
+      });
+      if (!existing) {
+        return;
+      }
+    }
+    await conversationStore.recordActivity({
       activityAtMs: args.summary.updatedAtMs,
       channelName: args.summary.channelName,
       conversationId: args.summary.conversationId,
       destination: args.summary.destination,
       nowMs: args.nowMs,
       requester: args.summary.requester,
-      source: args.summary.surface,
+      source,
     });
   } catch (error) {
-    logException(
-      error,
-      "conversation_activity_record_failed",
+    logWarn(
+      "conversation_activity_metadata_update_failed",
       { conversationId: args.summary.conversationId },
-      {},
-      "Failed to mirror turn session summary into conversation activity",
+      {
+        "exception.message":
+          error instanceof Error ? error.message : String(error),
+      },
+      "Failed to update conversation activity metadata",
     );
   }
 }
@@ -512,6 +537,7 @@ function buildStoredRecord(args: {
 }
 
 async function setStoredRecord(args: {
+  conversationStore?: ConversationStore;
   piMessages: PiMessage[];
   record: StoredAgentTurnSessionRecord;
   ttlMs: number;
@@ -532,6 +558,11 @@ async function setStoredRecord(args: {
     ...summary
   } = args.record;
   await appendAgentTurnSessionSummary(summary, args.ttlMs);
+  await recordConversationActivityMetadata({
+    conversationStore: args.conversationStore,
+    nowMs: Date.now(),
+    summary,
+  });
   return materializeAgentTurnSessionRecord(args.record, [...args.piMessages]);
 }
 
@@ -606,6 +637,7 @@ export async function upsertAgentTurnSessionRecord(args: {
   destination?: Destination;
   lastProgressAtMs?: number;
   loadedSkillNames?: string[];
+  conversationStore?: ConversationStore;
   sessionId: string;
   sliceId: number;
   state: AgentTurnSessionStatus;
@@ -632,6 +664,7 @@ export async function upsertAgentTurnSessionRecord(args: {
   });
 
   return await setStoredRecord({
+    conversationStore: args.conversationStore,
     piMessages: args.piMessages,
     ttlMs,
     record: buildStoredRecord({
@@ -699,6 +732,7 @@ export async function recordAgentTurnSessionSummary(args: {
   destination?: Destination;
   lastProgressAtMs?: number;
   loadedSkillNames?: string[];
+  conversationStore?: ConversationStore;
   requester?: StoredSlackRequester;
   resumeReason?: AgentTurnResumeReason;
   sessionId: string;
@@ -758,7 +792,8 @@ export async function recordAgentTurnSessionSummary(args: {
       : {}),
   };
   await appendAgentTurnSessionSummary(summary, ttlMs);
-  await recordConversationActivityBestEffort({
+  await recordConversationActivityMetadata({
+    conversationStore: args.conversationStore,
     nowMs,
     summary,
   });

@@ -367,6 +367,29 @@ export interface AgentPluginReadState {
   get<T = unknown>(key: string): Promise<T | undefined>;
 }
 
+export type AgentPluginConversationStatus =
+  | "active"
+  | "completed"
+  | "failed"
+  | "hung"
+  | "superseded";
+
+export interface AgentPluginConversationSummary {
+  channelName?: string;
+  conversationId: string;
+  displayTitle: string;
+  lastActivityAt: string;
+  lastUpdatedAt: string;
+  source?: "api" | "internal" | "local" | "plugin" | "scheduler" | "slack";
+  status: AgentPluginConversationStatus;
+}
+
+export interface AgentPluginConversations {
+  listRecent(options?: {
+    limit?: number;
+  }): Promise<AgentPluginConversationSummary[]>;
+}
+
 export interface HeartbeatHookContext extends AgentPluginContext {
   agent: {
     dispatch(options: DispatchOptions): Promise<DispatchResult>;
@@ -418,6 +441,7 @@ export interface PluginOperationalReport extends PluginOperationalReportContent 
 }
 
 export interface OperationalReportHookContext extends AgentPluginContext {
+  conversations: AgentPluginConversations;
   nowMs: number;
   state: AgentPluginReadState;
 }

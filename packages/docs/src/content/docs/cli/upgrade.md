@@ -11,7 +11,7 @@ related:
   - /cli/snapshot-create/
 ---
 
-Use `junior upgrade` after installing a Junior release that includes a one-shot state migration. The command mutates the configured state store, so run it from the same app environment that has `REDIS_URL` and `JUNIOR_STATE_KEY_PREFIX` configured for the deployment you are upgrading.
+Use `junior upgrade` after installing a Junior release that includes a one-shot state migration. The command mutates the configured state stores, so run it from the same app environment that has the production state and SQL environment variables configured for the deployment you are upgrading.
 
 ## Usage
 
@@ -25,22 +25,30 @@ The command takes no extra arguments.
 
 ## What it does
 
-`junior upgrade` runs registered migrations sequentially. The current migration moves legacy `junior:conversation-work:*` Redis state into the newer conversation record and index state used by the durable worker and dashboard feed.
+`junior upgrade` runs registered migrations sequentially. Current migrations:
 
-The migration is idempotent: rerunning it skips records that were already moved and removes stale legacy index entries that no longer have a record.
+- Move legacy `junior:conversation-work:*` Redis state into the newer conversation record and index state used by the durable worker and dashboard feed.
+- Backfill retained conversation records into the shared Junior SQL database. The upgrade requires `JUNIOR_DATABASE_URL` or Neon/Vercel's standard `DATABASE_URL`.
+
+The migrations are idempotent: rerunning them skips records that were already moved, removes stale legacy index entries that no longer have a record, and upserts SQL conversation rows. The SQL conversation backfill copies a bounded legacy slice of Redis conversation metadata; after cutover, durable conversation metadata is written to SQL while Redis remains the transcript and execution/cache store.
 
 ## Vercel deploys
 
-Run `junior upgrade` as an out-of-band production maintenance command, not as a permanent request-time path. Vercel build jobs can run the command when they have production `REDIS_URL` access, but build-time alone can leave a small cutover window where the old deployment writes more legacy state.
+Run `junior upgrade` from the Vercel build command when the deployment has access to the same `REDIS_URL`, `JUNIOR_STATE_KEY_PREFIX`, and database URL variables used by production. Neon's Vercel integration provides `DATABASE_URL`; set `JUNIOR_DATABASE_URL` only when Junior should use a different SQL database.
 
-For production deploys that need this migration, use this order:
+Use a build command like:
 
-1. Load the same `REDIS_URL` and `JUNIOR_STATE_KEY_PREFIX` used by the production deployment.
-2. Run `pnpm exec junior upgrade`.
-3. Build and deploy the new release.
-4. Run `pnpm exec junior upgrade` again after the deploy is serving traffic.
+```bash
+pnpm exec junior upgrade && pnpm build
+```
 
-The second run is safe because the migration is idempotent, and it catches records written by the old deployment during the Vercel build or promotion window.
+For monorepos, keep the same prefix and replace the build command with the app-specific build:
+
+```bash
+pnpm exec junior upgrade && pnpm --filter <app> build
+```
+
+This keeps schema creation and SQL backfills out of request handlers. Runtime code trusts that the deployment ran `junior upgrade`; if schema is missing, the deployment is misconfigured and should fail clearly.
 
 ## Example output
 
@@ -48,8 +56,10 @@ Typical logs look like this:
 
 ```text
 Running Junior upgrade migrations...
-Running migration migrate-legacy-conversation-work-redis-state...
-Finished migration migrate-legacy-conversation-work-redis-state: scanned=2 migrated=1 existing=0 missing=1
+Running migration migrate-redis-conversation-state...
+Finished migration migrate-redis-conversation-state: scanned=2 migrated=1 existing=0 missing=1
+Running migration backfill-conversations-sql...
+Finished migration backfill-conversations-sql: scanned=2 migrated=2 existing=0 missing=0
 Junior upgrade complete.
 ```
 
@@ -61,7 +71,7 @@ If the configured state store is unavailable or a legacy record is malformed, th
 junior command failed: Legacy conversation work state is invalid for slack:C123:1712345.0001
 ```
 
-Treat that as a deploy blocker for the affected environment. Check `REDIS_URL`, `JUNIOR_STATE_KEY_PREFIX`, and the reported legacy record before retrying.
+Treat that as a deploy blocker for the affected environment. Check `REDIS_URL`, `JUNIOR_STATE_KEY_PREFIX`, the database URL variables, and the reported legacy record before retrying.
 
 ## Verification
 

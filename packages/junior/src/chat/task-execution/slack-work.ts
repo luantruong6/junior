@@ -16,6 +16,7 @@ import {
 import { normalizeIncomingSlackThreadId } from "@/chat/ingress/message-router";
 import { rehydrateAttachmentFetchers } from "@/chat/slack/attachment-fetchers";
 import { getStateAdapter } from "@/chat/state/adapter";
+import type { ConversationStore } from "@/chat/conversations/store";
 import type { AgentInput, InboundMessage } from "@/chat/task-execution/store";
 import {
   getConversationWorkState,
@@ -55,6 +56,7 @@ export interface CreateSlackConversationWorkerOptions {
     userId: string,
   ) => Promise<SlackRequesterProfile | null | undefined>;
   resumeAwaitingContinuation: (conversationId: string) => Promise<boolean>;
+  conversationStore?: ConversationStore;
   runtime: Pick<
     SlackTurnRuntime<unknown>,
     "handleNewMention" | "handleSubscribedMessage"
@@ -281,6 +283,7 @@ export function createSlackConversationWorker(
             conversationId: context.conversationId,
             inboundMessageIds: initialInboundMessageIds,
             leaseToken: context.leaseToken,
+            conversationStore: options.conversationStore,
             state,
           });
           initialMessagesPersisted = marked;
