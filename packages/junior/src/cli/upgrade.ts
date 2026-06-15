@@ -6,6 +6,9 @@ import {
   requireConversationSqlDatabaseUrl,
   sqlConversationMigration,
 } from "./upgrade/migrations/conversations-sql";
+import { pluginStorageMigration } from "./upgrade/migrations/plugin-storage";
+import { sqlPluginMigration } from "./upgrade/migrations/plugin-sql";
+import { resolveUpgradePlugins } from "./upgrade/migrations/upgrade-plugins";
 import { redisConversationStateMigration } from "./upgrade/migrations/redis-conversation-state";
 import type {
   MigrationContext,
@@ -13,6 +16,7 @@ import type {
   UpgradeIo,
   UpgradeMigration,
 } from "./upgrade/types";
+import { type JuniorPluginSet } from "@/plugins";
 
 const DEFAULT_IO: UpgradeIo = {
   info: console.log,
@@ -21,7 +25,36 @@ const DEFAULT_IO: UpgradeIo = {
 const MIGRATIONS: UpgradeMigration[] = [
   redisConversationStateMigration,
   sqlConversationMigration,
+  sqlPluginMigration,
+  pluginStorageMigration,
 ];
+
+function isMissingVirtualConfig(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  const code = (error as { code?: string }).code;
+  return (
+    (code === "ERR_PACKAGE_IMPORT_NOT_DEFINED" ||
+      code === "ERR_MODULE_NOT_FOUND" ||
+      code === "MODULE_NOT_FOUND") &&
+    error.message.includes("#junior/config")
+  );
+}
+
+async function resolveUpgradePluginSet(): Promise<JuniorPluginSet | undefined> {
+  try {
+    const mod: {
+      pluginSet?: JuniorPluginSet;
+    } = await import("#junior/config");
+    return mod.pluginSet;
+  } catch (error) {
+    if (!isMissingVirtualConfig(error)) {
+      throw error;
+    }
+    return undefined;
+  }
+}
 
 function formatMigrationResult(result: MigrationResult): string {
   const fields = [
@@ -40,12 +73,14 @@ function formatMigrationResult(result: MigrationResult): string {
 export async function runUpgradeMigrations(
   context: MigrationContext,
 ): Promise<MigrationResult[]> {
-  requireConversationSqlDatabaseUrl(context);
+  const plugins = await resolveUpgradePlugins(context);
+  const migrationContext = { ...context, ...plugins };
+  requireConversationSqlDatabaseUrl(migrationContext);
   const results: MigrationResult[] = [];
   for (const migration of MIGRATIONS) {
-    context.io.info(`Running migration ${migration.name}...`);
-    const result = await migration.run(context);
-    context.io.info(
+    migrationContext.io.info(`Running migration ${migration.name}...`);
+    const result = await migration.run(migrationContext);
+    migrationContext.io.info(
       `Finished migration ${migration.name}: ${formatMigrationResult(result)}`,
     );
     results.push(result);
@@ -58,8 +93,14 @@ export async function runUpgrade(io: UpgradeIo = DEFAULT_IO): Promise<void> {
   try {
     const { redisStateAdapter, stateAdapter } =
       await getConnectedStateContext();
+    const pluginSet = await resolveUpgradePluginSet();
     io.info("Running Junior upgrade migrations...");
-    await runUpgradeMigrations({ io, redisStateAdapter, stateAdapter });
+    await runUpgradeMigrations({
+      io,
+      pluginSet,
+      redisStateAdapter,
+      stateAdapter,
+    });
     io.info("Junior upgrade complete.");
   } finally {
     await disconnectStateAdapter();

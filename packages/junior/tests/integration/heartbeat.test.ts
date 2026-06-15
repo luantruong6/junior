@@ -1,16 +1,23 @@
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   defineJuniorPlugin,
+  type PluginDb,
   type Destination,
 } from "@sentry/junior-plugin-api";
 import { createHeartbeatContext } from "@/chat/agent-dispatch/context";
 import { recoverStaleDispatches } from "@/chat/agent-dispatch/heartbeat";
 import {
-  createSchedulerStore,
+  createSchedulerSqlStore,
   schedulerPlugin,
   type ScheduledTask,
 } from "@sentry/junior-scheduler";
-import { createPluginState } from "@/chat/plugins/state";
+import * as pluginDbModule from "@/chat/plugins/db";
+import {
+  createPluginDbForExecutor,
+  migratePluginSchemas,
+  readPluginMigrations,
+} from "@/chat/plugins/db";
 import {
   createOrGetDispatch,
   getDispatchRecord,
@@ -26,10 +33,11 @@ import { persistThreadStateById } from "@/chat/runtime/thread-state";
 import { getConversationWorkState } from "@/chat/task-execution/store";
 import { scheduleAgentContinue } from "@/chat/services/agent-continue";
 import type { PiMessage } from "@/chat/pi/messages";
-import { setAgentPlugins } from "@/chat/plugins/agent-hooks";
+import { setPlugins } from "@/chat/plugins/agent-hooks";
 import { GET as heartbeat } from "@/handlers/heartbeat";
 import { createSlackDirectCredentialSubject } from "@/chat/credentials/subject";
 import { createConversationWorkQueueTestAdapter } from "../fixtures/conversation-work";
+import { createLocalJuniorSqlFixture } from "../fixtures/sql";
 import { createWaitUntilCollector } from "../fixtures/wait-until";
 import { getCapturedSlackApiCalls } from "../msw/handlers/slack-api";
 
@@ -45,8 +53,35 @@ const SLACK_DESTINATION = {
   channelId: "C123",
 } satisfies Destination;
 
-function schedulerStore() {
-  return createSchedulerStore(createPluginState("scheduler"));
+let schedulerSqlFixture:
+  | Awaited<ReturnType<typeof createLocalJuniorSqlFixture>>
+  | undefined;
+let schedulerPluginDb: PluginDb | undefined;
+
+function schedulerMigrationsDir(): string {
+  return path.resolve(process.cwd(), "../junior-scheduler/migrations");
+}
+
+async function migrateSchedulerSchema(
+  fixture: Awaited<ReturnType<typeof createLocalJuniorSqlFixture>>,
+) {
+  await migratePluginSchemas(
+    fixture.executor,
+    readPluginMigrations({
+      dir: schedulerMigrationsDir(),
+      pluginName: "scheduler",
+    }),
+  );
+}
+
+async function useSchedulerSqlStore() {
+  schedulerSqlFixture = await createLocalJuniorSqlFixture();
+  await migrateSchedulerSchema(schedulerSqlFixture);
+  schedulerPluginDb = createPluginDbForExecutor(schedulerSqlFixture.executor);
+  vi.spyOn(pluginDbModule, "getPluginDbForRegistration").mockImplementation(
+    (plugin) => (plugin.database ? schedulerPluginDb : undefined),
+  );
+  return createSchedulerSqlStore(schedulerPluginDb);
 }
 
 function createTask(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
@@ -170,13 +205,16 @@ describe("plugin heartbeat", () => {
     process.env.JUNIOR_SCHEDULER_SECRET = "heartbeat-secret";
     process.env.JUNIOR_BASE_URL = "https://junior.example.com";
     process.env.JUNIOR_SECRET = "dispatch-secret";
-    setAgentPlugins([]);
+    setPlugins([]);
     await disconnectStateAdapter();
   });
 
   afterEach(async () => {
     global.fetch = originalFetch;
-    setAgentPlugins([]);
+    setPlugins([]);
+    await schedulerSqlFixture?.close();
+    schedulerSqlFixture = undefined;
+    schedulerPluginDb = undefined;
     await disconnectStateAdapter();
     delete process.env.JUNIOR_SCHEDULER_SECRET;
     delete process.env.CRON_SECRET;
@@ -199,7 +237,7 @@ describe("plugin heartbeat", () => {
 
   it("runs plugin heartbeat hooks", async () => {
     const seen: number[] = [];
-    setAgentPlugins([
+    setPlugins([
       defineJuniorPlugin({
         manifest: {
           name: "scheduler",
@@ -467,6 +505,29 @@ describe("plugin heartbeat", () => {
     });
   });
 
+  it("exposes plugin DB access to heartbeat contexts for database plugins", () => {
+    const db = {} as any;
+    const spy = vi
+      .spyOn(pluginDbModule, "getPluginDbForRegistration")
+      .mockReturnValue(db);
+    const plugin = defineJuniorPlugin({
+      database: {},
+      manifest: {
+        name: "database-plugin",
+        displayName: "Database Plugin",
+        description: "Heartbeat database context test",
+      },
+    });
+
+    const ctx = createHeartbeatContext({
+      plugin,
+      nowMs: Date.parse("2026-05-26T12:00:00.000Z"),
+    });
+
+    expect(spy).toHaveBeenCalledWith(plugin);
+    expect(ctx.db).toBe(db);
+  });
+
   it("keeps plugin state isolated when plugin names and keys contain delimiters", async () => {
     const first = createHeartbeatContext({
       plugin: "scheduler",
@@ -482,30 +543,6 @@ describe("plugin heartbeat", () => {
 
     await expect(first.state.get("run:1")).resolves.toBe("first");
     await expect(second.state.get("1")).resolves.toBe("second");
-  });
-
-  it("claims scheduled tasks from the scheduler legacy state namespace", async () => {
-    const task = createTask({ id: "sched_legacy" });
-    const state = getStateAdapter();
-    await state.connect();
-    await state.set("junior:scheduler:tasks", [task.id]);
-    await state.set("junior:scheduler:team:T123:tasks", [task.id]);
-    await state.set("junior:scheduler:task:sched_legacy", task);
-
-    const store = createSchedulerStore(
-      createPluginState("scheduler", {
-        legacyStatePrefixes: ["junior:scheduler"],
-      }),
-    );
-
-    await expect(store.listTasksForTeam("T123")).resolves.toMatchObject([
-      { id: task.id },
-    ]);
-    await expect(
-      store.claimDueRun({ nowMs: TEST_NOW_MS }),
-    ).resolves.toMatchObject({
-      taskId: task.id,
-    });
   });
 
   it("bounds dispatch fanout from one heartbeat context", async () => {
@@ -834,8 +871,8 @@ describe("plugin heartbeat", () => {
       return new Response("Accepted", { status: 202 });
     });
     global.fetch = fetchMock as typeof fetch;
-    setAgentPlugins([schedulerPlugin()]);
-    const store = schedulerStore();
+    setPlugins([schedulerPlugin()]);
+    const store = await useSchedulerSqlStore();
     await store.saveTask(
       createTask({
         createdBy: {
@@ -901,11 +938,11 @@ describe("plugin heartbeat", () => {
       lastRunAtMs: Date.parse("2026-05-26T12:00:00.000Z"),
       status: "paused",
     });
-  });
+  }, 30_000);
 
   it("exposes sanitized scheduler operational reports through Junior reporting", async () => {
-    setAgentPlugins([schedulerPlugin()]);
-    const store = schedulerStore();
+    setPlugins([schedulerPlugin()]);
+    const store = await useSchedulerSqlStore();
     await store.saveTask(
       createTask({
         createdBy: {
@@ -996,11 +1033,11 @@ describe("plugin heartbeat", () => {
       author: "Invalid Slack creator metadata",
     });
     expect(JSON.stringify(feed)).not.toContain("Secret");
-  });
+  }, 30_000);
 
   it("counts all running scheduler runs in operational summaries", async () => {
-    setAgentPlugins([schedulerPlugin()]);
-    const store = schedulerStore();
+    setPlugins([schedulerPlugin()]);
+    const store = await useSchedulerSqlStore();
     for (let index = 0; index < 6; index += 1) {
       await store.saveTask(
         createTask({
@@ -1030,12 +1067,12 @@ describe("plugin heartbeat", () => {
 
     expect(runningSummary).toMatchObject({ value: "6" });
     expect(runningSection?.records).toHaveLength(5);
-  });
+  }, 30_000);
 
   it("carries scheduled task credential subjects into dispatch records", async () => {
     mockDispatchCallbackFetch(originalFetch);
-    setAgentPlugins([schedulerPlugin()]);
-    const store = schedulerStore();
+    setPlugins([schedulerPlugin()]);
+    const store = await useSchedulerSqlStore();
     await store.saveTask(
       createTask({
         destination: {
@@ -1079,15 +1116,15 @@ describe("plugin heartbeat", () => {
       },
     });
     expect(getCapturedSlackApiCalls("conversations.info")).toHaveLength(0);
-  });
+  }, 30_000);
 
   it("fails scheduled runs when their dispatch record disappeared", async () => {
     const fetchMock = vi.fn(async () => {
       return new Response("Accepted", { status: 202 });
     });
     global.fetch = fetchMock as typeof fetch;
-    setAgentPlugins([schedulerPlugin()]);
-    const store = schedulerStore();
+    setPlugins([schedulerPlugin()]);
+    const store = await useSchedulerSqlStore();
     await store.saveTask(createTask());
 
     const firstWaitUntil = createWaitUntilCollector();
@@ -1126,21 +1163,21 @@ describe("plugin heartbeat", () => {
     await expect(store.getTask("sched_plugin_1")).resolves.toMatchObject({
       status: "paused",
     });
-  });
+  }, 30_000);
 
   it("blocks malformed scheduled tasks without stopping the scheduler plugin heartbeat", async () => {
     const fetchMock = vi.fn(async () => {
       return new Response("Accepted", { status: 202 });
     });
     global.fetch = fetchMock as typeof fetch;
-    setAgentPlugins([schedulerPlugin()]);
-    const store = schedulerStore();
+    setPlugins([schedulerPlugin()]);
+    const store = await useSchedulerSqlStore();
     await store.saveTask({
       ...createTask(),
       id: "sched_plugin_malformed",
       task: {
-        text: undefined,
-      } as unknown as ScheduledTask["task"],
+        text: "",
+      },
     });
 
     const waitUntil = createWaitUntilCollector();
@@ -1170,15 +1207,15 @@ describe("plugin heartbeat", () => {
       ),
     });
     expect(fetchMock).not.toHaveBeenCalled();
-  });
+  }, 30_000);
 
   it("skips old recurring occurrences and advances to the next future run", async () => {
     const fetchMock = vi.fn(async () => {
       return new Response("Accepted", { status: 202 });
     });
     global.fetch = fetchMock as typeof fetch;
-    setAgentPlugins([schedulerPlugin()]);
-    const store = schedulerStore();
+    setPlugins([schedulerPlugin()]);
+    const store = await useSchedulerSqlStore();
     const task = createDailyTask();
     await store.saveTask(task);
 
@@ -1203,15 +1240,15 @@ describe("plugin heartbeat", () => {
       nextRunAtMs: Date.parse("2026-05-27T12:00:00.000Z"),
     });
     expect(fetchMock).not.toHaveBeenCalled();
-  });
+  }, 30_000);
 
   it("dedupes equivalent old recurring tasks during heartbeat recovery", async () => {
     const fetchMock = vi.fn(async () => {
       return new Response("Accepted", { status: 202 });
     });
     global.fetch = fetchMock as typeof fetch;
-    setAgentPlugins([schedulerPlugin()]);
-    const store = schedulerStore();
+    setPlugins([schedulerPlugin()]);
+    const store = await useSchedulerSqlStore();
     const first = createDailyTask({
       id: "sched_plugin_duplicate_a",
       createdAtMs: Date.parse("2026-05-24T12:00:00.000Z"),
@@ -1245,11 +1282,12 @@ describe("plugin heartbeat", () => {
       status: "active",
       nextRunAtMs: Date.parse("2026-05-27T12:00:00.000Z"),
     });
-    await expect(store.getTask(duplicate.id)).resolves.toMatchObject({
+    const duplicateTask = await store.getTask(duplicate.id);
+    expect(duplicateTask).toMatchObject({
       status: "paused",
-      nextRunAtMs: undefined,
       statusReason: expect.stringContaining(first.id),
     });
+    expect(duplicateTask).not.toHaveProperty("nextRunAtMs");
     expect(fetchMock).not.toHaveBeenCalled();
-  });
+  }, 30_000);
 });

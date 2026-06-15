@@ -1,11 +1,11 @@
-import type { JuniorPluginRegistration } from "@sentry/junior-plugin-api";
+import type { PluginRegistration } from "@sentry/junior-plugin-api";
 import type {
   InlinePluginManifestDefinition,
   PluginCatalogConfig,
   PluginManifestConfig,
 } from "./chat/plugins/types";
 
-export type JuniorPluginInput = JuniorPluginRegistration | string;
+export type JuniorPluginInput = PluginRegistration | string;
 
 export interface JuniorPluginSetOptions {
   /** Install-level manifest overrides applied before validation. */
@@ -19,7 +19,7 @@ export interface JuniorPluginSet {
   /** Manifest-only plugin packages included by package name. */
   packageNames: string[];
   /** JavaScript plugin definitions included by package factories. */
-  registrations: JuniorPluginRegistration[];
+  registrations: PluginRegistration[];
 }
 
 function cloneManifests(
@@ -29,7 +29,7 @@ function cloneManifests(
 }
 
 function cloneInlineManifests(
-  registrations: JuniorPluginRegistration[],
+  registrations: PluginRegistration[],
 ): InlinePluginManifestDefinition[] | undefined {
   const inlineManifests = registrations.flatMap((plugin) =>
     plugin.manifest
@@ -41,11 +41,11 @@ function cloneInlineManifests(
                 plugin.manifest.capabilities?.map((capability) =>
                   capability.includes(".")
                     ? capability
-                    : `${plugin.manifest!.name}.${capability}`,
+                    : `${plugin.manifest.name}.${capability}`,
                 ) ?? [],
               configKeys:
                 plugin.manifest.configKeys?.map((key) =>
-                  key.includes(".") ? key : `${plugin.manifest!.name}.${key}`,
+                  key.includes(".") ? key : `${plugin.manifest.name}.${key}`,
                 ) ?? [],
               ...(plugin.manifest.target
                 ? {
@@ -66,15 +66,14 @@ function cloneInlineManifests(
   return inlineManifests.length > 0 ? inlineManifests : undefined;
 }
 
-function assertUniquePluginNames(
-  registrations: JuniorPluginRegistration[],
-): void {
+function assertUniquePluginNames(registrations: PluginRegistration[]): void {
   const seen = new Set<string>();
   for (const plugin of registrations) {
-    if (seen.has(plugin.name)) {
-      throw new Error(`Duplicate plugin registration name "${plugin.name}"`);
+    const name = plugin.manifest.name;
+    if (seen.has(name)) {
+      throw new Error(`Duplicate plugin registration name "${name}"`);
     }
-    seen.add(plugin.name);
+    seen.add(name);
   }
 }
 
@@ -90,7 +89,7 @@ function assertUniquePackageNames(packageNames: string[]): void {
 
 function normalizePluginInput(input: JuniorPluginInput): {
   packageName?: string;
-  registration?: JuniorPluginRegistration;
+  registration?: PluginRegistration;
 } {
   if (typeof input === "string") {
     return { packageName: input };
@@ -150,13 +149,50 @@ export function pluginCatalogConfigFromPluginSet(
   };
 }
 
+function readEnvPluginPackages(
+  env: NodeJS.ProcessEnv = process.env,
+): string[] | undefined {
+  const value = env.JUNIOR_PLUGIN_PACKAGES;
+  if (!value) {
+    return undefined;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch (error) {
+    throw new Error("JUNIOR_PLUGIN_PACKAGES must be valid JSON", {
+      cause: error,
+    });
+  }
+
+  if (
+    !Array.isArray(parsed) ||
+    parsed.some((item) => typeof item !== "string" || !item.trim())
+  ) {
+    throw new Error(
+      "JUNIOR_PLUGIN_PACKAGES must be a JSON array of package names",
+    );
+  }
+
+  return parsed;
+}
+
+/** Build the manifest catalog config implied by plugin package env. */
+export function pluginCatalogConfigFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): PluginCatalogConfig | undefined {
+  const packages = readEnvPluginPackages(env);
+  return packages ? { packages } : undefined;
+}
+
 /** Return registrations that expose in-process runtime hooks. */
 export function pluginHookRegistrationsFromPluginSet(
   pluginSet: JuniorPluginSet | undefined,
-): JuniorPluginRegistration[] {
+): PluginRegistration[] {
   return (
     pluginSet?.registrations.filter(
-      (plugin) => plugin.hooks || plugin.legacyStatePrefixes,
+      (plugin) => plugin.database || plugin.hooks,
     ) ?? []
   );
 }

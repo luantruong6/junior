@@ -1,10 +1,12 @@
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  AgentPluginToolInputError,
-  type AgentPluginToolDefinition,
+  PluginToolInputError,
+  type PluginDb,
+  type PluginToolDefinition,
 } from "@sentry/junior-plugin-api";
 import {
-  createSchedulerStore,
+  createSchedulerSqlStore,
   createSlackScheduleCreateTaskTool,
   createSlackScheduleDeleteTaskTool,
   createSlackScheduleListTasksTool,
@@ -15,18 +17,49 @@ import {
 } from "@sentry/junior-scheduler";
 import { createSlackDirectCredentialSubject } from "@/chat/credentials/subject";
 import {
-  getAgentPluginTools,
-  setAgentPlugins,
-} from "@/chat/plugins/agent-hooks";
-import { createPluginState } from "@/chat/plugins/state";
+  createPluginDbForExecutor,
+  migratePluginSchemas,
+  readPluginMigrations,
+} from "@/chat/plugins/db";
+import * as pluginDbModule from "@/chat/plugins/db";
+import { getPluginTools, setPlugins } from "@/chat/plugins/agent-hooks";
 import { disconnectStateAdapter } from "@/chat/state/adapter";
 import { schedulerPlugin } from "@sentry/junior-scheduler";
+import {
+  createLocalJuniorSqlFixture,
+  type LocalJuniorSqlFixture,
+} from "../fixtures/sql";
 
 vi.hoisted(() => {
   process.env.JUNIOR_STATE_ADAPTER = "memory";
 });
 
 const TEST_TEAM_ID = `TSCHEDULE${Date.now()}`;
+let currentFixture: LocalJuniorSqlFixture | undefined;
+let currentSchedulerStore: SchedulerToolContext["store"] | undefined;
+
+function schedulerMigrationsDir(): string {
+  return path.resolve(process.cwd(), "../junior-scheduler/migrations");
+}
+
+async function useSchedulerSqlPlugin() {
+  const fixture = await createLocalJuniorSqlFixture();
+  await migratePluginSchemas(
+    fixture.executor,
+    readPluginMigrations({
+      dir: schedulerMigrationsDir(),
+      pluginName: "scheduler",
+    }),
+  );
+  const db: PluginDb = createPluginDbForExecutor(fixture.executor);
+  vi.spyOn(pluginDbModule, "getPluginDbForRegistration").mockImplementation(
+    (plugin) => (plugin.database ? db : undefined),
+  );
+  return {
+    fixture,
+    store: createSchedulerSqlStore(db),
+  };
+}
 
 function createContext(
   overrides: Partial<SchedulerToolContext> & {
@@ -53,7 +86,7 @@ function createContext(
       fullName: "David Cramer",
     },
     userText: "schedule this weekly",
-    state: createPluginState("scheduler"),
+    store: schedulerStore(),
     ...contextOverrides,
   };
   const credentialSubject =
@@ -70,7 +103,7 @@ function createContext(
 }
 
 async function executeTool<TInput>(
-  tool: AgentPluginToolDefinition<TInput>,
+  tool: PluginToolDefinition<TInput>,
   input: TInput,
 ) {
   if (typeof tool?.execute !== "function") {
@@ -80,7 +113,22 @@ async function executeTool<TInput>(
 }
 
 function schedulerStore() {
-  return createSchedulerStore(createPluginState("scheduler"));
+  if (!currentSchedulerStore) {
+    throw new Error("Scheduler SQL store is not initialized");
+  }
+  return currentSchedulerStore;
+}
+
+async function initializeSchedulerSqlStore(): Promise<void> {
+  const plugin = await useSchedulerSqlPlugin();
+  currentFixture = plugin.fixture;
+  currentSchedulerStore = plugin.store;
+}
+
+async function cleanupSchedulerSqlStore(): Promise<void> {
+  await currentFixture?.close();
+  currentFixture = undefined;
+  currentSchedulerStore = undefined;
 }
 
 async function createTask(
@@ -101,11 +149,14 @@ async function createTask(
 describe("Slack schedule tools", () => {
   beforeEach(async () => {
     await disconnectStateAdapter();
+    await initializeSchedulerSqlStore();
   });
 
   afterEach(async () => {
     vi.useRealTimers();
     delete process.env.JUNIOR_TIMEZONE;
+    await cleanupSchedulerSqlStore();
+    vi.restoreAllMocks();
     await disconnectStateAdapter();
   });
 
@@ -224,7 +275,7 @@ describe("Slack schedule tools", () => {
       }),
     );
 
-    await expect(rejected).rejects.toThrow(AgentPluginToolInputError);
+    await expect(rejected).rejects.toThrow(PluginToolInputError);
     await expect(rejected).rejects.toThrow(
       "No active Slack requester context is available.",
     );
@@ -243,7 +294,7 @@ describe("Slack schedule tools", () => {
       },
     );
 
-    await expect(rejected).rejects.toThrow(AgentPluginToolInputError);
+    await expect(rejected).rejects.toThrow(PluginToolInputError);
     await expect(rejected).rejects.toThrow(
       "Active Slack conversation workspace is invalid.",
     );
@@ -264,7 +315,7 @@ describe("Slack schedule tools", () => {
       }),
     );
 
-    await expect(rejected).rejects.toThrow(AgentPluginToolInputError);
+    await expect(rejected).rejects.toThrow(PluginToolInputError);
     await expect(rejected).rejects.toThrow(
       "Active Slack conversation must not include unknown fields.",
     );
@@ -291,7 +342,7 @@ describe("Slack schedule tools", () => {
       }),
     );
 
-    await expect(rejected).rejects.toThrow(AgentPluginToolInputError);
+    await expect(rejected).rejects.toThrow(PluginToolInputError);
     await expect(rejected).rejects.toThrow(
       "Active Slack credential subject is invalid.",
     );
@@ -467,7 +518,6 @@ describe("Slack schedule tools", () => {
         nextRunAtMs: Date.parse("2026-05-28T02:18:48.005Z"),
         schedule: {
           kind: "one_off",
-          recurrence: undefined,
         },
         status: "active",
       },
@@ -612,7 +662,6 @@ describe("Slack schedule tools", () => {
     ).resolves.toMatchObject({
       schedule: {
         kind: "one_off",
-        recurrence: undefined,
       },
     });
   });
@@ -642,7 +691,7 @@ describe("Slack schedule tools", () => {
     // same source conversation.
     //
     // In practice: a DM opened via Slack’s “Ask Junior” panel from #js-alerts
-    // has getAgentPluginTools build source.channelId = DDM rather than using
+    // has getPluginTools build source.channelId = DDM rather than using
     // the outbound assistant-context channel. Both creation and management
     // from that DM use DDM, so the stored task destination never drifts.
     const dmCtx = createContext({ channelId: "DDM" });
@@ -1091,7 +1140,7 @@ describe("Slack schedule tools", () => {
   });
 });
 
-describe("Slack schedule tool wiring via getAgentPluginTools", () => {
+describe("Slack schedule tool wiring via getPluginTools", () => {
   // These tests exercise the real agent-hooks.ts path where the runtime-owned
   // Destination is passed through to the scheduler plugin.
 
@@ -1104,12 +1153,13 @@ describe("Slack schedule tool wiring via getAgentPluginTools", () => {
   });
 
   it("scheduler tools bind to the runtime-owned source", async () => {
-    // Verifies that real getAgentPluginTools wiring passes Source through to
+    // Verifies that real getPluginTools wiring passes Source through to
     // the scheduler, which stores it as the task destination.
-    const previous = setAgentPlugins([schedulerPlugin()]);
+    const previous = setPlugins([schedulerPlugin()]);
+    const { fixture, store } = await useSchedulerSqlPlugin();
     try {
       const TEAM_ID = `TWIRING${Date.now()}`;
-      const tools = getAgentPluginTools({
+      const tools = getPluginTools({
         source: {
           platform: "slack",
           teamId: TEAM_ID,
@@ -1127,7 +1177,7 @@ describe("Slack schedule tool wiring via getAgentPluginTools", () => {
           userName: "alice",
           fullName: "Alice",
         },
-        sandbox: {} as Parameters<typeof getAgentPluginTools>[0]["sandbox"],
+        sandbox: {} as Parameters<typeof getPluginTools>[0]["sandbox"],
       });
 
       expect(tools).toHaveProperty("slackScheduleCreateTask");
@@ -1145,9 +1195,7 @@ describe("Slack schedule tool wiring via getAgentPluginTools", () => {
       const taskId = (result as { task: { id: string } }).task.id;
 
       // Task destination must be the raw DM channel, NOT the assistant context.
-      const stored = await createSchedulerStore(
-        createPluginState("scheduler"),
-      ).getTask(taskId);
+      const stored = await store.getTask(taskId);
       expect(stored).toMatchObject({
         destination: { channelId: "DDM", teamId: TEAM_ID },
         conversationAccess: { audience: "direct", visibility: "private" },
@@ -1159,12 +1207,23 @@ describe("Slack schedule tool wiring via getAgentPluginTools", () => {
         allowedWhen: "private-direct-conversation",
       });
     } finally {
-      setAgentPlugins(previous);
+      await fixture.close();
+      vi.restoreAllMocks();
+      setPlugins(previous);
     }
   });
 });
 
 describe("Slack schedule tool execution modes", () => {
+  beforeEach(async () => {
+    await initializeSchedulerSqlStore();
+  });
+
+  afterEach(async () => {
+    await cleanupSchedulerSqlStore();
+    vi.restoreAllMocks();
+  });
+
   it("all write tools have executionMode sequential", () => {
     const context = createContext();
 

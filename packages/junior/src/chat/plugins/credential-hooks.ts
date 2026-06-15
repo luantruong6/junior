@@ -1,19 +1,20 @@
 import {
-  agentPluginAuthorizationSchema,
-  agentPluginCredentialResultSchema,
-  agentPluginGrantSchema,
-  agentPluginProviderAccountSchema,
-  type AgentPluginAuthorization,
-  type AgentPluginCredentialResult,
-  type AgentPluginGrant,
-  type AgentPluginProviderAccount,
+  pluginAuthorizationSchema,
+  pluginCredentialResultSchema,
+  pluginGrantSchema,
+  pluginProviderAccountSchema,
+  type PluginAuthorization,
+  type PluginCredentialResult,
+  type PluginGrant,
+  type PluginProviderAccount,
 } from "@sentry/junior-plugin-api";
 import type {
   StoredTokens,
   UserTokenStore,
 } from "@/chat/credentials/user-token-store";
-import { getAgentPlugins } from "@/chat/plugins/agent-hooks";
-import { createAgentPluginLogger } from "@/chat/plugins/logging";
+import { getPlugins } from "@/chat/plugins/agent-hooks";
+import { getPluginDbForRegistration } from "@/chat/plugins/db";
+import { createPluginLogger } from "@/chat/plugins/logging";
 
 interface SafeSchema<T> {
   safeParse(value: unknown):
@@ -41,12 +42,12 @@ function parseSchema<T>(
 function parseAuthorization(
   value: unknown,
   pluginName: string,
-): AgentPluginAuthorization | undefined {
+): PluginAuthorization | undefined {
   if (value === undefined) {
     return undefined;
   }
   const authorization = parseSchema(
-    agentPluginAuthorizationSchema,
+    pluginAuthorizationSchema,
     value,
     `Plugin "${pluginName}" grant authorization is invalid`,
   );
@@ -58,24 +59,34 @@ function parseAuthorization(
   return authorization;
 }
 
-function parseGrant(value: unknown, pluginName: string): AgentPluginGrant {
+function parseGrant(value: unknown, pluginName: string): PluginGrant {
   return parseSchema(
-    agentPluginGrantSchema,
+    pluginGrantSchema,
     value,
     `Plugin "${pluginName}" grantForEgress returned an invalid grant`,
   );
 }
 
-function agentPluginFor(provider: string) {
-  return getAgentPlugins().find((candidate) => candidate.name === provider);
+function pluginFor(provider: string) {
+  return getPlugins().find((candidate) => candidate.manifest.name === provider);
+}
+
+function basePluginContext(plugin: NonNullable<ReturnType<typeof pluginFor>>) {
+  const pluginName = plugin.manifest.name;
+  const db = getPluginDbForRegistration(plugin);
+  return {
+    plugin: { name: pluginName },
+    log: createPluginLogger(pluginName),
+    ...(db ? { db } : {}),
+  };
 }
 
 function parseCredentialResult(
   value: unknown,
   pluginName: string,
-): AgentPluginCredentialResult {
+): PluginCredentialResult {
   const result = parseSchema(
-    agentPluginCredentialResultSchema,
+    pluginCredentialResultSchema,
     value,
     `Plugin "${pluginName}" issueCredential result is invalid`,
   );
@@ -100,26 +111,27 @@ export interface EgressGrantInput {
 /** Ask a plugin which grant an outbound request needs. */
 export async function selectPluginGrant(
   input: EgressGrantInput,
-): Promise<AgentPluginGrant | undefined> {
-  const plugin = agentPluginFor(input.provider);
+): Promise<PluginGrant | undefined> {
+  const plugin = pluginFor(input.provider);
   const hook = plugin?.hooks?.grantForEgress;
   if (!plugin || !hook) {
     return undefined;
   }
   const result = await hook({
-    plugin: { name: plugin.name },
-    log: createAgentPluginLogger(plugin.name),
+    ...basePluginContext(plugin),
     request: {
       ...(input.bodyText !== undefined ? { bodyText: input.bodyText } : {}),
       method: input.method,
       url: input.upstreamUrl.toString(),
     },
   });
-  return result === undefined ? undefined : parseGrant(result, plugin.name);
+  return result === undefined
+    ? undefined
+    : parseGrant(result, plugin.manifest.name);
 }
 
 export interface EgressResponseInput {
-  grant: AgentPluginGrant;
+  grant: PluginGrant;
   method: string;
   provider: string;
   response: {
@@ -140,21 +152,20 @@ export interface EgressResponseEffects {
 export async function onPluginEgressResponse(
   input: EgressResponseInput,
 ): Promise<EgressResponseEffects> {
-  const plugin = agentPluginFor(input.provider);
+  const plugin = pluginFor(input.provider);
   const hook = plugin?.hooks?.onEgressResponse;
   if (!plugin || !hook) {
     return {};
   }
   let permissionDenied: { message: string } | undefined;
   await hook({
-    plugin: { name: plugin.name },
-    log: createAgentPluginLogger(plugin.name),
+    ...basePluginContext(plugin),
     grant: input.grant,
     permissionDenied(message) {
       const trimmed = message.trim();
       if (!trimmed) {
         throw new Error(
-          `Plugin "${plugin.name}" onEgressResponse permissionDenied message is empty`,
+          `Plugin "${plugin.manifest.name}" onEgressResponse permissionDenied message is empty`,
         );
       }
       permissionDenied = { message: trimmed };
@@ -170,7 +181,7 @@ export async function onPluginEgressResponse(
 
 /** Return whether a plugin owns credential issuance for egress. */
 export function hasEgressCredentialHooks(provider: string): boolean {
-  const hooks = agentPluginFor(provider)?.hooks;
+  const hooks = pluginFor(provider)?.hooks;
   return Boolean(hooks?.grantForEgress || hooks?.issueCredential);
 }
 
@@ -188,7 +199,7 @@ export interface IssueCredentialInput {
     type: "user";
     userId: string;
   };
-  grant: AgentPluginGrant;
+  grant: PluginGrant;
   provider: string;
   userTokenStore: UserTokenStore;
 }
@@ -197,31 +208,30 @@ export interface IssueCredentialInput {
 export async function resolvePluginOAuthAccount(input: {
   provider: string;
   tokens: StoredTokens;
-}): Promise<AgentPluginProviderAccount | undefined> {
-  const plugin = agentPluginFor(input.provider);
+}): Promise<PluginProviderAccount | undefined> {
+  const plugin = pluginFor(input.provider);
   const hook = plugin?.hooks?.resolveOAuthAccount;
   if (!plugin || !hook) {
     return undefined;
   }
   const account = await hook({
-    plugin: { name: plugin.name },
-    log: createAgentPluginLogger(plugin.name),
+    ...basePluginContext(plugin),
     tokens: input.tokens,
   });
   return account === undefined
     ? undefined
     : parseSchema(
-        agentPluginProviderAccountSchema,
+        pluginProviderAccountSchema,
         account,
-        `Plugin "${plugin.name}" resolveOAuthAccount returned an invalid account`,
+        `Plugin "${plugin.manifest.name}" resolveOAuthAccount returned an invalid account`,
       );
 }
 
 /** Ask a plugin to issue headers or describe why the selected grant is unavailable. */
 export async function issuePluginCredential(
   input: IssueCredentialInput,
-): Promise<AgentPluginCredentialResult> {
-  const plugin = agentPluginFor(input.provider);
+): Promise<PluginCredentialResult> {
+  const plugin = pluginFor(input.provider);
   const hook = plugin?.hooks?.issueCredential;
   if (!plugin || !hook) {
     throw new Error(`Plugin "${input.provider}" has no issueCredential hook`);
@@ -230,8 +240,7 @@ export async function issuePluginCredential(
     input.actor.type === "user" ? input.actor.userId : undefined;
   const credentialSubjectUserId = input.credentialSubject?.userId;
   const result = await hook({
-    plugin: { name: plugin.name },
-    log: createAgentPluginLogger(plugin.name),
+    ...basePluginContext(plugin),
     actor: input.actor,
     grant: input.grant,
     ...(input.credentialSubject
@@ -243,11 +252,14 @@ export async function issuePluginCredential(
             currentUser: {
               userId: currentUserId,
               get: async () =>
-                await input.userTokenStore.get(currentUserId, plugin.name),
+                await input.userTokenStore.get(
+                  currentUserId,
+                  plugin.manifest.name,
+                ),
               set: async (tokens) => {
                 await input.userTokenStore.set(
                   currentUserId,
-                  plugin.name,
+                  plugin.manifest.name,
                   tokens,
                 );
               },
@@ -261,12 +273,12 @@ export async function issuePluginCredential(
               get: async () =>
                 await input.userTokenStore.get(
                   credentialSubjectUserId,
-                  plugin.name,
+                  plugin.manifest.name,
                 ),
               set: async (tokens) => {
                 await input.userTokenStore.set(
                   credentialSubjectUserId,
-                  plugin.name,
+                  plugin.manifest.name,
                   tokens,
                 );
               },
@@ -275,5 +287,5 @@ export async function issuePluginCredential(
         : {}),
     },
   });
-  return parseCredentialResult(result, plugin.name);
+  return parseCredentialResult(result, plugin.manifest.name);
 }

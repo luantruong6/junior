@@ -6,10 +6,11 @@ import {
 } from "@/package-resolution";
 
 interface InstalledJuniorContentPackage {
-  name: string;
   dir: string;
   nodeModulesDir?: string;
+  packageName: string;
   hasRootPluginManifest: boolean;
+  hasMigrationsDir: boolean;
   hasPluginsDir: boolean;
   hasSkillsDir: boolean;
 }
@@ -18,8 +19,9 @@ export interface InstalledPluginPackageContent {
   packageNames: string[];
   packages: {
     dir: string;
+    hasMigrationsDir: boolean;
     hasSkillsDir: boolean;
-    name: string;
+    packageName: string;
   }[];
   manifestRoots: string[];
   skillRoots: string[];
@@ -105,18 +107,26 @@ function resolvePackageDirFromName(
 
 function readPluginPackageFlags(dir: string): {
   hasRootPluginManifest: boolean;
+  hasMigrationsDir: boolean;
   hasPluginsDir: boolean;
   hasSkillsDir: boolean;
 } | null {
   const hasRootPluginManifest = isFile(path.join(dir, "plugin.yaml"));
+  const hasMigrationsDir = isDirectory(path.join(dir, "migrations"));
   const hasPluginsDir = isDirectory(path.join(dir, "plugins"));
   const hasSkillsDir = isDirectory(path.join(dir, "skills"));
-  if (!hasRootPluginManifest && !hasPluginsDir && !hasSkillsDir) {
+  if (
+    !hasRootPluginManifest &&
+    !hasMigrationsDir &&
+    !hasPluginsDir &&
+    !hasSkillsDir
+  ) {
     return null;
   }
 
   return {
     hasRootPluginManifest,
+    hasMigrationsDir,
     hasPluginsDir,
     hasSkillsDir,
   };
@@ -149,15 +159,15 @@ function discoverDeclaredPackages(
     const pluginFlags = readPluginPackageFlags(resolved.dir);
     if (!pluginFlags) {
       throw new Error(
-        `Plugin package "${packageName}" was configured but does not contain plugin content; expected plugin.yaml, plugins/, or skills/ in ${resolved.dir}`,
+        `Plugin package "${packageName}" was configured but does not contain plugin content; expected plugin.yaml, migrations/, plugins/, or skills/ in ${resolved.dir}`,
       );
     }
 
     seenPackageDirs.add(resolved.dir);
     discovered.push({
-      name: packageName,
       dir: resolved.dir,
       nodeModulesDir: resolved.nodeModulesDir,
+      packageName,
       ...pluginFlags,
     });
   }
@@ -194,13 +204,18 @@ export function discoverInstalledPluginPackageContent(
     const tracingBasePath = pkg.nodeModulesDir
       ? pathForTracingInclude(
           resolvedCwd,
-          path.join(pkg.nodeModulesDir, ...pkg.name.split("/")),
+          path.join(pkg.nodeModulesDir, ...pkg.packageName.split("/")),
         )
       : pathForTracingInclude(resolvedCwd, pkg.dir);
     if (pkg.hasRootPluginManifest) {
       manifestRoots.push(pkg.dir);
       if (tracingBasePath) {
         tracingIncludes.push(`${tracingBasePath}/plugin.yaml`);
+      }
+    }
+    if (pkg.hasMigrationsDir) {
+      if (tracingBasePath) {
+        tracingIncludes.push(`${tracingBasePath}/migrations/**/*`);
       }
     }
     if (pkg.hasPluginsDir) {
@@ -219,12 +234,13 @@ export function discoverInstalledPluginPackageContent(
 
   return {
     packageNames: uniqueStringsInOrder(
-      discoveredPackages.map((pkg) => pkg.name),
+      discoveredPackages.map((pkg) => pkg.packageName),
     ),
     packages: discoveredPackages.map((pkg) => ({
       dir: pkg.dir,
+      hasMigrationsDir: pkg.hasMigrationsDir,
       hasSkillsDir: pkg.hasSkillsDir,
-      name: pkg.name,
+      packageName: pkg.packageName,
     })),
     manifestRoots: uniqueStringsInOrder(manifestRoots),
     skillRoots: uniqueStringsInOrder(skillRoots),

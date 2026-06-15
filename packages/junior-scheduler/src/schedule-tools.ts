@@ -1,19 +1,18 @@
 import { randomUUID } from "node:crypto";
 import { Type } from "@sinclair/typebox";
 import {
-  AgentPluginToolInputError,
-  agentPluginCredentialSubjectSchema,
+  PluginToolInputError,
+  pluginCredentialSubjectSchema,
   destinationSchema,
   isSlackDestination,
-  type AgentPluginCredentialSubject,
-  type AgentPluginState,
-  type AgentPluginToolDefinition,
+  type PluginCredentialSubject,
+  type PluginToolDefinition,
   type SlackDestination,
   type SlackRequester,
 } from "@sentry/junior-plugin-api";
 import { buildCalendarRecurrence, parseScheduleTimestamp } from "./cadence";
 import { sanitizeScheduledTaskPrincipal } from "./identity";
-import { createSchedulerStore } from "./store";
+import { type SchedulerStore } from "./store";
 import { SCHEDULED_TASK_SYSTEM_ACTOR } from "./types";
 import type {
   ScheduledCalendarFrequency,
@@ -25,10 +24,10 @@ import type {
 } from "./types";
 
 export interface SchedulerToolContext {
-  credentialSubject?: AgentPluginCredentialSubject;
+  credentialSubject?: PluginCredentialSubject;
   requester?: SlackRequester;
   source?: SlackDestination;
-  state: AgentPluginState;
+  store: SchedulerStore;
   userText?: string;
 }
 
@@ -42,7 +41,7 @@ type SchemaIssue = {
 };
 
 function throwToolInputError(error: string): never {
-  throw new AgentPluginToolInputError(error);
+  throw new PluginToolInputError(error);
 }
 
 function requireActiveConversation(
@@ -99,8 +98,8 @@ function requireRequester(
 }
 
 function tool<TInput = any>(
-  definition: AgentPluginToolDefinition<TInput>,
-): AgentPluginToolDefinition<TInput> {
+  definition: PluginToolDefinition<TInput>,
+): PluginToolDefinition<TInput> {
   return definition;
 }
 
@@ -125,8 +124,8 @@ function getConversationAccess(
 
 function getCredentialSubject(args: {
   access: ScheduledTaskConversationAccess;
-  subject: AgentPluginCredentialSubject | undefined;
-}): AgentPluginCredentialSubject | undefined {
+  subject: PluginCredentialSubject | undefined;
+}): PluginCredentialSubject | undefined {
   if (
     args.access.audience !== "direct" ||
     args.access.visibility !== "private"
@@ -136,7 +135,7 @@ function getCredentialSubject(args: {
   if (!args.subject) {
     return undefined;
   }
-  const subject = agentPluginCredentialSubjectSchema.safeParse(args.subject);
+  const subject = pluginCredentialSubjectSchema.safeParse(args.subject);
   if (!subject.success) {
     throwToolInputError("Active Slack credential subject is invalid.");
   }
@@ -165,9 +164,7 @@ async function getWritableTask(args: {
 }): Promise<ScheduledTask> {
   const destination = requireActiveConversation(args.context);
 
-  const task = await createSchedulerStore(args.context.state).getTask(
-    args.taskId,
-  );
+  const task = await schedulerStore(args.context).getTask(args.taskId);
   if (!task || task.status === "deleted") {
     throwToolInputError(
       "Scheduled task was not found in the active Slack conversation.",
@@ -222,6 +219,10 @@ function compactTask(task: ScheduledTask): Record<string, unknown> {
 
 function buildTaskId(): string {
   return `${TASK_ID_PREFIX}_${randomUUID()}`;
+}
+
+function schedulerStore(context: SchedulerToolContext): SchedulerStore {
+  return context.store;
 }
 
 function normalizeStatus(
@@ -427,7 +428,7 @@ export function createSlackScheduleCreateTaskTool(
         version: 1,
       };
 
-      await createSchedulerStore(context.state).saveTask(task);
+      await schedulerStore(context).saveTask(task);
       return {
         ok: true,
         task: compactTask(task),
@@ -448,7 +449,7 @@ export function createSlackScheduleListTasksTool(
     execute: async () => {
       const destination = requireActiveConversation(context);
 
-      const tasks = await createSchedulerStore(context.state).listTasksForTeam(
+      const tasks = await schedulerStore(context).listTasksForTeam(
         destination.teamId,
       );
       const matching = tasks.filter((task) =>
@@ -574,7 +575,7 @@ export function createSlackScheduleUpdateTaskTool(
         version: lookup.version + 1,
       };
 
-      await createSchedulerStore(context.state).saveTask(next);
+      await schedulerStore(context).saveTask(next);
       return {
         ok: true,
         task: compactTask(next),
@@ -610,7 +611,7 @@ export function createSlackScheduleDeleteTaskTool(
         version: lookup.version + 1,
       };
 
-      await createSchedulerStore(context.state).saveTask(next);
+      await schedulerStore(context).saveTask(next);
       return {
         ok: true,
         task: compactTask(next),
@@ -650,7 +651,7 @@ export function createSlackScheduleRunTaskNowTool(
         version: lookup.version + 1,
       };
 
-      await createSchedulerStore(context.state).saveTask(next);
+      await schedulerStore(context).saveTask(next);
       return {
         ok: true,
         task: compactTask(next),

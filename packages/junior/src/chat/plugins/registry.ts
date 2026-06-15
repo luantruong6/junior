@@ -28,6 +28,7 @@ interface LoadedPluginState {
   packageSkillRoots: Set<string>;
   pluginConfigKeys: Set<string>;
   pluginDefinitions: PluginDefinition[];
+  pluginMigrationRoots: Map<string, string>;
   pluginsByName: Map<string, PluginDefinition>;
   signature: string;
 }
@@ -55,6 +56,7 @@ function createLoadedPluginState(signature: string): LoadedPluginState {
   return {
     signature,
     pluginDefinitions: [],
+    pluginMigrationRoots: new Map(),
     capabilityToPlugin: new Map(),
     domainToPlugin: new Map(),
     pluginConfigKeys: new Set(),
@@ -77,6 +79,7 @@ function registerPluginManifest(
   manifest: PluginDefinition["manifest"],
   pluginDir: string,
   skillsDir?: string,
+  migrationsDir?: string,
 ): void {
   if (state.pluginsByName.has(manifest.name)) {
     throw new Error(`Duplicate plugin name "${manifest.name}"`);
@@ -102,11 +105,15 @@ function registerPluginManifest(
   const definition: PluginDefinition = {
     manifest,
     dir: pluginDir,
+    ...(migrationsDir ? { migrationsDir } : {}),
     ...(skillsDir ? { skillsDir } : {}),
   };
 
   state.pluginDefinitions.push(definition);
   state.pluginsByName.set(manifest.name, definition);
+  if (definition.migrationsDir) {
+    state.pluginMigrationRoots.set(manifest.name, definition.migrationsDir);
+  }
 
   for (const cap of manifest.capabilities) {
     state.capabilityToPlugin.set(cap, definition);
@@ -125,6 +132,7 @@ function registerYamlPluginManifest(
   pluginDir: string,
 ): void {
   const manifest = parsePluginManifest(raw, pluginDir, pluginConfig);
+  // Declarative manifests are manifest-only; code registrations claim migrations.
   registerPluginManifest(
     state,
     manifest,
@@ -167,6 +175,16 @@ function getPluginCatalogSource(): PluginCatalogSource {
     signature: JSON.stringify({
       inlineManifests,
       manifestRoots,
+      packages: packagedContent.packages
+        .map((pkg) => ({
+          dir: path.resolve(pkg.dir),
+          hasMigrationsDir: pkg.hasMigrationsDir,
+          hasSkillsDir: pkg.hasSkillsDir,
+          packageName: pkg.packageName,
+        }))
+        .sort((left, right) =>
+          left.packageName.localeCompare(right.packageName),
+        ),
       packagedSkillRoots,
       packageNames: [...packagedContent.packageNames].sort(),
       pluginConfig: pluginConfig ?? {},
@@ -213,14 +231,19 @@ function clonePluginCatalogConfig(
 function packageContentByName(
   packagedContent: InstalledPluginPackageContent,
   packageName: string,
-): { dir: string; hasSkillsDir: boolean } | undefined {
-  return packagedContent.packages.find((pkg) => pkg.name === packageName);
+):
+  | { dir: string; hasMigrationsDir: boolean; hasSkillsDir: boolean }
+  | undefined {
+  return packagedContent.packages.find(
+    (pkg) => pkg.packageName === packageName,
+  );
 }
 
 function registerInlineManifests(
   state: LoadedPluginState,
   source: PluginCatalogSource,
 ): void {
+  const migrationOwners = new Map<string, string>();
   for (const definition of source.inlineManifests) {
     const pkg = definition.packageName
       ? packageContentByName(source.packagedContent, definition.packageName)
@@ -229,12 +252,28 @@ function registerInlineManifests(
     const skillsDir = pkg?.hasSkillsDir
       ? path.join(pkg.dir, "skills")
       : undefined;
+    const migrationsDir =
+      pkg?.hasMigrationsDir &&
+      statSync(path.join(pkg.dir, "migrations"), {
+        throwIfNoEntry: false,
+      })?.isDirectory()
+        ? path.join(pkg.dir, "migrations")
+        : undefined;
     const manifest = parseInlinePluginManifest(
       definition.manifest,
       dir,
       pluginConfig,
     );
-    registerPluginManifest(state, manifest, dir, skillsDir);
+    if (migrationsDir) {
+      const owner = migrationOwners.get(migrationsDir);
+      if (owner) {
+        throw new Error(
+          `Plugin "${manifest.name}" cannot share migrations directory with plugin "${owner}"`,
+        );
+      }
+      migrationOwners.set(migrationsDir, manifest.name);
+    }
+    registerPluginManifest(state, manifest, dir, skillsDir, migrationsDir);
   }
 }
 
@@ -417,6 +456,16 @@ export function getPluginCapabilityProviders(): CapabilityProviderDefinition[] {
 
 export function getPluginProviders(): PluginDefinition[] {
   return [...ensurePluginsLoaded().pluginDefinitions];
+}
+
+export function getPluginMigrationRoots(): {
+  dir: string;
+  pluginName: string;
+}[] {
+  const state = ensurePluginsLoaded();
+  return [...state.pluginMigrationRoots.entries()]
+    .map(([pluginName, dir]) => ({ pluginName, dir }))
+    .sort((left, right) => left.pluginName.localeCompare(right.pluginName));
 }
 
 export function getPluginMcpProviders(): PluginDefinition[] {

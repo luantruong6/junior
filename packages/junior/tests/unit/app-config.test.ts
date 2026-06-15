@@ -8,7 +8,7 @@ import {
   getConfigDefaults,
   setConfigDefaults,
 } from "@/chat/configuration/defaults";
-import { getAgentPlugins, setAgentPlugins } from "@/chat/plugins/agent-hooks";
+import { getPlugins, setPlugins } from "@/chat/plugins/agent-hooks";
 import {
   getPluginSkillRoots,
   getPluginProviders,
@@ -58,7 +58,7 @@ async function writePluginPackage(
 
 afterEach(async () => {
   process.chdir(originalCwd);
-  setAgentPlugins([]);
+  setPlugins([]);
   setPluginCatalogConfig(undefined);
   setConfigDefaults(undefined);
   vi.doUnmock("#junior/config");
@@ -99,7 +99,7 @@ describe("createApp plugin config", () => {
     });
 
     expect(getPluginProviders()).toEqual([]);
-    expect(getAgentPlugins().map((plugin) => plugin.name)).toEqual([]);
+    expect(getPlugins().map((plugin) => plugin.manifest.name)).toEqual([]);
   });
 
   it("validates sandbox egress trace propagation domains from app options", async () => {
@@ -138,7 +138,9 @@ describe("createApp plugin config", () => {
     expect(getPluginProviders().map((plugin) => plugin.manifest.name)).toEqual([
       "base",
     ]);
-    expect(getAgentPlugins().map((plugin) => plugin.name)).toEqual(["base"]);
+    expect(getPlugins().map((plugin) => plugin.manifest.name)).toEqual([
+      "base",
+    ]);
   });
 
   it("loads package plugins with runtime hook plugins", async () => {
@@ -176,7 +178,7 @@ describe("createApp plugin config", () => {
       "dashboard",
       "env",
     ]);
-    expect(getAgentPlugins().map((plugin) => plugin.name)).toEqual([
+    expect(getPlugins().map((plugin) => plugin.manifest.name)).toEqual([
       "dashboard",
     ]);
   });
@@ -281,7 +283,9 @@ describe("createApp plugin config", () => {
     expect(getPluginProviders().map((plugin) => plugin.manifest.name)).toEqual([
       "hooked",
     ]);
-    expect(getAgentPlugins().map((plugin) => plugin.name)).toEqual(["hooked"]);
+    expect(getPlugins().map((plugin) => plugin.manifest.name)).toEqual([
+      "hooked",
+    ]);
   });
 
   it("rejects incomplete plugin egress credential hooks", async () => {
@@ -311,7 +315,7 @@ describe("createApp plugin config", () => {
       'Plugin "example" egress credential hooks must include both grantForEgress and issueCredential.',
     );
 
-    expect(getAgentPlugins().map((plugin) => plugin.name)).toEqual([]);
+    expect(getPlugins().map((plugin) => plugin.manifest.name)).toEqual([]);
     expect(getPluginProviders()).toEqual([]);
   });
 
@@ -347,7 +351,7 @@ describe("createApp plugin config", () => {
       'Plugin "example" egress credential hooks require manifest.domains to list sandbox egress hosts.',
     );
 
-    expect(getAgentPlugins().map((plugin) => plugin.name)).toEqual([]);
+    expect(getPlugins().map((plugin) => plugin.manifest.name)).toEqual([]);
     expect(getPluginProviders()).toEqual([]);
   });
 
@@ -379,7 +383,7 @@ describe("createApp plugin config", () => {
       'Plugin "example" manifest.oauth without oauth-bearer credentials requires egress credential hooks.',
     );
 
-    expect(getAgentPlugins().map((plugin) => plugin.name)).toEqual([]);
+    expect(getPlugins().map((plugin) => plugin.manifest.name)).toEqual([]);
     expect(getPluginProviders()).toEqual([]);
   });
 
@@ -411,7 +415,9 @@ describe("createApp plugin config", () => {
     expect(getPluginProviders().map((plugin) => plugin.manifest.name)).toEqual([
       "example",
     ]);
-    expect(getAgentPlugins().map((plugin) => plugin.name)).toEqual(["example"]);
+    expect(getPlugins().map((plugin) => plugin.manifest.name)).toEqual([
+      "example",
+    ]);
   });
 
   it("does not assign app skills to runtime hook inline plugins", async () => {
@@ -537,7 +543,7 @@ describe("createApp plugin config", () => {
       'Plugin "invalid" manifest.domains requires egress credential hooks when no generic credentials or apiHeaders are configured.',
     );
 
-    expect(getAgentPlugins().map((plugin) => plugin.name)).toEqual([]);
+    expect(getPlugins().map((plugin) => plugin.manifest.name)).toEqual([]);
     expect(getPluginProviders()).toEqual([]);
   });
 
@@ -577,7 +583,9 @@ describe("createApp plugin config", () => {
     expect(getPluginProviders().map((plugin) => plugin.manifest.name)).toEqual([
       "hooked",
     ]);
-    expect(getAgentPlugins().map((plugin) => plugin.name)).toEqual(["hooked"]);
+    expect(getPlugins().map((plugin) => plugin.manifest.name)).toEqual([
+      "hooked",
+    ]);
   });
 
   it("loads manifest-only package plugins by package name", async () => {
@@ -600,7 +608,7 @@ describe("createApp plugin config", () => {
       plugins: defineJuniorPlugins(["@acme/full-plugin"]),
     });
 
-    expect(getAgentPlugins().map((plugin) => plugin.name)).toEqual([]);
+    expect(getPlugins().map((plugin) => plugin.manifest.name)).toEqual([]);
     expect(getPluginProviders().map((plugin) => plugin.manifest.name)).toEqual([
       "full",
     ]);
@@ -630,7 +638,7 @@ describe("createApp plugin config", () => {
       ]),
     ).toThrow('Duplicate plugin registration name "dupe"');
 
-    expect(getAgentPlugins().map((plugin) => plugin.name)).toEqual([]);
+    expect(getPlugins().map((plugin) => plugin.manifest.name)).toEqual([]);
     expect(getPluginProviders()).toEqual([]);
   });
 
@@ -652,33 +660,20 @@ describe("createApp plugin config", () => {
       'Junior plugin registration name "GitHub" must be a lowercase plugin identifier',
     );
 
-    expect(getAgentPlugins().map((plugin) => plugin.name)).toEqual([]);
+    expect(getPlugins().map((plugin) => plugin.manifest.name)).toEqual([]);
     expect(getPluginProviders()).toEqual([]);
   });
 
-  it("rejects legacy state prefixes outside the plugin namespace", async () => {
-    await createApp({
-      plugins: defineJuniorPlugins([]),
-    });
-
-    await expect(
-      createApp({
-        plugins: defineJuniorPlugins([
-          defineJuniorPlugin({
-            manifest: {
-              name: "hooked",
-              displayName: "Hooked",
-              description: "Runtime plugin",
-            },
-            legacyStatePrefixes: ["junior:scheduler"],
-          }),
-        ]),
-      }),
-    ).rejects.toThrow(
-      'Plugin "hooked" legacy state prefix "junior:scheduler" must stay under "junior:hooked"',
-    );
-
-    expect(getAgentPlugins().map((plugin) => plugin.name)).toEqual([]);
-    expect(getPluginProviders()).toEqual([]);
+  it("rejects top-level plugin registration names", () => {
+    expect(() =>
+      defineJuniorPlugin({
+        name: "legacy",
+        manifest: {
+          name: "legacy",
+          displayName: "Legacy",
+          description: "Legacy plugin",
+        },
+      } as Parameters<typeof defineJuniorPlugin>[0] & { name: string }),
+    ).toThrow("defineJuniorPlugin() uses manifest.name for identity.");
   });
 });

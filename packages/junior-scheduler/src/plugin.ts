@@ -1,15 +1,19 @@
 import {
   defineJuniorPlugin,
   type Dispatch,
-  type AgentPluginToolDefinition,
+  type PluginDb,
+  type PluginToolDefinition,
   type PluginOperationalReportContent,
+  type PluginReadState,
+  type PluginState,
   type SlackDestination,
   type ToolRegistrationHookContext,
 } from "@sentry/junior-plugin-api";
 import { buildScheduledTaskRunPrompt } from "./prompt";
 import {
-  createSchedulerOperationalStore,
-  createSchedulerStore,
+  createSchedulerOperationalSqlStore,
+  createSchedulerSqlStore,
+  migrateSchedulerStateToSql,
   type SchedulerOperationalStore,
   type SchedulerStore,
 } from "./store";
@@ -30,6 +34,22 @@ import {
 
 const SCHEDULER_HEARTBEAT_LIMIT = 10;
 const DASHBOARD_TABLE_LIMIT = 5;
+
+function schedulerStore(ctx: { db?: PluginDb }): SchedulerStore {
+  if (!ctx.db) {
+    throw new Error("Scheduler plugin requires ctx.db");
+  }
+  return createSchedulerSqlStore(ctx.db);
+}
+
+function schedulerOperationalStore(ctx: {
+  db?: PluginDb;
+}): SchedulerOperationalStore {
+  if (!ctx.db) {
+    throw new Error("Scheduler plugin requires ctx.db");
+  }
+  return createSchedulerOperationalSqlStore(ctx.db);
+}
 
 function shouldSkipRun(
   task: ScheduledTask,
@@ -64,7 +84,7 @@ function createSchedulerToolContext(
           }
         : undefined,
     requester: ctx.requester?.platform === "slack" ? ctx.requester : undefined,
-    state: ctx.state,
+    store: schedulerStore(ctx),
     userText: ctx.userText,
   };
 }
@@ -73,7 +93,7 @@ async function applyDispatchResult(args: {
   dispatch: Dispatch;
   nowMs: number;
   run: ScheduledRun;
-  store: ReturnType<typeof createSchedulerStore>;
+  store: SchedulerStore;
 }): Promise<boolean> {
   if (args.dispatch.status === "completed") {
     const completed = await args.store.markRunCompleted({
@@ -362,19 +382,20 @@ async function buildSchedulerOperationalReport(args: {
 /** Create Junior's built-in trusted scheduler plugin. */
 export function createSchedulerPlugin() {
   return defineJuniorPlugin({
+    database: {},
     manifest: {
       name: "scheduler",
       displayName: "Scheduler",
       description: "Scheduled Junior task management and heartbeat dispatch",
     },
-    legacyStatePrefixes: ["junior:scheduler"],
+    packageName: "@sentry/junior-scheduler",
     hooks: {
       tools(ctx) {
         if (
           ctx.source.platform !== "slack" ||
           ctx.requester?.platform !== "slack"
         ) {
-          return {} as Record<string, AgentPluginToolDefinition<any>>;
+          return {} as Record<string, PluginToolDefinition<any>>;
         }
         const context = createSchedulerToolContext(ctx);
         return {
@@ -383,10 +404,10 @@ export function createSchedulerPlugin() {
           slackScheduleUpdateTask: createSlackScheduleUpdateTaskTool(context),
           slackScheduleDeleteTask: createSlackScheduleDeleteTaskTool(context),
           slackScheduleRunTaskNow: createSlackScheduleRunTaskNowTool(context),
-        } satisfies Record<string, AgentPluginToolDefinition<any>>;
+        } satisfies Record<string, PluginToolDefinition<any>>;
       },
       async heartbeat(ctx) {
-        const store = createSchedulerStore(ctx.state);
+        const store = schedulerStore(ctx);
         let processedCount = 0;
         let dispatchCount = 0;
         for (const run of await store.listIncompleteRuns()) {
@@ -504,7 +525,16 @@ export function createSchedulerPlugin() {
       async operationalReport(ctx) {
         return buildSchedulerOperationalReport({
           nowMs: ctx.nowMs,
-          store: createSchedulerOperationalStore(ctx.state),
+          store: schedulerOperationalStore(ctx),
+        });
+      },
+      async migrateStorage(ctx) {
+        if (!ctx.db) {
+          throw new Error("Scheduler storage migration requires ctx.db");
+        }
+        return await migrateSchedulerStateToSql({
+          db: ctx.db,
+          state: ctx.state,
         });
       },
     },

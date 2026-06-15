@@ -3,8 +3,9 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { generateKeyPairSync } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { fileURLToPath } from "node:url";
+import { vi } from "vitest";
 import type { Message } from "chat";
-import type { Destination } from "@sentry/junior-plugin-api";
+import type { Destination, PluginDb } from "@sentry/junior-plugin-api";
 import {
   interceptTestHttp,
   resetTestGitHubHttpFixtures,
@@ -30,12 +31,20 @@ import {
   deleteMcpStoredOAuthCredentials,
   getLatestMcpAuthSessionForUserProvider,
 } from "@/chat/mcp/auth-store";
-import { getAgentPlugins, setAgentPlugins } from "@/chat/plugins/agent-hooks";
+import { getPlugins, setPlugins } from "@/chat/plugins/agent-hooks";
+import {
+  createPluginDbForExecutor,
+  migratePluginSchemas,
+  readPluginMigrations,
+} from "@/chat/plugins/db";
+import * as pluginDbModule from "@/chat/plugins/db";
 import {
   getPluginOAuthConfig,
   setPluginCatalogConfig,
 } from "@/chat/plugins/registry";
 import { generateAssistantReply } from "@/chat/respond";
+import type { JuniorDatabase } from "@/chat/sql/db";
+import { juniorSqlSchema } from "@/chat/sql/schema";
 import { schedulerPlugin } from "@sentry/junior-scheduler";
 import { getStateAdapter } from "@/chat/state/adapter";
 import { resetSkillDiscoveryCache } from "@/chat/skills";
@@ -65,6 +74,10 @@ import {
   readCapturedSlackApiCalls,
   type CapturedSlackApiCall,
 } from "@junior-tests/msw/captured-slack-api-calls";
+import {
+  createLocalPgliteFixture,
+  type LocalPgliteFixture,
+} from "@sentry/junior-test-fixtures/pglite";
 import { createSlackDestination } from "@/chat/destination";
 import { ALL as sandboxEgressProxyALL } from "@/handlers/sandbox-egress-proxy";
 import { createMockImageGenerateDeps } from "./fixtures/image-generate";
@@ -390,7 +403,12 @@ function toEvalToolInvocation(input: {
 const EVAL_PACKAGE_ROOT = path.resolve(
   fileURLToPath(new URL("..", import.meta.url)),
 );
+const SCHEDULER_MIGRATIONS_DIR = path.resolve(
+  EVAL_PACKAGE_ROOT,
+  "../junior-scheduler/migrations",
+);
 type HarnessStateAdapter = ReturnType<typeof getStateAdapter>;
+type EvalSchedulerSqlFixture = LocalPgliteFixture<JuniorDatabase>;
 
 const THREAD_STATE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const EVAL_SLACK_TEAM_ID = "TEVAL";
@@ -431,6 +449,25 @@ function createEvalDestination(thread: TestThread): Destination {
     throw new Error("Eval Slack destination requires a Slack channel id");
   }
   return destination;
+}
+
+async function createEvalSchedulerSqlFixture(): Promise<{
+  db: PluginDb;
+  fixture: EvalSchedulerSqlFixture;
+}> {
+  const fixture =
+    await createLocalPgliteFixture<JuniorDatabase>(juniorSqlSchema);
+  await migratePluginSchemas(
+    fixture,
+    readPluginMigrations({
+      dir: SCHEDULER_MIGRATIONS_DIR,
+      pluginName: "scheduler",
+    }),
+  );
+  return {
+    db: createPluginDbForExecutor(fixture),
+    fixture,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1694,13 +1731,29 @@ export async function runEvalScenario(
 ): Promise<EvalResult> {
   const logRecords = options.logRecords ?? [];
   const env = await setupHarnessEnvironment(scenario);
-  let previousAgentPlugins: ReturnType<typeof setAgentPlugins> | undefined;
+  let previousPlugins: ReturnType<typeof setPlugins> | undefined;
+  let schedulerSqlFixture: EvalSchedulerSqlFixture | undefined;
+  let pluginDbSpy: { mockRestore(): void } | undefined;
 
   try {
-    const currentAgentPlugins = getAgentPlugins();
-    previousAgentPlugins = setAgentPlugins([
+    const getPluginDbForRegistration =
+      pluginDbModule.getPluginDbForRegistration;
+    const schedulerSql = await createEvalSchedulerSqlFixture();
+    schedulerSqlFixture = schedulerSql.fixture;
+    pluginDbSpy = vi
+      .spyOn(pluginDbModule, "getPluginDbForRegistration")
+      .mockImplementation((plugin) =>
+        plugin.manifest.name === "scheduler"
+          ? schedulerSql.db
+          : getPluginDbForRegistration(plugin),
+      );
+
+    const currentPlugins = getPlugins();
+    previousPlugins = setPlugins([
       schedulerPlugin(),
-      ...currentAgentPlugins.filter((plugin) => plugin.name !== "scheduler"),
+      ...currentPlugins.filter(
+        (plugin) => plugin.manifest.name !== "scheduler",
+      ),
     ]);
 
     const slackAdapter = new FakeSlackAdapter();
@@ -1771,9 +1824,11 @@ export async function runEvalScenario(
       observations,
     );
   } finally {
-    if (previousAgentPlugins) {
-      setAgentPlugins(previousAgentPlugins);
+    if (previousPlugins) {
+      setPlugins(previousPlugins);
     }
+    pluginDbSpy?.mockRestore();
+    await schedulerSqlFixture?.close();
     await teardownHarnessEnvironment(scenario, env);
   }
 }

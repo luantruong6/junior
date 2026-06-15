@@ -3,7 +3,7 @@
 ## Metadata
 
 - Created: 2026-03-03
-- Last Edited: 2026-06-12
+- Last Edited: 2026-06-13
 
 ## Purpose
 
@@ -47,6 +47,10 @@ Define spec taxonomy, naming conventions, and canonical source-of-truth document
 - `specs/scheduler.md`
 - `specs/plugin-heartbeat.md`
 - `specs/plugin-dispatch.md`
+- `specs/plugin-prompt-hooks.md`
+- `specs/plugin-database.md`
+- `specs/plugin-cli.md`
+- `specs/memory-plugin/index.md`
 - `specs/harness-agent.md`
 - `specs/agent-session-resumability.md`
 - `specs/agent-execution.md`
@@ -75,6 +79,9 @@ For chat/agent/Slack execution and response behavior:
 - `specs/chat-architecture.md` owns the end-to-end platform-event-to-agent-run data flow, platform adapter boundary, data authority map, and module boundaries.
 - `specs/task-execution.md` owns durable conversation mailbox execution, queue wake-up semantics, conversation leases, cooperative yield, and heartbeat repair.
 - `specs/conversation-storage.md` owns SQL-backed queryable conversation record, transcript-storage exclusions, and Vercel-safe migration/backfill behavior.
+- `specs/plugin-database.md` owns plugin packaged SQL migration discovery/application and the trusted `ctx.db` hook surface.
+- `specs/plugin-cli.md` owns future plugin-contributed host CLI command discovery, dispatch, admin context, and redaction contracts.
+- `specs/memory-plugin/index.md` owns the long-term memory plugin's storage, recall, passive learning, tools, visibility, and lifecycle contracts.
 - `specs/local-agent.md` owns local CLI/local adapter user flows, identity, state, delivery, and verification contracts.
 - `specs/agent-turn-handling.md` owns user-message response policy: when Junior answers, stays silent, asks, uses tools, satisfies Slack side effects, handles resumed turns, and considers a turn complete.
 - `specs/agent-execution.md` owns coding-agent execution discipline and the repository-wide model-repairable tool failure contract.

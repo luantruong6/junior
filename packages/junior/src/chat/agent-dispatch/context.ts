@@ -1,6 +1,10 @@
-import type { HeartbeatHookContext } from "@sentry/junior-plugin-api";
+import type {
+  HeartbeatHookContext,
+  PluginRegistration,
+} from "@sentry/junior-plugin-api";
 import { bindSlackDirectCredentialSubject } from "@/chat/credentials/subject";
-import { createAgentPluginLogger } from "@/chat/plugins/logging";
+import { getPluginDbForRegistration } from "@/chat/plugins/db";
+import { createPluginLogger } from "@/chat/plugins/logging";
 import { createPluginState } from "@/chat/plugins/state";
 import {
   createOrGetDispatch,
@@ -64,18 +68,22 @@ function bindDispatchCredentialSubject(
 
 /** Build the plugin-scoped heartbeat context that gates durable dispatch access. */
 export function createHeartbeatContext(args: {
-  legacyStatePrefixes?: string[];
   nowMs: number;
-  plugin: string;
+  plugin: string | PluginRegistration;
 }): HeartbeatHookContext {
+  const pluginName =
+    typeof args.plugin === "string" ? args.plugin : args.plugin.manifest.name;
+  const db =
+    typeof args.plugin === "string"
+      ? undefined
+      : getPluginDbForRegistration(args.plugin);
   let dispatchCount = 0;
   return {
-    plugin: { name: args.plugin },
+    plugin: { name: pluginName },
     nowMs: args.nowMs,
-    state: createPluginState(args.plugin, {
-      legacyStatePrefixes: args.legacyStatePrefixes,
-    }),
-    log: createAgentPluginLogger(args.plugin),
+    ...(db ? { db } : {}),
+    state: createPluginState(pluginName),
+    log: createPluginLogger(pluginName),
     agent: {
       async dispatch(options) {
         validateDispatchOptions(options);
@@ -85,7 +93,7 @@ export function createHeartbeatContext(args: {
         }
         await verifyDispatchCredentialSubjectAccess(dispatchOptions);
         const result = await createOrGetDispatch({
-          plugin: args.plugin,
+          plugin: pluginName,
           options: dispatchOptions,
           nowMs: args.nowMs,
         });
@@ -103,7 +111,7 @@ export function createHeartbeatContext(args: {
       },
       async get(id) {
         return await getPluginDispatchProjection({
-          plugin: args.plugin,
+          plugin: pluginName,
           id,
         });
       },

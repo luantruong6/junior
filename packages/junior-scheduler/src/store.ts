@@ -1,10 +1,12 @@
 import {
-  agentPluginCredentialSubjectSchema,
+  pluginCredentialSubjectSchema,
   destinationSchema,
   isSlackDestination,
-  type AgentPluginReadState,
-  type AgentPluginState,
+  type PluginDb,
+  type PluginReadState,
+  type PluginState,
 } from "@sentry/junior-plugin-api";
+import { z } from "zod";
 import { getNextRunAtMs } from "./cadence";
 import type { ScheduledRun, ScheduledTask } from "./types";
 
@@ -15,6 +17,101 @@ const CLAIM_TTL_MS = 6 * 60 * 60 * 1000;
 const PENDING_CLAIM_STALE_MS = 60_000;
 const MISSED_RUN_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const LOCK_TTL_MS = 10_000;
+const SQL_INCOMPLETE_RUN_STATUSES = ["pending", "running"] as const;
+const slackDestinationSchema = destinationSchema.refine(isSlackDestination);
+const taskPrincipalSchema = z
+  .object({
+    slackUserId: z.string(),
+    fullName: z.string().optional(),
+    userName: z.string().optional(),
+  })
+  .strict();
+const recurrenceSchema = z
+  .object({
+    dayOfMonth: z.number().optional(),
+    frequency: z.enum(["daily", "weekly", "monthly", "yearly"]),
+    interval: z.number(),
+    month: z.number().optional(),
+    startDate: z.string(),
+    time: z
+      .object({
+        hour: z.number(),
+        minute: z.number(),
+      })
+      .strict(),
+    weekdays: z.array(z.number()).optional(),
+  })
+  .strict();
+const taskScheduleSchema = z
+  .object({
+    description: z.string(),
+    kind: z.enum(["one_off", "recurring"]),
+    recurrence: recurrenceSchema.optional(),
+    timezone: z.string(),
+  })
+  .strict();
+const taskSpecSchema = z
+  .object({
+    text: z.string(),
+  })
+  .strict();
+const taskRecordSchema = z
+  .object({
+    id: z.string(),
+    conversationAccess: z
+      .object({
+        audience: z.enum(["direct", "group", "channel"]),
+        visibility: z.enum(["private", "public", "unknown"]),
+      })
+      .strict()
+      .optional(),
+    createdAtMs: z.number(),
+    createdBy: taskPrincipalSchema,
+    credentialSubject: pluginCredentialSubjectSchema.optional(),
+    destination: slackDestinationSchema,
+    executionActor: z
+      .object({
+        type: z.literal("system"),
+        id: z.string(),
+      })
+      .strict()
+      .optional(),
+    lastRunAtMs: z.number().optional(),
+    nextRunAtMs: z.number().optional(),
+    originalRequest: z.string().optional(),
+    runNowAtMs: z.number().optional(),
+    schedule: taskScheduleSchema,
+    status: z.enum(["active", "paused", "blocked", "deleted"]),
+    statusReason: z.string().optional(),
+    task: taskSpecSchema,
+    updatedAtMs: z.number(),
+    version: z.number(),
+  })
+  .strict();
+const runRecordSchema = z
+  .object({
+    id: z.string(),
+    attempt: z.number(),
+    claimedAtMs: z.number(),
+    completedAtMs: z.number().optional(),
+    dispatchId: z.string().optional(),
+    errorMessage: z.string().optional(),
+    idempotencyKey: z.string(),
+    resultMessageTs: z.string().optional(),
+    scheduledForMs: z.number(),
+    startedAtMs: z.number().optional(),
+    status: z.enum([
+      "pending",
+      "running",
+      "completed",
+      "failed",
+      "blocked",
+      "skipped",
+    ]),
+    taskId: z.string(),
+    taskVersion: z.number(),
+  })
+  .strict();
 
 export interface SchedulerStore {
   claimDueRun(args: { nowMs: number }): Promise<ScheduledRun | undefined>;
@@ -107,7 +204,7 @@ function unique(values: string[]): string[] {
 }
 
 async function withLock<T>(
-  state: AgentPluginState,
+  state: PluginState,
   key: string,
   callback: () => Promise<T>,
 ): Promise<T> {
@@ -115,7 +212,7 @@ async function withLock<T>(
 }
 
 async function addToIndex(
-  state: AgentPluginState,
+  state: PluginState,
   key: string,
   taskId: string,
 ): Promise<void> {
@@ -128,7 +225,7 @@ async function addToIndex(
 }
 
 async function removeFromIndex(
-  state: AgentPluginState,
+  state: PluginState,
   key: string,
   taskId: string,
 ): Promise<void> {
@@ -151,7 +248,7 @@ async function removeFromIndex(
 }
 
 async function getIndex(
-  state: AgentPluginReadState,
+  state: PluginReadState,
   key: string,
 ): Promise<string[]> {
   const values = (await state.get<string[]>(key)) ?? [];
@@ -161,7 +258,7 @@ async function getIndex(
 }
 
 async function clearActiveRun(
-  state: AgentPluginState,
+  state: PluginState,
   taskId: string,
   runId: string,
 ): Promise<void> {
@@ -174,7 +271,7 @@ async function clearActiveRun(
 }
 
 async function clearStaleActiveRun(
-  state: AgentPluginState,
+  state: PluginState,
   taskId: string,
   nowMs: number,
 ): Promise<boolean> {
@@ -188,8 +285,7 @@ async function clearStaleActiveRun(
     return true;
   }
 
-  const activeRun =
-    (await state.get<ScheduledRun>(runKey(active.runId))) ?? undefined;
+  const activeRun = parseStoredRun(await state.get(runKey(active.runId)));
   if (!isStaleActiveRun(active, activeRun, nowMs)) {
     return false;
   }
@@ -358,27 +454,34 @@ function canFinishRun(
   return run.status === "running" && run.startedAtMs === startedAtMs;
 }
 
+/** Decode retained scheduler task state, skipping invalid legacy records. */
 function parseStoredTask(value: unknown): ScheduledTask | undefined {
-  if (!value || typeof value !== "object") {
-    return undefined;
+  const parsed = taskRecordSchema.safeParse(parseJsonRecord(value));
+  return parsed.success ? parsed.data : undefined;
+}
+
+/** Decode retained scheduler run state, skipping invalid legacy records. */
+function parseStoredRun(value: unknown): ScheduledRun | undefined {
+  const parsed = runRecordSchema.safeParse(parseJsonRecord(value));
+  return parsed.success ? parsed.data : undefined;
+}
+
+function parseJsonRecord<T>(value: unknown): T | undefined {
+  if (typeof value === "string") {
+    try {
+      return JSON.parse(value) as T;
+    } catch {
+      return undefined;
+    }
   }
-  const record = value as Partial<ScheduledTask>;
-  const destination = destinationSchema.safeParse(record.destination);
-  if (!destination.success || !isSlackDestination(destination.data)) {
-    return undefined;
+  if (value && typeof value === "object") {
+    return value as T;
   }
-  const credentialSubject =
-    record.credentialSubject === undefined
-      ? undefined
-      : agentPluginCredentialSubjectSchema.safeParse(record.credentialSubject);
-  if (credentialSubject && !credentialSubject.success) {
-    return undefined;
-  }
-  return {
-    ...(record as ScheduledTask),
-    destination: destination.data,
-    ...(credentialSubject ? { credentialSubject: credentialSubject.data } : {}),
-  };
+  return undefined;
+}
+
+function present<T>(value: T | undefined): value is T {
+  return value !== undefined;
 }
 
 function requireStoredTask(task: ScheduledTask): ScheduledTask {
@@ -390,14 +493,14 @@ function requireStoredTask(task: ScheduledTask): ScheduledTask {
 }
 
 async function getTaskFromState(
-  state: AgentPluginReadState,
+  state: PluginReadState,
   taskId: string,
 ): Promise<ScheduledTask | undefined> {
   return parseStoredTask(await state.get(taskKey(taskId)));
 }
 
 async function listTasksFromState(
-  state: AgentPluginReadState,
+  state: PluginReadState,
   indexKey: string,
 ): Promise<ScheduledTask[]> {
   const ids = await getIndex(state, indexKey);
@@ -409,14 +512,14 @@ async function listTasksFromState(
 }
 
 async function getRunFromState(
-  state: AgentPluginReadState,
+  state: PluginReadState,
   runId: string,
 ): Promise<ScheduledRun | undefined> {
-  return (await state.get<ScheduledRun>(runKey(runId))) ?? undefined;
+  return parseStoredRun(await state.get(runKey(runId)));
 }
 
 async function listIncompleteRunsForTasksFromState(
-  state: AgentPluginReadState,
+  state: PluginReadState,
   tasks: ScheduledTask[],
 ): Promise<ScheduledRun[]> {
   const runs: ScheduledRun[] = [];
@@ -434,9 +537,9 @@ async function listIncompleteRunsForTasksFromState(
 }
 
 class PluginStateSchedulerOperationalStore implements SchedulerOperationalStore {
-  private readonly state: AgentPluginReadState;
+  private readonly state: PluginReadState;
 
-  constructor(state: AgentPluginReadState) {
+  constructor(state: PluginReadState) {
     this.state = state;
   }
 
@@ -452,9 +555,9 @@ class PluginStateSchedulerOperationalStore implements SchedulerOperationalStore 
 }
 
 class PluginStateSchedulerStore implements SchedulerStore {
-  private readonly state: AgentPluginState;
+  private readonly state: PluginState;
 
-  constructor(state: AgentPluginState) {
+  constructor(state: PluginState) {
     this.state = state;
   }
 
@@ -903,13 +1006,747 @@ class PluginStateSchedulerStore implements SchedulerStore {
 }
 
 /** Create a scheduler store backed by this plugin's durable state namespace. */
-export function createSchedulerStore(state: AgentPluginState): SchedulerStore {
+export function createSchedulerStore(state: PluginState): SchedulerStore {
   return new PluginStateSchedulerStore(state);
 }
 
 /** Create a read-only scheduler store for operational reporting. */
 export function createSchedulerOperationalStore(
-  state: AgentPluginReadState,
+  state: PluginReadState,
 ): SchedulerOperationalStore {
   return new PluginStateSchedulerOperationalStore(state);
+}
+
+type SchedulerTaskRow = {
+  record: unknown;
+};
+
+type SchedulerRunRow = {
+  record: unknown;
+};
+
+/** Decode scheduler SQL task records and reject rows unsafe for scan paths. */
+function parseSqlTaskRecord(value: unknown): ScheduledTask | undefined {
+  const parsed = taskRecordSchema.safeParse(parseJsonRecord(value));
+  return parsed.success ? parsed.data : undefined;
+}
+
+function parseSqlTaskRow(row: SchedulerTaskRow): ScheduledTask | undefined {
+  return parseSqlTaskRecord(row.record);
+}
+
+/** Decode scheduler SQL run records and reject rows unsafe for scan paths. */
+function parseSqlRunRow(row: SchedulerRunRow): ScheduledRun | undefined {
+  const parsed = runRecordSchema.safeParse(parseJsonRecord(row.record));
+  return parsed.success ? parsed.data : undefined;
+}
+
+function json(value: unknown): string {
+  return JSON.stringify(value);
+}
+
+async function withSqlLock<T>(
+  db: PluginDb,
+  key: string,
+  callback: (db: PluginDb) => Promise<T>,
+): Promise<T> {
+  return await db.transaction(async (tx) => {
+    await tx.execute("SELECT pg_advisory_xact_lock(hashtext($1))", [key]);
+    return await callback(tx);
+  });
+}
+
+async function upsertSqlTask(db: PluginDb, task: ScheduledTask): Promise<void> {
+  await db.execute(
+    `
+INSERT INTO junior_scheduler_tasks (
+  id,
+  team_id,
+  status,
+  next_run_at_ms,
+  run_now_at_ms,
+  created_at_ms,
+  updated_at_ms,
+  version,
+  destination,
+  created_by,
+  conversation_access,
+  credential_subject,
+  execution_actor,
+  last_run_at_ms,
+  original_request,
+  schedule,
+  status_reason,
+  task,
+  record
+) VALUES (
+  $1, $2, $3, $4, $5, $6, $7, $8,
+  $9::jsonb, $10::jsonb, $11::jsonb, $12::jsonb, $13::jsonb,
+  $14, $15, $16::jsonb, $17, $18::jsonb, $19::jsonb
+)
+ON CONFLICT (id) DO UPDATE SET
+  team_id = EXCLUDED.team_id,
+  status = EXCLUDED.status,
+  next_run_at_ms = EXCLUDED.next_run_at_ms,
+  run_now_at_ms = EXCLUDED.run_now_at_ms,
+  created_at_ms = EXCLUDED.created_at_ms,
+  updated_at_ms = EXCLUDED.updated_at_ms,
+  version = EXCLUDED.version,
+  destination = EXCLUDED.destination,
+  created_by = EXCLUDED.created_by,
+  conversation_access = EXCLUDED.conversation_access,
+  credential_subject = EXCLUDED.credential_subject,
+  execution_actor = EXCLUDED.execution_actor,
+  last_run_at_ms = EXCLUDED.last_run_at_ms,
+  original_request = EXCLUDED.original_request,
+  schedule = EXCLUDED.schedule,
+  status_reason = EXCLUDED.status_reason,
+  task = EXCLUDED.task,
+  record = EXCLUDED.record
+`,
+    [
+      task.id,
+      task.destination.teamId,
+      task.status,
+      task.nextRunAtMs ?? null,
+      task.runNowAtMs ?? null,
+      task.createdAtMs,
+      task.updatedAtMs,
+      task.version,
+      json(task.destination),
+      json(task.createdBy),
+      task.conversationAccess ? json(task.conversationAccess) : null,
+      task.credentialSubject ? json(task.credentialSubject) : null,
+      task.executionActor ? json(task.executionActor) : null,
+      task.lastRunAtMs ?? null,
+      task.originalRequest ?? null,
+      json(task.schedule),
+      task.statusReason ?? null,
+      json(task.task),
+      json(task),
+    ],
+  );
+}
+
+async function upsertSqlRun(db: PluginDb, run: ScheduledRun): Promise<void> {
+  await db.execute(
+    `
+INSERT INTO junior_scheduler_runs (
+  id,
+  task_id,
+  status,
+  claimed_at_ms,
+  scheduled_for_ms,
+  started_at_ms,
+  completed_at_ms,
+  dispatch_id,
+  error_message,
+  idempotency_key,
+  result_message_ts,
+  task_version,
+  attempt,
+  record
+) VALUES (
+  $1, $2, $3, $4, $5, $6, $7, $8,
+  $9, $10, $11, $12, $13, $14::jsonb
+)
+ON CONFLICT (id) DO UPDATE SET
+  task_id = EXCLUDED.task_id,
+  status = EXCLUDED.status,
+  claimed_at_ms = EXCLUDED.claimed_at_ms,
+  scheduled_for_ms = EXCLUDED.scheduled_for_ms,
+  started_at_ms = EXCLUDED.started_at_ms,
+  completed_at_ms = EXCLUDED.completed_at_ms,
+  dispatch_id = EXCLUDED.dispatch_id,
+  error_message = EXCLUDED.error_message,
+  idempotency_key = EXCLUDED.idempotency_key,
+  result_message_ts = EXCLUDED.result_message_ts,
+  task_version = EXCLUDED.task_version,
+  attempt = EXCLUDED.attempt,
+  record = EXCLUDED.record
+`,
+    [
+      run.id,
+      run.taskId,
+      run.status,
+      run.claimedAtMs,
+      run.scheduledForMs,
+      run.startedAtMs ?? null,
+      run.completedAtMs ?? null,
+      run.dispatchId ?? null,
+      run.errorMessage ?? null,
+      run.idempotencyKey,
+      run.resultMessageTs ?? null,
+      run.taskVersion,
+      run.attempt,
+      json(run),
+    ],
+  );
+}
+
+async function getTaskFromSql(
+  db: PluginDb,
+  taskId: string,
+): Promise<ScheduledTask | undefined> {
+  const rows = await db.query<SchedulerTaskRow>(
+    "SELECT record FROM junior_scheduler_tasks WHERE id = $1",
+    [taskId],
+  );
+  return rows[0] ? parseSqlTaskRow(rows[0]) : undefined;
+}
+
+async function getRunFromSql(
+  db: PluginDb,
+  runId: string,
+): Promise<ScheduledRun | undefined> {
+  const rows = await db.query<SchedulerRunRow>(
+    "SELECT record FROM junior_scheduler_runs WHERE id = $1",
+    [runId],
+  );
+  return rows[0] ? parseSqlRunRow(rows[0]) : undefined;
+}
+
+async function getClaimedRunSlotFromSql(
+  db: PluginDb,
+  runId: string,
+): Promise<ScheduledRun | undefined> {
+  const rows = await db.query<SchedulerRunRow>(
+    "SELECT record FROM junior_scheduler_runs WHERE id = $1",
+    [runId],
+  );
+  return rows[0] ? parseSqlRunRow(rows[0]) : undefined;
+}
+
+async function listTasksFromSql(db: PluginDb): Promise<ScheduledTask[]> {
+  const rows = await db.query<SchedulerTaskRow>(
+    `
+SELECT record
+FROM junior_scheduler_tasks
+WHERE status <> 'deleted'
+ORDER BY created_at_ms ASC, id ASC
+`,
+  );
+  return rows.map(parseSqlTaskRow).filter(present);
+}
+
+async function listTasksForTeamFromSql(
+  db: PluginDb,
+  teamId: string,
+): Promise<ScheduledTask[]> {
+  const rows = await db.query<SchedulerTaskRow>(
+    `
+SELECT record
+FROM junior_scheduler_tasks
+WHERE team_id = $1
+  AND status <> 'deleted'
+ORDER BY created_at_ms ASC, id ASC
+`,
+    [teamId],
+  );
+  return rows.map(parseSqlTaskRow).filter(present);
+}
+
+async function listIncompleteRunsForTasksFromSql(
+  db: PluginDb,
+  tasks: ScheduledTask[],
+): Promise<ScheduledRun[]> {
+  if (tasks.length === 0) {
+    return [];
+  }
+  const rows = await db.query<SchedulerRunRow>(
+    `
+SELECT record
+FROM junior_scheduler_runs
+WHERE task_id = ANY($1)
+  AND status = ANY($2)
+ORDER BY scheduled_for_ms ASC, id ASC
+`,
+    [tasks.map((task) => task.id), [...SQL_INCOMPLETE_RUN_STATUSES]],
+  );
+  return rows.map(parseSqlRunRow).filter(present);
+}
+
+class SqlSchedulerStore implements SchedulerStore, SchedulerOperationalStore {
+  constructor(private readonly db: PluginDb) {}
+
+  async saveTask(task: ScheduledTask): Promise<void> {
+    const next = requireStoredTask(task);
+    await withSqlLock(this.db, taskLockKey(task.id), async (db) => {
+      const current = await getTaskFromSql(db, task.id);
+      await this.saveTaskRecord(db, next, current);
+    });
+  }
+
+  private async saveTaskRecord(
+    db: PluginDb,
+    task: ScheduledTask,
+    current: ScheduledTask | undefined,
+  ): Promise<void> {
+    // Reactivation intentionally forgets the blocked slot so authorization or
+    // configuration fixes can dispatch the same scheduled occurrence again.
+    if (
+      current?.status === "blocked" &&
+      task.status === "active" &&
+      typeof task.nextRunAtMs === "number" &&
+      Number.isFinite(task.nextRunAtMs)
+    ) {
+      await db.execute(
+        "DELETE FROM junior_scheduler_runs WHERE id = $1 AND status = 'blocked'",
+        [buildRunId(task.id, task.nextRunAtMs)],
+      );
+    }
+    await upsertSqlTask(db, task);
+  }
+
+  async getTask(taskId: string): Promise<ScheduledTask | undefined> {
+    return await getTaskFromSql(this.db, taskId);
+  }
+
+  async listTasks(): Promise<ScheduledTask[]> {
+    return await listTasksFromSql(this.db);
+  }
+
+  async listTasksForTeam(teamId: string): Promise<ScheduledTask[]> {
+    return await listTasksForTeamFromSql(this.db, teamId);
+  }
+
+  async claimDueRun(args: {
+    nowMs: number;
+  }): Promise<ScheduledRun | undefined> {
+    return await withSqlLock(this.db, "junior:scheduler:claim", async (db) => {
+      const rows = await db.query<SchedulerTaskRow>(
+        `
+SELECT record
+FROM junior_scheduler_tasks
+WHERE status = 'active'
+  AND (
+    (run_now_at_ms IS NOT NULL AND run_now_at_ms <= $1)
+    OR (next_run_at_ms IS NOT NULL AND next_run_at_ms <= $1)
+  )
+ORDER BY created_at_ms ASC, id ASC
+`,
+        [args.nowMs],
+      );
+
+      for (const row of rows) {
+        const task = parseSqlTaskRow(row);
+        if (!task) {
+          continue;
+        }
+        const scheduledForMs = getDueRunAtMs(task, args.nowMs);
+        if (scheduledForMs === undefined) {
+          continue;
+        }
+        const runId = buildRunId(task.id, scheduledForMs);
+        const incompleteRuns = await listIncompleteRunsForTasksFromSql(db, [
+          task,
+        ]);
+        const incompleteRun = incompleteRuns.find((run) => run.id === runId);
+        const blockingRun = incompleteRuns.find(
+          (run) => run.id !== runId && !isStalePendingRun(run, args.nowMs),
+        );
+        if (blockingRun) {
+          continue;
+        }
+        if (incompleteRun) {
+          if (!isStalePendingRun(incompleteRun, args.nowMs)) {
+            continue;
+          }
+          const reclaimed = {
+            ...incompleteRun,
+            attempt: incompleteRun.attempt + 1,
+            claimedAtMs: args.nowMs,
+          };
+          await upsertSqlRun(db, reclaimed);
+          return reclaimed;
+        }
+        const existingRun = await getClaimedRunSlotFromSql(db, runId);
+        if (existingRun) {
+          continue;
+        }
+
+        if (isMissedRunTooOld({ nowMs: args.nowMs, scheduledForMs })) {
+          await this.skipMissedRun(db, {
+            nowMs: args.nowMs,
+            scheduledForMs,
+            task,
+          });
+          continue;
+        }
+
+        const run = buildScheduledRun({
+          claimedAtMs: args.nowMs,
+          scheduledForMs,
+          task,
+        });
+        await upsertSqlRun(db, run);
+        return run;
+      }
+
+      return undefined;
+    });
+  }
+
+  private async skipMissedRun(
+    db: PluginDb,
+    args: {
+      nowMs: number;
+      scheduledForMs: number;
+      task: ScheduledTask;
+    },
+  ): Promise<void> {
+    const current = await getTaskFromSql(db, args.task.id);
+    if (
+      !current ||
+      current.status !== "active" ||
+      getDueRunAtMs(current, args.nowMs) !== args.scheduledForMs
+    ) {
+      return;
+    }
+
+    const duplicateOf = await this.findStaleRecoveryCanonicalTask(db, current);
+    const errorMessage = duplicateOf
+      ? `Duplicate stale scheduled task was skipped without dispatch. Canonical task: ${duplicateOf.id}.`
+      : "Scheduled occurrence was more than 24 hours late and was skipped without dispatch.";
+    await upsertSqlRun(
+      db,
+      buildSkippedScheduledRun({
+        completedAtMs: args.nowMs,
+        errorMessage,
+        scheduledForMs: args.scheduledForMs,
+        task: current,
+      }),
+    );
+
+    const isRunNow = current.runNowAtMs === args.scheduledForMs;
+    let nextRunAtMs: number | undefined;
+    if (!duplicateOf) {
+      nextRunAtMs =
+        isRunNow && current.nextRunAtMs !== args.scheduledForMs
+          ? current.nextRunAtMs
+          : current.schedule.kind === "recurring"
+            ? getNextRunAtMs(current, args.scheduledForMs, args.nowMs)
+            : undefined;
+    }
+    const nextStatus = nextRunAtMs ? "active" : "paused";
+
+    await this.saveTaskRecord(
+      db,
+      {
+        ...current,
+        nextRunAtMs,
+        runNowAtMs: isRunNow ? undefined : current.runNowAtMs,
+        status: nextStatus,
+        statusReason: nextStatus === "paused" ? errorMessage : undefined,
+        updatedAtMs: args.nowMs,
+        version: current.version + 1,
+      },
+      current,
+    );
+  }
+
+  private async findStaleRecoveryCanonicalTask(
+    db: PluginDb,
+    task: ScheduledTask,
+  ): Promise<ScheduledTask | undefined> {
+    const fingerprint = taskDedupeFingerprint(task);
+    const tasks = await listTasksForTeamFromSql(db, task.destination.teamId);
+    return tasks
+      .filter((candidate) => candidate.id !== task.id)
+      .filter(
+        (candidate) =>
+          candidate.status === "active" &&
+          isEarlierTask(candidate, task) &&
+          taskDedupeFingerprint(candidate) === fingerprint,
+      )
+      .sort((a, b) => a.createdAtMs - b.createdAtMs || a.id.localeCompare(b.id))
+      .at(0);
+  }
+
+  async getRun(runId: string): Promise<ScheduledRun | undefined> {
+    return await getRunFromSql(this.db, runId);
+  }
+
+  async listIncompleteRuns(): Promise<ScheduledRun[]> {
+    return await listIncompleteRunsForTasksFromSql(
+      this.db,
+      await this.listTasks(),
+    );
+  }
+
+  async listIncompleteRunsForTasks(
+    tasks: ScheduledTask[],
+  ): Promise<ScheduledRun[]> {
+    return await listIncompleteRunsForTasksFromSql(this.db, tasks);
+  }
+
+  async markRunDispatched(args: {
+    claimedAtMs: number;
+    dispatchId: string;
+    nowMs: number;
+    runId: string;
+  }): Promise<ScheduledRun | undefined> {
+    return await this.updateRun(args.runId, (run) =>
+      run.status === "pending" && run.claimedAtMs === args.claimedAtMs
+        ? {
+            ...run,
+            dispatchId: args.dispatchId,
+            startedAtMs: args.nowMs,
+            status: "running",
+          }
+        : undefined,
+    );
+  }
+
+  async markRunCompleted(args: {
+    completedAtMs: number;
+    resultMessageTs?: string;
+    runId: string;
+    startedAtMs: number;
+  }): Promise<ScheduledRun | undefined> {
+    const next = await this.updateRun(args.runId, (run) =>
+      canFinishRun(run, args.startedAtMs)
+        ? {
+            ...run,
+            completedAtMs: args.completedAtMs,
+            resultMessageTs: args.resultMessageTs,
+            status: "completed",
+          }
+        : undefined,
+    );
+    return next;
+  }
+
+  async markRunFailed(args: {
+    completedAtMs: number;
+    errorMessage: string;
+    startedAtMs?: number;
+    runId: string;
+  }): Promise<ScheduledRun | undefined> {
+    return await this.updateRun(args.runId, (run) =>
+      canFinishRun(run, args.startedAtMs)
+        ? {
+            ...run,
+            completedAtMs: args.completedAtMs,
+            errorMessage: args.errorMessage,
+            status: "failed",
+          }
+        : undefined,
+    );
+  }
+
+  async markRunSkipped(args: {
+    completedAtMs: number;
+    errorMessage: string;
+    runId: string;
+  }): Promise<ScheduledRun | undefined> {
+    return await this.updateRun(args.runId, (run) =>
+      run.status === "pending"
+        ? {
+            ...run,
+            completedAtMs: args.completedAtMs,
+            errorMessage: args.errorMessage,
+            status: "skipped",
+          }
+        : undefined,
+    );
+  }
+
+  async markRunBlocked(args: {
+    completedAtMs: number;
+    errorMessage: string;
+    runId: string;
+    startedAtMs?: number;
+  }): Promise<ScheduledRun | undefined> {
+    return await this.updateRun(args.runId, (run) =>
+      canFinishRun(run, args.startedAtMs)
+        ? {
+            ...run,
+            completedAtMs: args.completedAtMs,
+            errorMessage: args.errorMessage,
+            status: "blocked",
+          }
+        : undefined,
+    );
+  }
+
+  async updateTaskAfterRun(args: {
+    errorMessage?: string;
+    nowMs: number;
+    run: ScheduledRun;
+    status: "blocked" | "completed" | "failed";
+  }): Promise<void> {
+    await withSqlLock(this.db, taskLockKey(args.run.taskId), async (db) => {
+      const current = await getTaskFromSql(db, args.run.taskId);
+      if (!current || current.status === "deleted") {
+        return;
+      }
+
+      const isRunNow = current.runNowAtMs === args.run.scheduledForMs;
+      if (isRunNow) {
+        let nextRunAtMs = current.nextRunAtMs;
+        if (
+          args.status !== "blocked" &&
+          typeof current.nextRunAtMs === "number" &&
+          current.nextRunAtMs <= args.run.scheduledForMs
+        ) {
+          nextRunAtMs = getNextRunAtMs(
+            current,
+            current.nextRunAtMs,
+            args.nowMs,
+          );
+        }
+        await this.saveTaskRecord(
+          db,
+          {
+            ...current,
+            lastRunAtMs: args.run.scheduledForMs,
+            nextRunAtMs,
+            runNowAtMs: undefined,
+            status:
+              args.status === "blocked"
+                ? "blocked"
+                : nextRunAtMs
+                  ? current.status
+                  : "paused",
+            statusReason:
+              args.status === "blocked" ? args.errorMessage : undefined,
+            updatedAtMs: args.nowMs,
+            version: current.version + 1,
+          },
+          current,
+        );
+        return;
+      }
+
+      if (
+        current.status !== "active" ||
+        current.nextRunAtMs !== args.run.scheduledForMs
+      ) {
+        await this.saveTaskRecord(
+          db,
+          {
+            ...current,
+            lastRunAtMs: args.run.scheduledForMs,
+            updatedAtMs: args.nowMs,
+            version: current.version + 1,
+          },
+          current,
+        );
+        return;
+      }
+
+      const nextRunAtMs =
+        args.status === "blocked"
+          ? undefined
+          : getNextRunAtMs(current, args.run.scheduledForMs, args.nowMs);
+
+      await this.saveTaskRecord(
+        db,
+        {
+          ...current,
+          lastRunAtMs: args.run.scheduledForMs,
+          nextRunAtMs,
+          status:
+            args.status === "blocked"
+              ? "blocked"
+              : nextRunAtMs
+                ? "active"
+                : "paused",
+          statusReason:
+            args.status === "blocked" ? args.errorMessage : undefined,
+          updatedAtMs: args.nowMs,
+          version: current.version + 1,
+        },
+        current,
+      );
+    });
+  }
+
+  private async updateRun(
+    runId: string,
+    update: (run: ScheduledRun) => ScheduledRun | undefined,
+  ): Promise<ScheduledRun | undefined> {
+    return await withSqlLock(
+      this.db,
+      indexLockKey(runKey(runId)),
+      async (db) => {
+        const current = await getRunFromSql(db, runId);
+        if (!current) {
+          return undefined;
+        }
+        const next = update(current);
+        if (!next) {
+          return undefined;
+        }
+        await upsertSqlRun(db, next);
+        return next;
+      },
+    );
+  }
+}
+
+/** Create a scheduler store backed by the plugin SQL database. */
+export function createSchedulerSqlStore(db: PluginDb): SchedulerStore {
+  return new SqlSchedulerStore(db);
+}
+
+/** Create a read-only scheduler operational store backed by SQL. */
+export function createSchedulerOperationalSqlStore(
+  db: PluginDb,
+): SchedulerOperationalStore {
+  return new SqlSchedulerStore(db);
+}
+
+/** Copy retained scheduler plugin-state records into the scheduler SQL tables. */
+export async function migrateSchedulerStateToSql(args: {
+  db: PluginDb;
+  state: PluginState;
+}): Promise<{
+  existing: number;
+  migrated: number;
+  missing: number;
+  scanned: number;
+}> {
+  const store = createSchedulerSqlStore(args.db);
+  const ids = await getIndex(args.state, globalTaskIndexKey());
+  let existing = 0;
+  let migrated = 0;
+  let missing = 0;
+  const migratedTasks: ScheduledTask[] = [];
+
+  for (const id of ids) {
+    const task = await getTaskFromState(args.state, id);
+    if (!task) {
+      missing += 1;
+      continue;
+    }
+    migratedTasks.push(task);
+    if (await store.getTask(task.id)) {
+      existing += 1;
+      continue;
+    }
+    await store.saveTask(task);
+    migrated += 1;
+  }
+
+  const runs = await listIncompleteRunsForTasksFromState(
+    args.state,
+    migratedTasks,
+  );
+  for (const run of runs) {
+    if (await store.getRun(run.id)) {
+      existing += 1;
+      continue;
+    }
+    await upsertSqlRun(args.db, run);
+    migrated += 1;
+  }
+
+  return {
+    existing,
+    migrated,
+    missing,
+    scanned: ids.length + runs.length,
+  };
 }
