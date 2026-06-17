@@ -51,11 +51,21 @@ export interface AssistantLifecycleEvent {
   userId?: string;
 }
 
+type SteeringMode = "defer" | "interrupt";
+
+export interface SteeringCandidateMessage {
+  activeRequest: boolean;
+  inboundMessageId: string;
+  message: Message;
+}
+
 export interface ReplyHooks {
   beforeFirstResponsePost?: () => Promise<void>;
   drainSteeringMessages?: (
-    inject: (messages: Message[]) => Promise<void>,
-  ) => Promise<Message[]>;
+    inject: (
+      messages: SteeringCandidateMessage[],
+    ) => Promise<readonly string[] | void>,
+  ) => Promise<void>;
   messageContext?: MessageContext;
   onInputCommitted?: () => Promise<void>;
   onToolInvocation?: (invocation: TurnToolInvocation) => void;
@@ -247,16 +257,22 @@ function getQueuedMessagesFromSlackMessages(
 interface SteeringMessageDecision {
   context: TurnContext;
   decision: SubscribedReplyDecision;
+  inboundMessageId: string;
+  mode: SteeringMode;
   message: Message;
   text: TurnMessageText;
 }
 
 interface SteeringMessageSelection {
-  accepted: Message[];
+  accepted: Array<{
+    inboundMessageId: string;
+    message: Message;
+    mode: SteeringMode;
+  }>;
   skipped: SteeringMessageDecision[];
 }
 
-/** Drain mailbox steering messages only after selecting work Junior will process. */
+/** Drain mailbox steering messages after classifying interrupt, defer, and skip. */
 function createAcceptedSteeringDrain(
   hooks: ReplyHooks,
   options: {
@@ -264,7 +280,7 @@ function createAcceptedSteeringDrain(
     onAcceptedForProcessing?: (messages: Message[]) => Promise<void>;
     onSkipped?: (messages: SteeringMessageDecision[]) => Promise<void>;
     selectMessages: (
-      messages: Message[],
+      messages: SteeringCandidateMessage[],
       context?: SteeringDrainContext,
     ) => Promise<SteeringMessageSelection>;
     stripLeadingBotMention: SlackTurnRuntimeDependencies<unknown>["stripLeadingBotMention"];
@@ -280,16 +296,29 @@ function createAcceptedSteeringDrain(
   }
 
   return async (inject, context) => {
-    let acceptedMessages: Message[] | undefined;
+    let interruptedMessages: Message[] | undefined;
     await hooks.drainSteeringMessages!(async (messages) => {
       const selection = await options.selectMessages(messages, context);
-      const accepted = selection.accepted;
       await options.onSkipped?.(selection.skipped);
-      await inject(getQueuedMessagesFromSlackMessages(accepted, options));
-      acceptedMessages = accepted;
-      await options.onAcceptedForProcessing?.(accepted);
+      // Deferred accepted messages stay pending so a later worker slice handles
+      // them after the active answer is delivered.
+      const interrupted = selection.accepted
+        .filter((accepted) => accepted.mode === "interrupt")
+        .map((accepted) => accepted.message);
+      await inject(getQueuedMessagesFromSlackMessages(interrupted, options));
+      interruptedMessages = interrupted;
+      await options.onAcceptedForProcessing?.(interrupted);
+      return [
+        ...selection.accepted
+          .filter((accepted) => accepted.mode === "interrupt")
+          .map((accepted) => accepted.inboundMessageId),
+        ...selection.skipped.map((skipped) => skipped.inboundMessageId),
+      ];
     });
-    return getQueuedMessagesFromSlackMessages(acceptedMessages ?? [], options);
+    return getQueuedMessagesFromSlackMessages(
+      interruptedMessages ?? [],
+      options,
+    );
   };
 }
 
@@ -448,13 +477,15 @@ export function createSlackTurnRuntime<
 
   const decideSteeringMessage = async (
     thread: Thread,
-    message: Message,
+    candidate: SteeringCandidateMessage,
     conversationContext: string | undefined,
   ): Promise<{
     context: TurnContext;
     decision: SubscribedReplyDecision;
+    mode: SteeringMode;
     text: TurnMessageText;
   }> => {
+    const { message } = candidate;
     const context: TurnContext = {
       threadId: deps.getThreadId(thread, message),
       requesterId: message.author.userId,
@@ -469,7 +500,8 @@ export function createSlackTurnRuntime<
       rawText: appendSlackLegacyAttachmentText(message.text, message.raw),
       userText: appendSlackLegacyAttachmentText(strippedUserText, message.raw),
     };
-    const isExplicitMention = Boolean(message.isMention);
+    const isActiveRequest =
+      candidate.activeRequest || Boolean(message.isMention);
 
     const decision = await deps.decideSubscribedReply({
       rawText: text.rawText,
@@ -477,10 +509,15 @@ export function createSlackTurnRuntime<
       conversationContext,
       hasAttachments:
         message.attachments.length > 0 || legacyAttachmentText !== "",
-      isExplicitMention,
+      isExplicitMention: isActiveRequest,
       context,
     });
-    return { context, decision, text };
+    return {
+      context,
+      decision,
+      mode: isActiveRequest ? "interrupt" : "defer",
+      text,
+    };
   };
 
   const logSkippedSubscribedDecision = (args: {
@@ -541,20 +578,22 @@ export function createSlackTurnRuntime<
 
   const selectAcceptedSteeringMessages = async (args: {
     conversationContext: string | undefined;
-    messages: Message[];
+    messages: SteeringCandidateMessage[];
     thread: Thread;
   }): Promise<SteeringMessageSelection> => {
     const selected: SteeringMessageDecision[] = [];
-    for (const message of args.messages) {
+    for (const candidate of args.messages) {
       const decision = await decideSteeringMessage(
         args.thread,
-        message,
+        candidate,
         args.conversationContext,
       );
       selected.push({
         context: decision.context,
         decision: decision.decision,
-        message,
+        inboundMessageId: candidate.inboundMessageId,
+        mode: decision.mode,
+        message: candidate.message,
         text: decision.text,
       });
     }
@@ -577,7 +616,11 @@ export function createSlackTurnRuntime<
     return {
       accepted: selected
         .filter((message) => message.decision.shouldReply)
-        .map((message) => message.message),
+        .map((message) => ({
+          inboundMessageId: message.inboundMessageId,
+          message: message.message,
+          mode: message.mode,
+        })),
       skipped: selected.filter((message) => !message.decision.shouldReply),
     };
   };

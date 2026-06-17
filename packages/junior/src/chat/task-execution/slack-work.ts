@@ -7,7 +7,10 @@ import {
   type SerializedThread,
   type StateAdapter,
 } from "chat";
-import type { SlackTurnRuntime } from "@/chat/runtime/slack-runtime";
+import type {
+  SlackTurnRuntime,
+  SteeringCandidateMessage,
+} from "@/chat/runtime/slack-runtime";
 import {
   isCooperativeTurnYieldError,
   isTurnInputCommitLostError,
@@ -101,9 +104,27 @@ function compareInboundMessages(
 }
 
 function routeForRecords(records: InboundMessage[]): SlackConversationRoute {
-  return records.some((record) => record.input.metadata?.route === "mention")
+  return records.some((record) => {
+    const metadata = record.input.metadata;
+    if (!isSlackMetadata(metadata)) {
+      throw new Error("Conversation mailbox record is not Slack metadata");
+    }
+    return metadata.route === "mention";
+  })
     ? "mention"
     : "subscribed";
+}
+
+function isSlackAssistantThreadUserMessage(message: Message): boolean {
+  const raw =
+    message.raw && typeof message.raw === "object"
+      ? (message.raw as Record<string, unknown>)
+      : undefined;
+  return (
+    raw?.channel_type === "im" &&
+    typeof raw.thread_ts === "string" &&
+    raw.thread_ts.trim().length > 0
+  );
 }
 
 /** Rehydrate the Slack message payload before handing it back to runtime code. */
@@ -296,21 +317,32 @@ export function createSlackConversationWorker(
             );
           }
         };
+        // Restore stored mailbox entries as Slack steering candidates; the
+        // runtime returns only the inbound ids it handled durably.
         const drainSteeringMessages = async (
-          inject: (messages: Message[]) => Promise<void>,
-        ): Promise<Message[]> => {
-          let restoredMessages: Message[] | undefined;
-          const drained = await context.drainMailbox(async (pendingRecords) => {
-            const messages = pendingRecords.map((record) =>
-              restoreMessage({ adapter, record }),
-            );
-            restoredMessages = messages;
-            await inject(messages);
+          inject: (
+            messages: SteeringCandidateMessage[],
+          ) => Promise<readonly string[] | void>,
+        ): Promise<void> => {
+          await context.drainMailbox(async (pendingRecords) => {
+            const messages = pendingRecords.map((record) => {
+              const metadata = record.input.metadata;
+              if (!isSlackMetadata(metadata)) {
+                throw new Error(
+                  "Conversation mailbox record is not Slack metadata",
+                );
+              }
+              const message = restoreMessage({ adapter, record });
+              return {
+                activeRequest:
+                  metadata.route === "mention" ||
+                  isSlackAssistantThreadUserMessage(message),
+                inboundMessageId: record.inboundMessageId,
+                message,
+              };
+            });
+            return await inject(messages);
           });
-          return (
-            restoredMessages ??
-            drained.map((record) => restoreMessage({ adapter, record }))
-          );
         };
 
         try {

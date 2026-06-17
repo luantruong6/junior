@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Message, StateAdapter, Thread } from "chat";
+import { Message, ThreadImpl, type StateAdapter, type Thread } from "chat";
 import { CooperativeTurnYieldError } from "@/chat/runtime/turn";
 import { recoverConversationWork } from "@/chat/task-execution/heartbeat";
 import {
+  appendInboundMessage,
   CONVERSATION_WORK_LEASE_TTL_MS,
   countPendingConversationMessages,
   getConversationWorkState,
@@ -12,7 +13,10 @@ import {
 } from "@/chat/task-execution/store";
 import { processConversationWork } from "@/chat/task-execution/worker";
 import { processConversationQueueMessage } from "@/chat/task-execution/vercel-callback";
-import { createSlackConversationWorker } from "@/chat/task-execution/slack-work";
+import {
+  buildSlackInboundMessage,
+  createSlackConversationWorker,
+} from "@/chat/task-execution/slack-work";
 import { getMessageActorIdentity } from "@/chat/services/message-actor-identity";
 import { disconnectStateAdapter, getStateAdapter } from "@/chat/state/adapter";
 import {
@@ -603,7 +607,6 @@ describe("Slack conversation work execution", () => {
     });
 
     const injected: string[][] = [];
-    const drained: string[][] = [];
     const runtime: SlackWorkerOptions["runtime"] = {
       handleNewMention: async (_thread, _message, hooks) => {
         await hooks.onInputCommitted?.();
@@ -617,11 +620,10 @@ describe("Slack conversation work execution", () => {
           ),
           services: ingressServices,
         });
-        const messages =
-          (await hooks.drainSteeringMessages?.(async (steering) => {
-            injected.push(steering.map((message) => message.id));
-          })) ?? [];
-        drained.push(messages.map((message) => message.id));
+        await hooks.drainSteeringMessages?.(async (steering) => {
+          injected.push(steering.map((candidate) => candidate.message.id));
+          return steering.map((candidate) => candidate.inboundMessageId);
+        });
       },
       handleSubscribedMessage: async () => {
         throw new Error("unexpected subscribed route");
@@ -637,7 +639,6 @@ describe("Slack conversation work execution", () => {
     ).resolves.toEqual({ status: "completed" });
 
     expect(injected).toEqual([["1712345.0002"]]);
-    expect(drained).toEqual([["1712345.0002"]]);
     const work = await getConversationWorkState({
       conversationId: CONVERSATION_ID,
       state,
@@ -654,6 +655,107 @@ describe("Slack conversation work execution", () => {
       runtime,
       state,
     });
+  });
+
+  it("treats Slack assistant-thread user messages as active steering", async () => {
+    const queue = createConversationWorkQueueTestAdapter();
+    const state = getStateAdapter();
+    await state.connect();
+    const slackAdapter = createSlackAdapterFixture();
+    const dmChannelId = "D123";
+    const threadTs = "1712345.1001";
+    const conversationId = `slack:${dmChannelId}:${threadTs}`;
+    const ingressServices = {
+      getSlackAdapter: () => slackAdapter,
+      queue,
+      runtime: createNoopSlackWebhookRuntime(),
+      state,
+    };
+    await handleSlackWebhookAndFlush({
+      request: slackWebhookRequest(
+        slackEnvelope({
+          channel: dmChannelId,
+          eventType: "message",
+          text: "first",
+          threadTs,
+          ts: threadTs,
+        }),
+      ),
+      services: ingressServices,
+    });
+
+    const observed: Array<Array<{ activeRequest: boolean; id: string }>> = [];
+    const runtime: SlackWorkerOptions["runtime"] = {
+      handleNewMention: async (_thread, _message, hooks) => {
+        await hooks.onInputCommitted?.();
+        const followUp = new Message({
+          id: "1712345.1002",
+          threadId: conversationId,
+          text: "steer this assistant thread",
+          attachments: [],
+          metadata: { dateSent: new Date(1_000), edited: false },
+          formatted: { type: "root", children: [] },
+          raw: {
+            channel: dmChannelId,
+            channel_type: "im",
+            thread_ts: threadTs,
+            ts: "1712345.1002",
+            user: "U123",
+          },
+          author: {
+            userId: "U123",
+            userName: "",
+            fullName: "",
+            isBot: false,
+            isMe: false,
+          },
+        });
+        const thread = new ThreadImpl({
+          adapter: slackAdapter,
+          stateAdapter: state,
+          id: conversationId,
+          channelId: dmChannelId,
+          currentMessage: followUp,
+          initialMessage: followUp,
+          isDM: true,
+          isSubscribedContext: true,
+        });
+        await appendInboundMessage({
+          message: buildSlackInboundMessage({
+            conversationId,
+            installation: { teamId: "T123" },
+            message: followUp,
+            receivedAtMs: 1_100,
+            route: "subscribed",
+            thread,
+          }),
+          state,
+        });
+        await hooks.drainSteeringMessages?.(async (steering) => {
+          observed.push(
+            steering.map((candidate) => ({
+              activeRequest: candidate.activeRequest,
+              id: candidate.message.id,
+            })),
+          );
+          return steering.map((candidate) => candidate.inboundMessageId);
+        });
+      },
+      handleSubscribedMessage: async () => {
+        throw new Error("unexpected subscribed route");
+      },
+    };
+
+    await expect(
+      processNextQueuedSlackWork({
+        getSlackAdapter: () => slackAdapter,
+        queue,
+        runtime,
+        state,
+      }),
+    ).resolves.toEqual({ status: "completed" });
+
+    expect(observed).toEqual([[{ activeRequest: true, id: "1712345.1002" }]]);
   });
 
   it("does not replay injected Slack mailbox records after lease recovery", async () => {
