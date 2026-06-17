@@ -12,8 +12,11 @@ import {
 } from "node:process";
 import { randomUUID } from "node:crypto";
 import * as readline from "node:readline/promises";
+import { createJiti } from "jiti";
+import { loadAppPluginSet } from "@/plugin-module";
 import { normalizeLocalConversationId } from "@/chat/local/conversation";
 import type { LocalAgentReply } from "@/chat/local/runner";
+import type { JuniorPluginSet } from "@/plugins";
 
 export const CHAT_USAGE = "usage: junior chat\n       junior chat -p <message>";
 
@@ -34,6 +37,7 @@ const DEFAULT_IO: ChatIo = {
   output: defaultStdout,
   write: (text) => writeStream(defaultStdout, text),
 };
+const localPluginLoader = createJiti(import.meta.url, { moduleCache: false });
 
 class ChatOutputError extends Error {
   constructor(error: unknown) {
@@ -97,6 +101,56 @@ function defaultStateAdapterForLocalChat(): void {
   process.env.JUNIOR_STATE_ADAPTER = "memory";
 }
 
+/** Load the app plugin module so source-mode local chat matches server wiring. */
+async function loadLocalPluginSet(): Promise<JuniorPluginSet | undefined> {
+  return await loadAppPluginSet(process.cwd(), async (moduleRef) =>
+    localPluginLoader.import<Record<string, unknown>>(moduleRef.importPath),
+  );
+}
+
+/** Configure plugin hooks after local chat has selected its state adapter. */
+async function configureLocalChatPlugins(): Promise<void> {
+  const [
+    pluginsModule,
+    agentHooksModule,
+    registryModule,
+    validationModule,
+    databaseModule,
+  ] = await Promise.all([
+    import("@/plugins"),
+    import("@/chat/plugins/agent-hooks"),
+    import("@/chat/plugins/registry"),
+    import("@/chat/plugins/validation"),
+    import("@/chat/plugins/db"),
+  ]);
+  const pluginSet = await loadLocalPluginSet();
+  const plugins = pluginsModule.pluginHookRegistrationsFromPluginSet(pluginSet);
+  const pluginConfig = pluginSet
+    ? pluginsModule.pluginCatalogConfigFromPluginSet(pluginSet)
+    : pluginsModule.pluginCatalogConfigFromEnv();
+  const shouldValidatePluginCatalog =
+    Boolean(pluginConfig) || Boolean(pluginSet?.registrations.length);
+  agentHooksModule.validatePlugins(plugins);
+  const previousPluginCatalogConfig =
+    registryModule.setPluginCatalogConfig(pluginConfig);
+  try {
+    if (shouldValidatePluginCatalog) {
+      registryModule.getPluginCatalogSignature();
+      validationModule.validatePluginRegistrations(
+        pluginSet?.registrations ?? [],
+      );
+      validationModule.validatePluginEgressCredentialHooks(
+        pluginSet?.registrations ?? [],
+      );
+    }
+    databaseModule.validatePluginDatabaseRequirements(plugins);
+    agentHooksModule.setPlugins(plugins);
+  } catch (error) {
+    registryModule.setPluginCatalogConfig(previousPluginCatalogConfig);
+    throw error;
+  }
+}
+
 function parseChatArgs(argv: string[]): ChatCommandOptions | undefined {
   if (argv.length === 0) {
     return { mode: "interactive" };
@@ -140,6 +194,7 @@ async function runPrompt(
   io: ChatIo,
 ): Promise<number> {
   defaultStateAdapterForLocalChat();
+  await configureLocalChatPlugins();
   const conversationId = newRunConversationId();
 
   const { runLocalAgentTurn } = await import("@/chat/local/runner");
@@ -162,6 +217,7 @@ async function runPrompt(
 
 async function runInteractive(io: ChatIo): Promise<void> {
   defaultStateAdapterForLocalChat();
+  await configureLocalChatPlugins();
   const conversationId = newRunConversationId();
 
   const { runLocalAgentTurn } = await import("@/chat/local/runner");

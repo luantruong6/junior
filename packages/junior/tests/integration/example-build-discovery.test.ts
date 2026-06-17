@@ -9,7 +9,15 @@ import {
 import { createRequire } from "node:module";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import {
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 
 const originalEnv = { ...process.env };
 const originalCwd = process.cwd();
@@ -20,6 +28,7 @@ const examplePluginsModule = path.join(exampleRoot, "plugins.ts");
 const exampleDashboardConfig = path.join(exampleRoot, "dashboard.ts");
 const examplePackageJson = path.join(exampleRoot, "package.json");
 const exampleRequire = createRequire(exampleEntry);
+const exampleDatabaseUrl = "postgres://configured.example.test/neon";
 const vercelEnvNames = [
   "VERCEL",
   "VERCEL_ENV",
@@ -107,6 +116,10 @@ describe.sequential("example build discovery integration", () => {
     buildJuniorPackage();
   }, 60_000);
 
+  beforeEach(() => {
+    process.env.JUNIOR_DATABASE_URL ??= exampleDatabaseUrl;
+  });
+
   afterEach(() => {
     process.chdir(originalCwd);
     process.env = { ...originalEnv };
@@ -175,6 +188,9 @@ describe.sequential("example build discovery integration", () => {
     );
     expect(packageJson.scripts?.prebuild).toContain(
       "pnpm --filter @sentry/junior-dashboard build",
+    );
+    expect(packageJson.scripts?.prebuild).toContain(
+      "pnpm --filter @sentry/junior-scheduler build",
     );
     expect(packageJson.scripts?.postbuild).toBe(
       "node scripts/check-vercel-output.mjs",

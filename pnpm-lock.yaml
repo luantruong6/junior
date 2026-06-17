@@ -32,6 +32,9 @@ overrides:
 importers:
   .:
     devDependencies:
+      "@ast-grep/cli":
+        specifier: ^0.43.0
+        version: 0.43.0
       "@playwright/test":
         specifier: ^1.60.0
         version: 1.60.0
@@ -47,6 +50,9 @@ importers:
       prettier:
         specifier: ^3.8.3
         version: 3.8.3
+      publint:
+        specifier: ^0.3.21
+        version: 0.3.21
       simple-git-hooks:
         specifier: ^2.13.1
         version: 2.13.1
@@ -58,7 +64,7 @@ importers:
     dependencies:
       "@sentry/junior":
         specifier: workspace:*
-        version: link:../../packages/junior
+        version: file:packages/junior
       "@sentry/junior-agent-browser":
         specifier: workspace:*
         version: link:../../packages/junior-agent-browser
@@ -80,6 +86,9 @@ importers:
       "@sentry/junior-notion":
         specifier: workspace:*
         version: link:../../packages/junior-notion
+      "@sentry/junior-scheduler":
+        specifier: workspace:*
+        version: link:../../packages/junior-scheduler
       "@sentry/junior-sentry":
         specifier: workspace:*
         version: link:../../packages/junior-sentry
@@ -161,7 +170,7 @@ importers:
         version: 1.1.0
       "@sentry/junior-plugin-api":
         specifier: workspace:*
-        version: file:packages/junior-plugin-api(@neondatabase/serverless@1.1.0)
+        version: file:packages/junior-plugin-api(@neondatabase/serverless@1.1.0)(@types/pg@8.15.6)(pg@8.21.0)
       "@sentry/node":
         specifier: "catalog:"
         version: 10.53.1
@@ -191,10 +200,13 @@ importers:
         version: 4.29.0(ai@6.0.190(zod@4.4.3))(zod@4.4.3)
       drizzle-orm:
         specifier: "catalog:"
-        version: 0.45.2(@neondatabase/serverless@1.1.0)
+        version: 0.45.2(@neondatabase/serverless@1.1.0)(@types/pg@8.15.6)(pg@8.21.0)
       hono:
         specifier: ^4.12.22
         version: 4.12.22
+      jiti:
+        specifier: ^2.7.0
+        version: 2.7.0
       jose:
         specifier: ^6.2.3
         version: 6.2.3
@@ -204,6 +216,9 @@ importers:
       node-html-markdown:
         specifier: ^2.0.0
         version: 2.0.0
+      pg:
+        specifier: ^8.16.3
+        version: 8.21.0
       yaml:
         specifier: ^2.9.0
         version: 2.9.0
@@ -219,13 +234,19 @@ importers:
         version: 1.10.0
       "@sentry/junior-scheduler":
         specifier: workspace:*
-        version: file:packages/junior-scheduler(@neondatabase/serverless@1.1.0)
+        version: file:packages/junior-scheduler(@neondatabase/serverless@1.1.0)(@types/pg@8.15.6)(pg@8.21.0)
       "@sentry/junior-test-fixtures":
         specifier: workspace:*
-        version: file:packages/junior-test-fixtures(@neondatabase/serverless@1.1.0)
+        version: file:packages/junior-test-fixtures(@neondatabase/serverless@1.1.0)(@types/pg@8.15.6)(pg@8.21.0)
+      "@sentry/junior-testing":
+        specifier: workspace:*
+        version: link:../junior-testing
       "@types/node":
         specifier: ^25.9.1
         version: 25.9.1
+      "@types/pg":
+        specifier: ^8.15.6
+        version: 8.15.6
       "@vitest/coverage-v8":
         specifier: 4.1.7
         version: 4.1.7(vitest@4.1.7)
@@ -237,13 +258,13 @@ importers:
         version: 2.14.6(@types/node@25.9.1)(typescript@6.0.3)
       nitro:
         specifier: 3.0.260522-beta
-        version: 3.0.260522-beta(@vercel/functions@3.6.0)(@vercel/queue@0.2.0)(drizzle-orm@0.45.2(@neondatabase/serverless@1.1.0))
+        version: 3.0.260522-beta(@vercel/functions@3.6.0)(@vercel/queue@0.2.0)(drizzle-orm@0.45.2(@neondatabase/serverless@1.1.0)(@types/pg@8.15.6)(pg@8.21.0))(jiti@2.7.0)
       oxlint:
         specifier: ^1.66.0
         version: 1.66.0
       tsup:
         specifier: ^8.5.1
-        version: 8.5.1(tsx@4.22.3)(typescript@6.0.3)(yaml@2.9.0)
+        version: 8.5.1(jiti@2.7.0)(tsx@4.22.3)(typescript@6.0.3)(yaml@2.9.0)
       typescript:
         specifier: ^6.0.3
         version: 6.0.3
@@ -252,7 +273,7 @@ importers:
         version: 54.4.0(@emnapi/core@1.10.0)(@emnapi/runtime@1.10.0)
       vitest:
         specifier: ^4.1.7
-        version: 4.1.7(@types/node@25.9.1)(@vitest/coverage-v8@4.1.7)(msw@2.14.6(@types/node@25.9.1)(typescript@6.0.3))(tsx@4.22.3)(yaml@2.9.0)
+        version: 4.1.7(@types/node@25.9.1)(@vitest/coverage-v8@4.1.7)(jiti@2.7.0)(msw@2.14.6(@types/node@25.9.1)(typescript@6.0.3))(tsx@4.22.3)(yaml@2.9.0)
 
   packages/junior-agent-browser: {}
 
@@ -260,7 +281,7 @@ importers:
     dependencies:
       "@sentry/junior":
         specifier: workspace:*
-        version: link:../junior
+        version: file:packages/junior
       "@sentry/junior-plugin-api":
         specifier: workspace:*
         version: link:../junior-plugin-api
@@ -332,7 +353,7 @@ importers:
     devDependencies:
       "@sentry/junior":
         specifier: workspace:*
-        version: link:../junior
+        version: file:packages/junior
       "@sentry/junior-github":
         specifier: workspace:*
         version: link:../junior-github
@@ -444,7 +465,20 @@ importers:
         version: 6.0.3
 
   packages/junior-testing:
+    dependencies:
+      pg:
+        specifier: ^8.16.3
+        version: 8.21.0
+      zod:
+        specifier: "catalog:"
+        version: 4.4.3
     devDependencies:
+      "@types/node":
+        specifier: ^25.9.1
+        version: 25.9.1
+      "@types/pg":
+        specifier: ^8.15.6
+        version: 8.15.6
       typescript:
         specifier: ^6.0.3
         version: 6.0.3
@@ -488,6 +522,79 @@ packages:
     peerDependenciesMeta:
       zod:
         optional: true
+
+  "@ast-grep/cli-darwin-arm64@0.43.0":
+    resolution:
+      {
+        integrity: sha512-0i63gSBbgriPaRpFsbP3yETxolHPK2JAZbpcGbFOytB7QTnKAguwhlKmIOkUGKfsCzYiEq1awY0EBmvjMONXOg==,
+      }
+    engines: { node: ">= 10" }
+    cpu: [arm64]
+    os: [darwin]
+
+  "@ast-grep/cli-darwin-x64@0.43.0":
+    resolution:
+      {
+        integrity: sha512-SPkj00HGKpYdqReUmso2ftG5Xgd+bWNFH4i9fubLxsWzn4ey2G6sotPruaOtcrzxb9xH+8kmhN7KJfm1k8Atzg==,
+      }
+    engines: { node: ">= 10" }
+    cpu: [x64]
+    os: [darwin]
+
+  "@ast-grep/cli-linux-arm64-gnu@0.43.0":
+    resolution:
+      {
+        integrity: sha512-U8+2fkcY8sBxNHHBYZ33vTa7C97GFAB+Kj6gFzVMSqK8Ve1Aw+DxhVWD4i/PBryDdmWb4/erjGSkTQtdhVa2vg==,
+      }
+    engines: { node: ">= 10" }
+    cpu: [arm64]
+    os: [linux]
+    libc: [glibc]
+
+  "@ast-grep/cli-linux-x64-gnu@0.43.0":
+    resolution:
+      {
+        integrity: sha512-r/o9Mag6OZmGevY9OJjatuUKDOX1rSvgo29qSfxpMbIciiH3hkzEW/2w1xTPZI8xnM7iC+k+CkGoknmoXVTYGg==,
+      }
+    engines: { node: ">= 10" }
+    cpu: [x64]
+    os: [linux]
+    libc: [glibc]
+
+  "@ast-grep/cli-win32-arm64-msvc@0.43.0":
+    resolution:
+      {
+        integrity: sha512-oHa4ruD87xccnqFuR+Pmx6F/suHV0YtibuyZ6SxUqgpNJAFZiUNAiFblzhEgQ5gp03e8B012P/Yy/7GYOvxOLg==,
+      }
+    engines: { node: ">= 10" }
+    cpu: [arm64]
+    os: [win32]
+
+  "@ast-grep/cli-win32-ia32-msvc@0.43.0":
+    resolution:
+      {
+        integrity: sha512-RSzz9bKzSEutWgX7/g84guudEp75Q990CYpG/TBasdJP+U27zX8aA9d5p1+o/lF0hw3UoTYuFCGG8PU/QelfNQ==,
+      }
+    engines: { node: ">= 10" }
+    cpu: [ia32]
+    os: [win32]
+
+  "@ast-grep/cli-win32-x64-msvc@0.43.0":
+    resolution:
+      {
+        integrity: sha512-/5dDD9B65vVuHCdVHN5+tIDquhE5s43S5CgEn88w1BgQaoayf+nRnUO4ZFez6SqyCGqAfa/yZdoaOQ9N2ySa1w==,
+      }
+    engines: { node: ">= 10" }
+    cpu: [x64]
+    os: [win32]
+
+  "@ast-grep/cli@0.43.0":
+    resolution:
+      {
+        integrity: sha512-DGi6xXAOBJubGg9QWqTeW8PzKSGHWEOa3uxXspEfYf532yb3lHmNJAcKMl1d+O9Xs9bTcNeDLC8se+O+tirEFQ==,
+      }
+    engines: { node: ">= 12.0.0" }
+    hasBin: true
 
   "@astrojs/check@0.9.9":
     resolution:
@@ -3303,6 +3410,13 @@ packages:
       {
         integrity: sha512-oOAWABowe8EAbMyWKM0tYDKi8Yaox52D+HWZhAIJqQXbqe0xI/GV7FhLWqlEKreMkfDjshR5FKgi3mnle0h6Eg==,
       }
+
+  "@publint/pack@0.1.4":
+    resolution:
+      {
+        integrity: sha512-HDVTWq3H0uTXiU0eeSQntcVUTPP3GamzeXI41+x7uU9J65JgWQh3qWZHblR1i0npXfFtF+mxBiU2nJH8znxWnQ==,
+      }
+    engines: { node: ">=18" }
 
   "@redis/bloom@5.12.1":
     resolution:
@@ -9292,12 +9406,32 @@ packages:
         integrity: sha512-F3asv42UuXchdzt+xXqfW1OGlVBe+mxa2mqI0pg5yAHZPvFmY3Y6drSf/GQ1A86WgWEN9Kzh/WrgKa6iGcHXLg==,
       }
 
+  pg-cloudflare@1.4.0:
+    resolution:
+      {
+        integrity: sha512-Vo7z/6rrQYxpNRylp4Tlob2elzbh+N/MOQbxFVWCxS7oEx6jF53GTJFxK2WWpKuBRkmiin4Mt+xofFDjx09R0A==,
+      }
+
+  pg-connection-string@2.13.0:
+    resolution:
+      {
+        integrity: sha512-EMnU9E2fSULdsbErBbMaXJvFeD9B4+nPcM3f+4lsiCR0BHLPrLVjv3DbyM2hgQQviKJaTWIRRTjKjWlHg3p2ig==,
+      }
+
   pg-int8@1.0.1:
     resolution:
       {
         integrity: sha512-WCtabS6t3c8SkpDBUlb1kjOs7l66xsGdKpIPZsg4wR+B3+u9UAum2odSsF9tnvxg80h4ZxLWMy4pRjOsFIqQpw==,
       }
     engines: { node: ">=4.0.0" }
+
+  pg-pool@3.14.0:
+    resolution:
+      {
+        integrity: sha512-gKtPkFdQPU3DksooVLi9LsjZxrsBUZIpa+7aVx+LV5pNh0KzP4Zleud2po+ConrxbuXGBJ6Hfer6hdgpIBpBaw==,
+      }
+    peerDependencies:
+      pg: ">=8.0"
 
   pg-protocol@1.14.0:
     resolution:
@@ -9311,6 +9445,24 @@ packages:
         integrity: sha512-qTAAlrEsl8s4OiEQY69wDvcMIdQN6wdz5ojQiOy6YRMuynxenON0O5oCpJI6lshc6scgAY8qvJ2On/p+CXY0GA==,
       }
     engines: { node: ">=4" }
+
+  pg@8.21.0:
+    resolution:
+      {
+        integrity: sha512-AUP1EYJuHraQGsVoCQVIcM7TEJVGtDzxWtGFZd8rds9d+CCXlU5Js1rYgfLNvxy9iJrpHjGrRjoi/3BT9fRyiA==,
+      }
+    engines: { node: ">= 16.0.0" }
+    peerDependencies:
+      pg-native: ">=3.0.1"
+    peerDependenciesMeta:
+      pg-native:
+        optional: true
+
+  pgpass@1.0.5:
+    resolution:
+      {
+        integrity: sha512-FdW9r/jQZhSeohs1Z3sI1yxFQNFvMcnmfuj4WBMUTxOrAyLMaTcE1aAMBiTlbMNaXvBCQuVi0R7hd8udDSP7ug==,
+      }
 
   piccolore@0.1.3:
     resolution:
@@ -9466,6 +9618,14 @@ packages:
         integrity: sha512-7igPTM53cGHMW8xWuVTydi2KO233VFiTNyF5hLJqpilHfmn8C8gPf+PS7dUT64YcXFbiMGZxS9pCSxL/Dxm/Jw==,
       }
     engines: { node: ">=14" }
+    hasBin: true
+
+  publint@0.3.21:
+    resolution:
+      {
+        integrity: sha512-OqejcnMV6E9zel2oCrUOJEiiFkGiAAni0A6ibfQNh1k9Gu5z4F+Yso8lllam7AzmV6Do0vp7u3UpZNRBwuXaHQ==,
+      }
+    engines: { node: ">=18" }
     hasBin: true
 
   pretty-ms@7.0.1:
@@ -10045,6 +10205,13 @@ packages:
         integrity: sha512-5l4VyZR86LZ/lDxZTR6jqL8AFE2S0IFLMP26AbjsLVADxHdhB/c0GUsH+y39UfCi3dzz8OlQuPmnaJOMoDHQBA==,
       }
 
+  sade@1.8.1:
+    resolution:
+      {
+        integrity: sha512-xal3CZX1Xlo/k4ApwCFrHVACi9fBqJ7V+mwhBsuf/1IOKbBy098Fex+Wa/5QMubw09pSZ/u8EY8PWgevJsXp1A==,
+      }
+    engines: { node: ">=6" }
+
   safe-buffer@5.2.1:
     resolution:
       {
@@ -10356,6 +10523,13 @@ packages:
       {
         integrity: sha512-PEGlAwrG8yXGXRjW32fGbg66JAlOAwbObuqVoJpv/mRgoWDQfgH1wDPvtzWyUSNAXBGSk8h755YDbbcEy3SH2Q==,
       }
+
+  split2@4.2.0:
+    resolution:
+      {
+        integrity: sha512-UcjcJOWknrNkF6PLX83qcHM6KHgVKNkV62Y8a5uYDVv9ydGQVwAHMKqHdJje1VTWpljG0WYpCDhrCdAOYH4TWg==,
+      }
+    engines: { node: ">= 10.x" }
 
   split@0.2.10:
     resolution:
@@ -11953,6 +12127,39 @@ snapshots:
       json-schema-to-ts: 3.1.1
     optionalDependencies:
       zod: 4.4.3
+
+  "@ast-grep/cli-darwin-arm64@0.43.0":
+    optional: true
+
+  "@ast-grep/cli-darwin-x64@0.43.0":
+    optional: true
+
+  "@ast-grep/cli-linux-arm64-gnu@0.43.0":
+    optional: true
+
+  "@ast-grep/cli-linux-x64-gnu@0.43.0":
+    optional: true
+
+  "@ast-grep/cli-win32-arm64-msvc@0.43.0":
+    optional: true
+
+  "@ast-grep/cli-win32-ia32-msvc@0.43.0":
+    optional: true
+
+  "@ast-grep/cli-win32-x64-msvc@0.43.0":
+    optional: true
+
+  "@ast-grep/cli@0.43.0":
+    dependencies:
+      detect-libc: 2.1.2
+    optionalDependencies:
+      "@ast-grep/cli-darwin-arm64": 0.43.0
+      "@ast-grep/cli-darwin-x64": 0.43.0
+      "@ast-grep/cli-linux-arm64-gnu": 0.43.0
+      "@ast-grep/cli-linux-x64-gnu": 0.43.0
+      "@ast-grep/cli-win32-arm64-msvc": 0.43.0
+      "@ast-grep/cli-win32-ia32-msvc": 0.43.0
+      "@ast-grep/cli-win32-x64-msvc": 0.43.0
 
   "@astrojs/check@0.9.9(prettier@3.8.3)(typescript@6.0.3)":
     dependencies:
@@ -13618,6 +13825,8 @@ snapshots:
 
   "@protobufjs/utf8@1.1.1": {}
 
+  "@publint/pack@0.1.4": {}
+
   "@redis/bloom@5.12.1(@redis/client@5.12.1)":
     dependencies:
       "@redis/client": 5.12.1
@@ -13924,6 +14133,7 @@ snapshots:
       - mysql2
       - next
       - pg
+      - pg-native
       - postgres
       - prisma
       - react-native-b4a
@@ -13978,9 +14188,9 @@ snapshots:
       - sql.js
       - sqlite3
 
-  "@sentry/junior-plugin-api@file:packages/junior-plugin-api(@neondatabase/serverless@1.1.0)":
+  "@sentry/junior-plugin-api@file:packages/junior-plugin-api(@neondatabase/serverless@1.1.0)(@types/pg@8.15.6)(pg@8.21.0)":
     dependencies:
-      drizzle-orm: 0.45.2(@neondatabase/serverless@1.1.0)
+      drizzle-orm: 0.45.2(@neondatabase/serverless@1.1.0)(@types/pg@8.15.6)(pg@8.21.0)
       zod: 4.4.3
     transitivePeerDependencies:
       - "@aws-sdk/client-rds-data"
@@ -14013,11 +14223,46 @@ snapshots:
       - sql.js
       - sqlite3
 
-  "@sentry/junior-scheduler@file:packages/junior-scheduler(@neondatabase/serverless@1.1.0)":
+  "@sentry/junior-plugin-api@file:packages/junior-plugin-api(@neondatabase/serverless@1.1.0)(pg@8.21.0)":
     dependencies:
-      "@sentry/junior-plugin-api": file:packages/junior-plugin-api(@neondatabase/serverless@1.1.0)
+      drizzle-orm: 0.45.2(@neondatabase/serverless@1.1.0)(pg@8.21.0)
+      zod: 4.4.3
+    transitivePeerDependencies:
+      - "@aws-sdk/client-rds-data"
+      - "@cloudflare/workers-types"
+      - "@electric-sql/pglite"
+      - "@libsql/client"
+      - "@libsql/client-wasm"
+      - "@neondatabase/serverless"
+      - "@op-engineering/op-sqlite"
+      - "@opentelemetry/api"
+      - "@planetscale/database"
+      - "@prisma/client"
+      - "@tidbcloud/serverless"
+      - "@types/better-sqlite3"
+      - "@types/pg"
+      - "@types/sql.js"
+      - "@upstash/redis"
+      - "@vercel/postgres"
+      - "@xata.io/client"
+      - better-sqlite3
+      - bun-types
+      - expo-sqlite
+      - gel
+      - knex
+      - kysely
+      - mysql2
+      - pg
+      - postgres
+      - prisma
+      - sql.js
+      - sqlite3
+
+  "@sentry/junior-scheduler@file:packages/junior-scheduler(@neondatabase/serverless@1.1.0)(@types/pg@8.15.6)(pg@8.21.0)":
+    dependencies:
+      "@sentry/junior-plugin-api": file:packages/junior-plugin-api(@neondatabase/serverless@1.1.0)(@types/pg@8.15.6)(pg@8.21.0)
       "@sinclair/typebox": 0.34.49
-      drizzle-orm: 0.45.2(@neondatabase/serverless@1.1.0)
+      drizzle-orm: 0.45.2(@neondatabase/serverless@1.1.0)(@types/pg@8.15.6)(pg@8.21.0)
       zod: 4.4.3
     transitivePeerDependencies:
       - "@aws-sdk/client-rds-data"
@@ -14050,10 +14295,10 @@ snapshots:
       - sql.js
       - sqlite3
 
-  "@sentry/junior-test-fixtures@file:packages/junior-test-fixtures(@neondatabase/serverless@1.1.0)":
+  "@sentry/junior-test-fixtures@file:packages/junior-test-fixtures(@neondatabase/serverless@1.1.0)(@types/pg@8.15.6)(pg@8.21.0)":
     dependencies:
       "@electric-sql/pglite": 0.4.6
-      drizzle-orm: 0.45.2(@electric-sql/pglite@0.4.6)(@neondatabase/serverless@1.1.0)
+      drizzle-orm: 0.45.2(@electric-sql/pglite@0.4.6)(@neondatabase/serverless@1.1.0)(@types/pg@8.15.6)(pg@8.21.0)
     transitivePeerDependencies:
       - "@aws-sdk/client-rds-data"
       - "@cloudflare/workers-types"
@@ -14095,7 +14340,7 @@ snapshots:
       "@logtape/logtape": 2.1.1
       "@modelcontextprotocol/sdk": 1.29.0(zod@4.4.3)
       "@neondatabase/serverless": 1.1.0
-      "@sentry/junior-plugin-api": file:packages/junior-plugin-api(@neondatabase/serverless@1.1.0)
+      "@sentry/junior-plugin-api": file:packages/junior-plugin-api(@neondatabase/serverless@1.1.0)(pg@8.21.0)
       "@sentry/node": 10.53.1
       "@sinclair/typebox": 0.34.49
       "@slack/web-api": 7.16.0
@@ -14105,11 +14350,13 @@ snapshots:
       ai: 6.0.190(zod@4.4.3)
       bash-tool: 1.3.16(@vercel/sandbox@2.0.0)(ai@6.0.190(zod@4.4.3))(just-bash@3.0.1)
       chat: 4.29.0(ai@6.0.190(zod@4.4.3))(zod@4.4.3)
-      drizzle-orm: 0.45.2(@neondatabase/serverless@1.1.0)
+      drizzle-orm: 0.45.2(@neondatabase/serverless@1.1.0)(pg@8.21.0)
       hono: 4.12.22
+      jiti: 2.7.0
       jose: 6.2.3
       just-bash: 3.0.1
       node-html-markdown: 2.0.0
+      pg: 8.21.0
       yaml: 2.9.0
       zod: 4.4.3
     transitivePeerDependencies:
@@ -14143,7 +14390,7 @@ snapshots:
       - knex
       - kysely
       - mysql2
-      - pg
+      - pg-native
       - postgres
       - prisma
       - react-native-b4a
@@ -14972,7 +15219,7 @@ snapshots:
       obug: 2.1.1
       std-env: 4.1.0
       tinyrainbow: 3.1.0
-      vitest: 4.1.7(@types/node@25.9.1)(@vitest/coverage-v8@4.1.7)(msw@2.14.6(@types/node@25.9.1)(typescript@6.0.3))(tsx@4.22.3)(yaml@2.9.0)
+      vitest: 4.1.7(@types/node@25.9.1)(@vitest/coverage-v8@4.1.7)(jiti@2.7.0)(msw@2.14.6(@types/node@25.9.1)(typescript@6.0.3))(tsx@4.22.3)(yaml@2.9.0)
 
   "@vitest/expect@4.1.7":
     dependencies:
@@ -14983,14 +15230,14 @@ snapshots:
       chai: 6.2.2
       tinyrainbow: 3.1.0
 
-  "@vitest/mocker@4.1.7(msw@2.14.6(@types/node@25.9.1)(typescript@6.0.3))(vite@8.0.14(@types/node@25.9.1)(tsx@4.22.3)(yaml@2.9.0))":
+  "@vitest/mocker@4.1.7(msw@2.14.6(@types/node@25.9.1)(typescript@6.0.3))(vite@8.0.14(@types/node@25.9.1)(jiti@2.7.0)(tsx@4.22.3)(yaml@2.9.0))":
     dependencies:
       "@vitest/spy": 4.1.7
       estree-walker: 3.0.3
       magic-string: 0.30.21
     optionalDependencies:
       msw: 2.14.6(@types/node@25.9.1)(typescript@6.0.3)
-      vite: 8.0.14(@types/node@25.9.1)(tsx@4.22.3)(yaml@2.9.0)
+      vite: 8.0.14(@types/node@25.9.1)(jiti@2.7.0)(tsx@4.22.3)(yaml@2.9.0)
 
   "@vitest/mocker@4.1.7(vite@8.0.14(@types/node@25.9.1)(tsx@4.22.3))":
     dependencies:
@@ -15728,9 +15975,9 @@ snapshots:
 
   db0@0.3.4: {}
 
-  db0@0.3.4(drizzle-orm@0.45.2(@neondatabase/serverless@1.1.0)):
+  db0@0.3.4(drizzle-orm@0.45.2(@neondatabase/serverless@1.1.0)(@types/pg@8.15.6)(pg@8.21.0)):
     optionalDependencies:
-      drizzle-orm: 0.45.2(@neondatabase/serverless@1.1.0)
+      drizzle-orm: 0.45.2(@neondatabase/serverless@1.1.0)(@types/pg@8.15.6)(pg@8.21.0)
 
   debug@4.3.4:
     dependencies:
@@ -15829,14 +16076,23 @@ snapshots:
     optionalDependencies:
       "@electric-sql/pglite": 0.4.6
 
-  drizzle-orm@0.45.2(@electric-sql/pglite@0.4.6)(@neondatabase/serverless@1.1.0):
+  drizzle-orm@0.45.2(@electric-sql/pglite@0.4.6)(@neondatabase/serverless@1.1.0)(@types/pg@8.15.6)(pg@8.21.0):
     optionalDependencies:
       "@electric-sql/pglite": 0.4.6
       "@neondatabase/serverless": 1.1.0
+      "@types/pg": 8.15.6
+      pg: 8.21.0
 
-  drizzle-orm@0.45.2(@neondatabase/serverless@1.1.0):
+  drizzle-orm@0.45.2(@neondatabase/serverless@1.1.0)(@types/pg@8.15.6)(pg@8.21.0):
     optionalDependencies:
       "@neondatabase/serverless": 1.1.0
+      "@types/pg": 8.15.6
+      pg: 8.21.0
+
+  drizzle-orm@0.45.2(@neondatabase/serverless@1.1.0)(pg@8.21.0):
+    optionalDependencies:
+      "@neondatabase/serverless": 1.1.0
+      pg: 8.21.0
 
   dset@3.1.4: {}
 
@@ -17744,11 +18000,11 @@ snapshots:
       - sqlite3
       - uploadthing
 
-  nitro@3.0.260522-beta(@vercel/functions@3.6.0)(@vercel/queue@0.2.0)(drizzle-orm@0.45.2(@neondatabase/serverless@1.1.0)):
+  nitro@3.0.260522-beta(@vercel/functions@3.6.0)(@vercel/queue@0.2.0)(drizzle-orm@0.45.2(@neondatabase/serverless@1.1.0)(@types/pg@8.15.6)(pg@8.21.0))(jiti@2.7.0):
     dependencies:
       consola: 3.4.2
       crossws: 0.4.5(srvx@0.11.16)
-      db0: 0.3.4(drizzle-orm@0.45.2(@neondatabase/serverless@1.1.0))
+      db0: 0.3.4(drizzle-orm@0.45.2(@neondatabase/serverless@1.1.0)(@types/pg@8.15.6)(pg@8.21.0))
       env-runner: 0.1.9(@vercel/queue@0.2.0)
       h3: 2.0.1-rc.22(crossws@0.4.5(srvx@0.11.16))
       hookable: 6.1.1
@@ -17759,9 +18015,10 @@ snapshots:
       rolldown: 1.0.2
       srvx: 0.11.16
       unenv: 2.0.0-rc.24
-      unstorage: 2.0.0-alpha.7(@vercel/functions@3.6.0)(db0@0.3.4(drizzle-orm@0.45.2(@neondatabase/serverless@1.1.0)))(ofetch@2.0.0-alpha.3)
+      unstorage: 2.0.0-alpha.7(@vercel/functions@3.6.0)(db0@0.3.4(drizzle-orm@0.45.2(@neondatabase/serverless@1.1.0)(@types/pg@8.15.6)(pg@8.21.0)))(ofetch@2.0.0-alpha.3)
     optionalDependencies:
       "@vercel/queue": 0.2.0
+      jiti: 2.7.0
     transitivePeerDependencies:
       - "@azure/app-configuration"
       - "@azure/cosmos"
@@ -18134,7 +18391,16 @@ snapshots:
 
   pend@1.2.0: {}
 
+  pg-cloudflare@1.4.0:
+    optional: true
+
+  pg-connection-string@2.13.0: {}
+
   pg-int8@1.0.1: {}
+
+  pg-pool@3.14.0(pg@8.21.0):
+    dependencies:
+      pg: 8.21.0
 
   pg-protocol@1.14.0: {}
 
@@ -18145,6 +18411,20 @@ snapshots:
       postgres-bytea: 1.0.1
       postgres-date: 1.0.7
       postgres-interval: 1.2.0
+
+  pg@8.21.0:
+    dependencies:
+      pg-connection-string: 2.13.0
+      pg-pool: 3.14.0(pg@8.21.0)
+      pg-protocol: 1.14.0
+      pg-types: 2.2.0
+      pgpass: 1.0.5
+    optionalDependencies:
+      pg-cloudflare: 1.4.0
+
+  pgpass@1.0.5:
+    dependencies:
+      split2: 4.2.0
 
   piccolore@0.1.3: {}
 
@@ -18174,18 +18454,19 @@ snapshots:
     optionalDependencies:
       fsevents: 2.3.2
 
+  postcss-load-config@6.0.1(jiti@2.7.0)(tsx@4.22.3)(yaml@2.9.0):
+    dependencies:
+      lilconfig: 3.1.3
+    optionalDependencies:
+      jiti: 2.7.0
+      tsx: 4.22.3
+      yaml: 2.9.0
+
   postcss-load-config@6.0.1(tsx@4.22.3):
     dependencies:
       lilconfig: 3.1.3
     optionalDependencies:
       tsx: 4.22.3
-
-  postcss-load-config@6.0.1(tsx@4.22.3)(yaml@2.9.0):
-    dependencies:
-      lilconfig: 3.1.3
-    optionalDependencies:
-      tsx: 4.22.3
-      yaml: 2.9.0
 
   postcss-nested@6.2.0(postcss@8.5.15):
     dependencies:
@@ -18230,6 +18511,13 @@ snapshots:
     optional: true
 
   prettier@3.8.3: {}
+
+  publint@0.3.21:
+    dependencies:
+      "@publint/pack": 0.1.4
+      package-manager-detector: 1.6.0
+      picocolors: 1.1.1
+      sade: 1.8.1
 
   pretty-ms@7.0.1:
     dependencies:
@@ -18743,6 +19031,10 @@ snapshots:
     dependencies:
       queue-microtask: 1.2.3
 
+  sade@1.8.1:
+    dependencies:
+      mri: 1.2.0
+
   safe-buffer@5.2.1: {}
 
   safe-regex@2.1.1:
@@ -18951,15 +19243,18 @@ snapshots:
 
   source-map-js@1.2.1: {}
 
-  source-map@0.6.1: {}
+  source-map@0.6.1:
+    optional: true
 
   source-map@0.7.6: {}
+
+  space-separated-tokens@2.0.2: {}
+
+  split2@4.2.0: {}
 
   split@0.2.10:
     dependencies:
       through: 2.3.8
-
-  space-separated-tokens@2.0.2: {}
 
   sprintf-js@1.1.3: {}
 
@@ -19240,7 +19535,7 @@ snapshots:
 
   tslib@2.8.1: {}
 
-  tsup@8.5.1(tsx@4.22.3)(typescript@6.0.3):
+  tsup@8.5.1(jiti@2.7.0)(tsx@4.22.3)(typescript@6.0.3)(yaml@2.9.0):
     dependencies:
       bundle-require: 5.1.0(esbuild@0.27.7)
       cac: 6.7.14
@@ -19251,7 +19546,7 @@ snapshots:
       fix-dts-default-cjs-exports: 1.0.1
       joycon: 3.1.1
       picocolors: 1.1.1
-      postcss-load-config: 6.0.1(tsx@4.22.3)
+      postcss-load-config: 6.0.1(jiti@2.7.0)(tsx@4.22.3)(yaml@2.9.0)
       resolve-from: 5.0.0
       rollup: 4.60.4
       source-map: 0.7.6
@@ -19267,7 +19562,7 @@ snapshots:
       - tsx
       - yaml
 
-  tsup@8.5.1(tsx@4.22.3)(typescript@6.0.3)(yaml@2.9.0):
+  tsup@8.5.1(tsx@4.22.3)(typescript@6.0.3):
     dependencies:
       bundle-require: 5.1.0(esbuild@0.27.7)
       cac: 6.7.14
@@ -19278,7 +19573,7 @@ snapshots:
       fix-dts-default-cjs-exports: 1.0.1
       joycon: 3.1.1
       picocolors: 1.1.1
-      postcss-load-config: 6.0.1(tsx@4.22.3)(yaml@2.9.0)
+      postcss-load-config: 6.0.1(tsx@4.22.3)
       resolve-from: 5.0.0
       rollup: 4.60.4
       source-map: 0.7.6
@@ -19463,10 +19758,10 @@ snapshots:
       ofetch: 1.5.1
       ufo: 1.6.4
 
-  unstorage@2.0.0-alpha.7(@vercel/functions@3.6.0)(db0@0.3.4(drizzle-orm@0.45.2(@neondatabase/serverless@1.1.0)))(ofetch@2.0.0-alpha.3):
+  unstorage@2.0.0-alpha.7(@vercel/functions@3.6.0)(db0@0.3.4(drizzle-orm@0.45.2(@neondatabase/serverless@1.1.0)(@types/pg@8.15.6)(pg@8.21.0)))(ofetch@2.0.0-alpha.3):
     optionalDependencies:
       "@vercel/functions": 3.6.0
-      db0: 0.3.4(drizzle-orm@0.45.2(@neondatabase/serverless@1.1.0))
+      db0: 0.3.4(drizzle-orm@0.45.2(@neondatabase/serverless@1.1.0)(@types/pg@8.15.6)(pg@8.21.0))
       ofetch: 2.0.0-alpha.3
 
   unstorage@2.0.0-alpha.7(db0@0.3.4)(ofetch@2.0.0-alpha.3):
@@ -19578,6 +19873,20 @@ snapshots:
       fsevents: 2.3.3
       tsx: 4.22.3
 
+  vite@8.0.14(@types/node@25.9.1)(jiti@2.7.0)(tsx@4.22.3)(yaml@2.9.0):
+    dependencies:
+      lightningcss: 1.32.0
+      picomatch: 4.0.4
+      postcss: 8.5.15
+      rolldown: 1.0.2
+      tinyglobby: 0.2.16
+    optionalDependencies:
+      "@types/node": 25.9.1
+      fsevents: 2.3.3
+      jiti: 2.7.0
+      tsx: 4.22.3
+      yaml: 2.9.0
+
   vite@8.0.14(@types/node@25.9.1)(tsx@4.22.3):
     dependencies:
       lightningcss: 1.32.0
@@ -19589,19 +19898,6 @@ snapshots:
       "@types/node": 25.9.1
       fsevents: 2.3.3
       tsx: 4.22.3
-
-  vite@8.0.14(@types/node@25.9.1)(tsx@4.22.3)(yaml@2.9.0):
-    dependencies:
-      lightningcss: 1.32.0
-      picomatch: 4.0.4
-      postcss: 8.5.15
-      rolldown: 1.0.2
-      tinyglobby: 0.2.16
-    optionalDependencies:
-      "@types/node": 25.9.1
-      fsevents: 2.3.3
-      tsx: 4.22.3
-      yaml: 2.9.0
 
   vite@8.0.14(tsx@4.22.3):
     dependencies:
@@ -19623,10 +19919,10 @@ snapshots:
       tinyrainbow: 3.1.0
       vitest: 4.1.7(tsx@4.22.3)
 
-  vitest@4.1.7(@types/node@25.9.1)(@vitest/coverage-v8@4.1.7)(msw@2.14.6(@types/node@25.9.1)(typescript@6.0.3))(tsx@4.22.3)(yaml@2.9.0):
+  vitest@4.1.7(@types/node@25.9.1)(@vitest/coverage-v8@4.1.7)(jiti@2.7.0)(msw@2.14.6(@types/node@25.9.1)(typescript@6.0.3))(tsx@4.22.3)(yaml@2.9.0):
     dependencies:
       "@vitest/expect": 4.1.7
-      "@vitest/mocker": 4.1.7(msw@2.14.6(@types/node@25.9.1)(typescript@6.0.3))(vite@8.0.14(@types/node@25.9.1)(tsx@4.22.3)(yaml@2.9.0))
+      "@vitest/mocker": 4.1.7(msw@2.14.6(@types/node@25.9.1)(typescript@6.0.3))(vite@8.0.14(@types/node@25.9.1)(jiti@2.7.0)(tsx@4.22.3)(yaml@2.9.0))
       "@vitest/pretty-format": 4.1.7
       "@vitest/runner": 4.1.7
       "@vitest/snapshot": 4.1.7
@@ -19643,7 +19939,7 @@ snapshots:
       tinyexec: 1.1.2
       tinyglobby: 0.2.16
       tinyrainbow: 3.1.0
-      vite: 8.0.14(@types/node@25.9.1)(tsx@4.22.3)(yaml@2.9.0)
+      vite: 8.0.14(@types/node@25.9.1)(jiti@2.7.0)(tsx@4.22.3)(yaml@2.9.0)
       why-is-node-running: 2.3.0
     optionalDependencies:
       "@types/node": 25.9.1

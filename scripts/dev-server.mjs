@@ -2,6 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { loadEnvFiles } from "./lib/load-env-files.mjs";
 import {
   linkDirectory,
   resolveInjectedPackageDir,
@@ -31,21 +32,7 @@ if (!process.env.NO_COLOR && !process.env.FORCE_COLOR) {
   }
 }
 
-const envCandidates = [
-  `.env.${nodeEnv}.local`,
-  nodeEnv === "test" ? null : ".env.local",
-  `.env.${nodeEnv}`,
-  ".env",
-].filter(Boolean);
-
-for (const relativePath of envCandidates) {
-  const absolutePath = path.join(workspaceRoot, relativePath);
-  if (!fs.existsSync(absolutePath)) {
-    continue;
-  }
-
-  process.loadEnvFile(absolutePath);
-}
+loadEnvFiles([workspaceRoot, exampleDir]);
 
 const children = new Set();
 

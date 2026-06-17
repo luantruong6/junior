@@ -14,14 +14,33 @@ const SYSTEM_MESSAGE = {
 };
 
 const ORIGINAL_ENV = { ...process.env };
+const USE_POSTGRES_HARNESS = Boolean(process.env.JUNIOR_TEST_DATABASE_URL);
+
+async function createStateReportingReader() {
+  const { createStateConversationStore } =
+    await import("@/chat/conversations/state");
+  const { getStateAdapter } = await import("@/chat/state/adapter");
+  const { readConversationReport, readConversationStatsReport } =
+    await import("@/reporting/conversations");
+  const conversationStore = createStateConversationStore(getStateAdapter());
+  return {
+    conversationStore,
+    readConversationReport,
+    readConversationStatsReport,
+  };
+}
 
 describe("dashboard reporting", () => {
   beforeEach(async () => {
     process.env = {
       ...ORIGINAL_ENV,
       JUNIOR_STATE_ADAPTER: "memory",
-      DATABASE_URL: undefined,
-      JUNIOR_DATABASE_URL: undefined,
+      DATABASE_URL: USE_POSTGRES_HARNESS
+        ? ORIGINAL_ENV.DATABASE_URL
+        : undefined,
+      JUNIOR_DATABASE_URL: USE_POSTGRES_HARNESS
+        ? ORIGINAL_ENV.JUNIOR_DATABASE_URL
+        : undefined,
     };
     vi.resetModules();
     const { disconnectStateAdapter } = await import("@/chat/state/adapter");
@@ -30,6 +49,9 @@ describe("dashboard reporting", () => {
 
   afterEach(async () => {
     const { disconnectStateAdapter } = await import("@/chat/state/adapter");
+    const { closeConfiguredConversationStore } =
+      await import("@/chat/conversations/configured");
+    await closeConfiguredConversationStore();
     await disconnectStateAdapter();
     vi.useRealTimers();
     vi.resetModules();
@@ -543,9 +565,11 @@ describe("dashboard reporting", () => {
     vi.setSystemTime(new Date(startedAtMs));
     const { recordAgentTurnSessionSummary } =
       await import("@/chat/state/turn-session");
-    const { createJuniorReporting } = await import("@/reporting");
+    const { conversationStore, readConversationStatsReport } =
+      await createStateReportingReader();
 
     await recordAgentTurnSessionSummary({
+      conversationStore,
       conversationId: "slack:C1:baseline",
       cumulativeDurationMs: 1_000,
       requester: { fullName: "Avery" },
@@ -557,6 +581,7 @@ describe("dashboard reporting", () => {
     for (let index = 0; index < 5_000; index += 1) {
       vi.setSystemTime(new Date(startedAtMs + (index + 1) * 1000));
       await recordAgentTurnSessionSummary({
+        conversationStore,
         conversationId: `slack:C_FILL:${index}`,
         cumulativeDurationMs: 1,
         requester: { fullName: "Filler" },
@@ -567,6 +592,7 @@ describe("dashboard reporting", () => {
     }
     vi.setSystemTime(new Date(startedAtMs + 5_001 * 1000));
     await recordAgentTurnSessionSummary({
+      conversationStore,
       conversationId: "slack:C1:baseline",
       cumulativeDurationMs: 1_500,
       requester: { fullName: "Blake" },
@@ -575,7 +601,7 @@ describe("dashboard reporting", () => {
       state: "completed",
     });
 
-    const stats = await createJuniorReporting().getConversationStats();
+    const stats = await readConversationStatsReport({ conversationStore });
     const avery = stats.requesters.find((item) => item.label === "Avery");
     const blake = stats.requesters.find((item) => item.label === "Blake");
 
@@ -590,10 +616,12 @@ describe("dashboard reporting", () => {
     vi.setSystemTime(new Date("2026-06-04T12:00:00.000Z"));
     const { recordAgentTurnSessionSummary } =
       await import("@/chat/state/turn-session");
-    const { createJuniorReporting } = await import("@/reporting");
+    const { conversationStore, readConversationStatsReport } =
+      await createStateReportingReader();
 
     for (let index = 0; index < 5_001; index += 1) {
       await recordAgentTurnSessionSummary({
+        conversationStore,
         conversationId: `slack:C1:${index}`,
         sessionId: `turn-${index}`,
         sliceId: 1,
@@ -601,7 +629,7 @@ describe("dashboard reporting", () => {
       });
     }
 
-    const stats = await createJuniorReporting().getConversationStats();
+    const stats = await readConversationStatsReport({ conversationStore });
 
     expect(stats).toMatchObject({
       sampleLimit: 5_000,
@@ -788,9 +816,11 @@ describe("dashboard reporting", () => {
   it("reports a conversation after newer turns evict it from the global index", async () => {
     const { recordAgentTurnSessionSummary, upsertAgentTurnSessionRecord } =
       await import("@/chat/state/turn-session");
-    const { createJuniorReporting } = await import("@/reporting");
+    const { conversationStore, readConversationReport } =
+      await createStateReportingReader();
 
     await upsertAgentTurnSessionRecord({
+      conversationStore,
       conversationId: "slack:C1:999",
       destination: {
         platform: "slack",
@@ -811,6 +841,7 @@ describe("dashboard reporting", () => {
 
     for (let index = 0; index < 5_005; index += 1) {
       await recordAgentTurnSessionSummary({
+        conversationStore,
         conversationId: `slack:C2:${index}`,
         sessionId: `newer-turn-${index}`,
         sliceId: 1,
@@ -818,8 +849,9 @@ describe("dashboard reporting", () => {
       });
     }
 
-    const report =
-      await createJuniorReporting().getConversation("slack:C1:999");
+    const report = await readConversationReport("slack:C1:999", {
+      conversationStore,
+    });
 
     expect(report.runs).toHaveLength(1);
     expect(report.runs[0]).toMatchObject({

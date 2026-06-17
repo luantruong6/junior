@@ -9,7 +9,6 @@ import { generateAssistantReply } from "@/chat/respond";
 import { normalizeSandboxEgressTracePropagationDomains } from "@/chat/sandbox/egress-tracing";
 import {
   getPluginCatalogSignature,
-  getPluginProviders,
   setPluginCatalogConfig,
 } from "@/chat/plugins/registry";
 import {
@@ -20,9 +19,13 @@ import {
 } from "@/chat/plugins/agent-hooks";
 import { validatePluginDatabaseRequirements } from "@/chat/plugins/db";
 import type { PluginCatalogConfig } from "@/chat/plugins/types";
+import {
+  validatePluginEgressCredentialHooks,
+  validatePluginRegistrations,
+} from "@/chat/plugins/validation";
 import type {
-  PluginRouteMethod,
   PluginRegistration,
+  PluginRouteMethod,
 } from "@sentry/junior-plugin-api";
 import {
   pluginCatalogConfigFromEnv,
@@ -35,11 +38,8 @@ import { POST as agentDispatchPOST } from "@/handlers/agent-dispatch";
 import { GET as heartbeatGET } from "@/handlers/heartbeat";
 import { GET as mcpOauthCallbackGET } from "@/handlers/mcp-oauth-callback";
 import { GET as oauthCallbackGET } from "@/handlers/oauth-callback";
-import {
-  ALL as sandboxEgressProxyALL,
-  isSandboxEgressRequest,
-} from "@/handlers/sandbox-egress-proxy";
-import { POST as webhooksPOST } from "@/handlers/webhooks";
+import { handleSandboxEgressRoute } from "@/handlers/sandbox-egress-route";
+import { POST as slackWebhookPOST } from "@/handlers/slack-webhook";
 import {
   createVercelConversationWorkCallback,
   registerVercelConversationWorkDevConsumer,
@@ -205,76 +205,6 @@ function validateBuildIncludesPluginHookRegistrations(
   );
 }
 
-function validatePluginRegistrations(
-  registrations: PluginRegistration[],
-): void {
-  const loadedPlugins = getPluginProviders();
-  const loadedNames = new Set(
-    loadedPlugins.map((plugin) => plugin.manifest.name),
-  );
-
-  for (const registration of registrations) {
-    if (!loadedNames.has(registration.manifest.name)) {
-      throw new Error(
-        `Plugin registration "${registration.manifest.name}" does not have a matching plugin manifest. Add an inline manifest, packageName, or app-local plugin.yaml with the same name.`,
-      );
-    }
-  }
-}
-
-function validatePluginEgressCredentialHooks(
-  registrations: PluginRegistration[],
-): void {
-  const plugins = new Map(
-    registrations.map((registration) => [
-      registration.manifest.name,
-      registration,
-    ]),
-  );
-
-  for (const provider of getPluginProviders()) {
-    const hooks = plugins.get(provider.manifest.name)?.hooks;
-    const hasGrantHook = Boolean(hooks?.grantForEgress);
-    const hasIssueHook = Boolean(hooks?.issueCredential);
-    const hasGenericCredentials = Boolean(
-      provider.manifest.credentials || provider.manifest.apiHeaders,
-    );
-    const hasDomains = Boolean(provider.manifest.domains?.length);
-    const hasHookManagedOAuth = Boolean(
-      provider.manifest.oauth && !provider.manifest.credentials,
-    );
-    if (!hasGrantHook && !hasIssueHook) {
-      if (hasDomains && !hasGenericCredentials) {
-        throw new Error(
-          `Plugin "${provider.manifest.name}" manifest.domains requires egress credential hooks when no generic credentials or apiHeaders are configured.`,
-        );
-      }
-      if (hasHookManagedOAuth) {
-        throw new Error(
-          `Plugin "${provider.manifest.name}" manifest.oauth without oauth-bearer credentials requires egress credential hooks.`,
-        );
-      }
-      continue;
-    }
-
-    if (!hasGrantHook || !hasIssueHook) {
-      throw new Error(
-        `Plugin "${provider.manifest.name}" egress credential hooks must include both grantForEgress and issueCredential.`,
-      );
-    }
-    if (hasGenericCredentials) {
-      throw new Error(
-        `Plugin "${provider.manifest.name}" egress credential hooks must use manifest.domains instead of generic credentials or apiHeaders.`,
-      );
-    }
-    if (!hasDomains) {
-      throw new Error(
-        `Plugin "${provider.manifest.name}" egress credential hooks require manifest.domains to list sandbox egress hosts.`,
-      );
-    }
-  }
-}
-
 /** Mount plugin HTTP handlers before core routes claim those paths. */
 function mountPluginRoutes(app: Hono, routes: PluginRouteRegistration[]): void {
   for (const route of routes) {
@@ -365,14 +295,11 @@ export async function createApp(options?: JuniorAppOptions): Promise<Hono> {
   });
 
   app.use("*", async (c, next) => {
-    // Vercel Sandbox proxying preserves the original upstream path, so detect
-    // authenticated proxy traffic before ordinary application routes claim it.
-    if (isSandboxEgressRequest(c.req.raw)) {
-      return await sandboxEgressProxyALL(c.req.raw, {
-        tracePropagation: { domains: sandboxEgressTracePropagationDomains },
-      });
-    }
-    await next();
+    return await handleSandboxEgressRoute(
+      c.req.raw,
+      sandboxEgressTracePropagationDomains,
+      next,
+    );
   });
 
   mountPluginRoutes(app, pluginRoutes);
@@ -428,13 +355,14 @@ export async function createApp(options?: JuniorAppOptions): Promise<Hono> {
     return heartbeatGET(c.req.raw, waitUntil);
   });
 
+  app.post("/api/webhooks/slack", (c) => {
+    return slackWebhookPOST(c.req.raw, waitUntil, slackWebhookServices);
+  });
+
   app.post("/api/webhooks/:platform", (c) => {
-    return webhooksPOST(
-      c.req.raw,
-      c.req.param("platform"),
-      waitUntil,
-      slackWebhookServices,
-    );
+    return new Response(`Unknown platform: ${c.req.param("platform")}`, {
+      status: 404,
+    });
   });
 
   return app;

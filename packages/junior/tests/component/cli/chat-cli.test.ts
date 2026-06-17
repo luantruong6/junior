@@ -1,4 +1,7 @@
 import { PassThrough, Writable } from "node:stream";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CHAT_USAGE, runChat } from "@/cli/chat";
 import type {
@@ -16,6 +19,9 @@ vi.mock("@/chat/local/runner", () => ({
 
 const ORIGINAL_STATE_ADAPTER = process.env.JUNIOR_STATE_ADAPTER;
 const ORIGINAL_REDIS_URL = process.env.REDIS_URL;
+const ORIGINAL_DATABASE_URL = process.env.DATABASE_URL;
+const ORIGINAL_JUNIOR_DATABASE_URL = process.env.JUNIOR_DATABASE_URL;
+const ORIGINAL_CWD = process.cwd();
 
 function reply(outcome: LocalAgentTurnResult["outcome"]): {
   conversationId: string;
@@ -37,8 +43,12 @@ describe("chat cli", () => {
   });
 
   afterEach(() => {
+    process.chdir(ORIGINAL_CWD);
     restoreEnv("JUNIOR_STATE_ADAPTER", ORIGINAL_STATE_ADAPTER);
     restoreEnv("REDIS_URL", ORIGINAL_REDIS_URL);
+    restoreEnv("DATABASE_URL", ORIGINAL_DATABASE_URL);
+    restoreEnv("JUNIOR_DATABASE_URL", ORIGINAL_JUNIOR_DATABASE_URL);
+    vi.resetModules();
   });
 
   it("returns usage for invalid argument forms", async () => {
@@ -106,6 +116,148 @@ describe("chat cli", () => {
 
     expect(await runChat(["-p", "hello"], io)).toBe(0);
     expect(process.env.JUNIOR_STATE_ADAPTER).toBe("memory");
+    const { getChatConfig } = await import("@/chat/config");
+    expect(getChatConfig().state.adapter).toBe("memory");
+  });
+
+  it("fails local chat for database plugins without SQL configuration", async () => {
+    delete process.env.DATABASE_URL;
+    delete process.env.JUNIOR_DATABASE_URL;
+    const tempDir = mkdtempSync(path.join(tmpdir(), "junior-chat-plugins-"));
+    writeFileSync(
+      path.join(tempDir, "plugins.mjs"),
+      `export const plugins = {
+  packageNames: [],
+  registrations: [
+    {
+      database: {},
+      manifest: {
+        name: "database-plugin",
+        displayName: "Database Plugin",
+        description: "Database-backed local chat test plugin",
+      },
+    },
+  ],
+};
+`,
+    );
+    process.chdir(tempDir);
+
+    try {
+      const io = {
+        error: vi.fn(),
+        input: process.stdin,
+        output: process.stdout,
+        write: vi.fn(),
+      };
+
+      expect(await runChat(["-p", "hello"], io)).toBe(1);
+      expect(io.error).toHaveBeenCalledWith(
+        "Plugin database access requires JUNIOR_DATABASE_URL or DATABASE_URL for: database-plugin",
+      );
+      expect(runner.runLocalAgentTurn).not.toHaveBeenCalled();
+    } finally {
+      process.chdir(ORIGINAL_CWD);
+      rmSync(tempDir, { force: true, recursive: true });
+    }
+  });
+
+  it("fails local chat for unresolved plugin packages", async () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "junior-chat-plugins-"));
+    writeFileSync(
+      path.join(tempDir, "plugins.mjs"),
+      `export const plugins = {
+  packageNames: ["@sentry/junior-missing-plugin"],
+  registrations: [],
+};
+`,
+    );
+    process.chdir(tempDir);
+
+    try {
+      const io = {
+        error: vi.fn(),
+        input: process.stdin,
+        output: process.stdout,
+        write: vi.fn(),
+      };
+
+      expect(await runChat(["-p", "hello"], io)).toBe(1);
+      expect(io.error).toHaveBeenCalledWith(
+        expect.stringContaining(
+          'Plugin package "@sentry/junior-missing-plugin" was configured but could not be resolved',
+        ),
+      );
+      expect(runner.runLocalAgentTurn).not.toHaveBeenCalled();
+    } finally {
+      process.chdir(ORIGINAL_CWD);
+      rmSync(tempDir, { force: true, recursive: true });
+    }
+  });
+
+  it("loads TypeScript local plugin modules before prompt local chat", async () => {
+    const tempDir = mkdtempSync(path.join(tmpdir(), "junior-chat-plugins-"));
+    writeFileSync(
+      path.join(tempDir, "plugins.js"),
+      `export const plugins = {
+  packageNames: [],
+  registrations: [
+    {
+      manifest: {
+        name: "javascript-plugin",
+        displayName: "JavaScript Plugin",
+        description: "JavaScript local plugin module test",
+      },
+    },
+  ],
+};
+`,
+    );
+    writeFileSync(
+      path.join(tempDir, "plugins.ts"),
+      `const packageNames: string[] = [];
+
+export const plugins = {
+  packageNames,
+  registrations: [
+    {
+      manifest: {
+        name: "typescript-plugin",
+        displayName: "TypeScript Plugin",
+        description: "TypeScript local plugin module test",
+      },
+    },
+  ],
+};
+`,
+    );
+    process.chdir(tempDir);
+    runner.runLocalAgentTurn.mockImplementation(async (_input, deps) => {
+      const result = reply("success");
+      await deps.deliverReply(result.reply);
+      return result;
+    });
+
+    try {
+      const io = {
+        error: vi.fn(),
+        input: process.stdin,
+        output: process.stdout,
+        write: vi.fn(),
+      };
+
+      expect(await runChat(["-p", "hello"], io)).toBe(0);
+      expect(runner.runLocalAgentTurn).toHaveBeenCalledOnce();
+      const { getPluginProviders } = await import("@/chat/plugins/registry");
+      const pluginNames = getPluginProviders().map(
+        (plugin) => plugin.manifest.name,
+      );
+      expect(pluginNames).toContain("typescript-plugin");
+      expect(pluginNames).not.toContain("javascript-plugin");
+    } finally {
+      process.chdir(ORIGINAL_CWD);
+      rmSync(tempDir, { force: true, recursive: true });
+    }
   });
 
   it("preserves an explicit prompt local chat state adapter", async () => {
@@ -126,6 +278,8 @@ describe("chat cli", () => {
 
     expect(await runChat(["-p", "hello"], io)).toBe(0);
     expect(process.env.JUNIOR_STATE_ADAPTER).toBe("redis");
+    const { getChatConfig } = await import("@/chat/config");
+    expect(getChatConfig().state.adapter).toBe("redis");
   });
 
   it("defaults interactive local chat to memory even when REDIS_URL is present", async () => {
@@ -149,6 +303,8 @@ describe("chat cli", () => {
 
     expect(await pending).toBe(0);
     expect(process.env.JUNIOR_STATE_ADAPTER).toBe("memory");
+    const { getChatConfig } = await import("@/chat/config");
+    expect(getChatConfig().state.adapter).toBe("memory");
   });
 
   it("uses a fresh local conversation for each prompt invocation", async () => {

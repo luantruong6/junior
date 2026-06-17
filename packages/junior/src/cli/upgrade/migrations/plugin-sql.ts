@@ -4,7 +4,7 @@ import {
   getPluginMigrationRoots,
   setPluginCatalogConfig,
 } from "@/chat/plugins/registry";
-import { createNeonJuniorSqlExecutor } from "@/chat/sql/neon";
+import { createJuniorSqlExecutor } from "@/chat/sql/executor";
 import { resolveUpgradePlugins } from "./upgrade-plugins";
 import type { MigrationContext, MigrationResult } from "../types";
 
@@ -26,8 +26,9 @@ export async function migratePluginsToSql(
   const databaseUrl = requirePluginSqlDatabaseUrl(context);
   const { pluginCatalogConfig } = await resolveUpgradePlugins(context);
   const previousConfig = setPluginCatalogConfig(pluginCatalogConfig);
-  const executor = createNeonJuniorSqlExecutor({
+  const executor = createJuniorSqlExecutor({
     connectionString: databaseUrl,
+    driver: context.sqlDriver ?? getChatConfig().sql.driver,
   });
   try {
     const migrations = getPluginMigrationRoots().flatMap((root) =>
