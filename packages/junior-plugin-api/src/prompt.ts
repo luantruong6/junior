@@ -1,59 +1,33 @@
-import type { InvocationContext, PluginContext } from "./context";
+import { z } from "zod";
 import type {
-  PluginSessionState,
-  PluginSessionStateAppend,
-  PluginState,
-} from "./state";
+  Destination,
+  Platform,
+  PluginContext,
+  Requester,
+  Source,
+} from "./context";
+import type { PluginState } from "./state";
 
-export interface UserPromptContribution {
-  id: string;
-  text: string;
-}
+export const promptMessageSchema = z
+  .object({
+    text: z.string().trim().min(1).max(8_000),
+  })
+  .strict();
 
-export interface UserPromptContributionResult {
-  contributions?: UserPromptContribution[];
-  sessionState?: PluginSessionStateAppend[];
-}
+/** Small plugin-owned prompt text block rendered by Junior core. */
+export type PromptMessage = z.output<typeof promptMessageSchema>;
 
-export type UserPromptHookContext = PluginContext &
-  InvocationContext & {
-    isFirstPrompt: boolean;
-    session: PluginSessionState;
-    state: PluginState;
-    userText: string;
-  };
+/** Stable platform context for plugin system prompt guidance. */
+export type SystemPromptContext = Pick<PluginContext, "log" | "plugin"> & {
+  platform: Platform;
+};
 
-export interface PluginTaskEnqueueOptions {
-  idempotencyKey: string;
-  name: string;
-  payload?: unknown;
-}
-
-export interface PluginTaskEnqueueResult {
-  id: string;
-  status: "created" | "already_exists";
-}
-
-export interface PluginTaskQueue {
-  enqueue(options: PluginTaskEnqueueOptions): Promise<PluginTaskEnqueueResult>;
-}
-
-export type TurnObservationHookContext = PluginContext &
-  InvocationContext & {
-    observationId: string;
-    tasks: PluginTaskQueue;
-  };
-
-export interface PluginTaskContext extends PluginContext {
-  id: string;
-  name: string;
-  observation?: {
-    load(): Promise<unknown | undefined>;
-  };
-  payload?: unknown;
+/** Runtime facts available while building plugin user prompt context. */
+export type UserPromptContext = Pick<PluginContext, "log" | "plugin"> & {
+  conversationId?: string;
+  destination?: Destination;
+  requester?: Requester;
+  source: Source;
   state: PluginState;
-}
-
-export type PluginTaskHandler = (
-  ctx: PluginTaskContext,
-) => Promise<void> | void;
+  text: string;
+};

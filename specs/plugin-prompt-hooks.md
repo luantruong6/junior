@@ -3,26 +3,24 @@
 ## Metadata
 
 - Created: 2026-06-12
-- Last Edited: 2026-06-13
+- Last Edited: 2026-06-19
 
 ## Purpose
 
 Define the generic plugin hooks that let runtime hook plugins contribute prompt
-text, observe completed turns, enqueue plugin background work, and keep
-per-session append-only bookkeeping without exposing raw Junior internals or
-creating memory-specific plugin APIs.
+text, observe completed turns, and enqueue plugin background work without
+exposing raw Junior internals or creating memory-specific plugin APIs.
 
 ## Implementation Status
 
-This is a target design for future plugin prompt, observation, session-state,
-and background-task hooks. The current `@sentry/junior-plugin-api` package does
-not export `userPrompt`, `observeTurn`, plugin prompt session state, or plugin
-background task handlers, and Junior core does not invoke those hooks yet.
+Plugin prompt hooks are implemented in Junior core and
+`@sentry/junior-plugin-api`. Turn observation hooks and background task handlers
+remain target design for a later implementation slice.
 
 ## Scope
 
 - Plugin-provided system prompt and user prompt contributions.
-- Prompt hook context and plugin-scoped session append state.
+- Prompt hook context.
 - Post-turn observation hook and plugin background task contract for passive
   extraction workflows.
 - Security and rendering boundaries for prompt contributions.
@@ -32,7 +30,6 @@ background task handlers, and Junior core does not invoke those hooks yet.
 
 - A memory-specific retrieval or extraction hook.
 - Plugin-owned prompt rendering.
-- Cross-plugin session state access.
 - A general event bus for every runtime lifecycle transition.
 - Model-visible memory management as the only memory path.
 - Storage schema for long-lived memory records.
@@ -48,12 +45,12 @@ Runtime hook plugins may provide prompt and observation hooks:
 ```ts
 interface PluginHooks {
   systemPrompt?(
-    ctx: SystemPromptHookContext,
-  ): PromptContribution[] | Promise<PromptContribution[]>;
+    ctx: SystemPromptContext,
+  ): PromptMessage[] | Promise<PromptMessage[]>;
 
   userPrompt?(
-    ctx: UserPromptHookContext,
-  ): UserPromptContributionResult | Promise<UserPromptContributionResult>;
+    ctx: UserPromptContext,
+  ): PromptMessage[] | undefined | Promise<PromptMessage[] | undefined>;
 
   observeTurn?(ctx: TurnObservationContext): void | Promise<void>;
 
@@ -65,30 +62,38 @@ These hooks are app-code plugin hooks registered through
 `defineJuniorPlugin({ manifest, hooks })`. Declarative `plugin.yaml` manifests
 must not register prompt or observation hooks.
 
-### Prompt Contributions
+### Prompt Messages
 
-Prompt contributions are intentionally small:
+Prompt messages are intentionally small:
 
 ```ts
-interface PromptContribution {
-  id: string;
+interface PromptMessage {
   text: string;
 }
 ```
 
 Rules:
 
-1. `id` is unique only within one plugin hook invocation.
-2. `text` is plugin-provided prompt text after the plugin has applied its own
+1. `text` is plugin-provided prompt text after the plugin has applied its own
    domain policy.
-3. Core owns ordering between plugins, wrapper rendering, escaping where needed,
+2. Core owns ordering between plugins, wrapper rendering, escaping where needed,
    total size limits, and failure behavior.
-4. Contributions are not durable state by themselves. If a plugin needs
-   deterministic continuity, it must use session append state.
+3. Messages are not durable plugin state by themselves. Plugins that need
+   durable continuity must use their own plugin storage.
+4. Core may assign internal IDs for rendering, logging, and diagnostics; those
+   IDs are not part of the plugin public contract.
 
 ### System Prompt Hook
 
 `systemPrompt(ctx)` contributes stable plugin-level prompt text.
+
+```ts
+interface SystemPromptContext {
+  log: PluginLogger;
+  platform: Platform;
+  plugin: PluginMetadata;
+}
+```
 
 System prompt contributions:
 
@@ -108,52 +113,42 @@ credential, tool, and output rules.
 ### User Prompt Hook
 
 `userPrompt(ctx)` contributes dynamic request-scoped prompt text. Core invokes
-the hook for every model-visible user prompt.
-
-```ts
-interface UserPromptContributionResult {
-  contributions?: PromptContribution[];
-  sessionState?: PluginSessionStateAppend[];
-}
-```
+the hook once while constructing the fresh triggering user prompt of an agent
+run. Steering messages delivered while that run is already active do not invoke
+`userPrompt`.
 
 Rules:
 
 1. User prompt contributions may depend on the current requester, source,
-   destination, conversation id, user text, plugin state, and plugin session
-   append state.
+   destination, conversation id, user text, and plugin state.
 2. User prompt contributions must be inserted into the model-visible user
    message, not the static system prompt.
 3. The hook must not receive runtime implementation details such as timeout
    continuation or auth-resume state. It receives product-level prompt facts
    only.
-4. Core commits returned `sessionState` appends only after it accepts the
-   corresponding contribution result for rendering.
-5. If the hook returns no contributions, core must not append its returned
-   `sessionState`.
+4. If the hook has no prompt messages, it may return `undefined` or an empty
+   array.
+5. Resume records that already contain a prompt checkpoint continue from stored
+   Pi history and must not invoke `userPrompt` again. Resume records captured
+   before a prompt checkpoint rebuild the fresh prompt and invoke `userPrompt`
+   once.
 
 ### User Prompt Context
 
-`UserPromptHookContext` exposes only narrow runtime facts and helper surfaces:
+`UserPromptContext` exposes only narrow runtime facts and helper surfaces:
 
 ```ts
-interface UserPromptHookContext {
+interface UserPromptContext {
   conversationId?: string;
   destination?: Destination;
-  isFirstPrompt: boolean;
   log: PluginLogger;
   plugin: PluginMetadata;
   requester?: Requester;
-  session: PluginSessionState;
   source: Source;
   state: PluginState;
-  userText: string;
+  text: string;
 }
 ```
-
-`isFirstPrompt` means this is the first model-visible user prompt in the
-current agent session projection. It is the only prompt lifecycle flag exposed
-in V1.
 
 The context must not expose:
 
@@ -163,51 +158,6 @@ The context must not expose:
 - continuation, resume, retry, or lease state
 - cross-plugin state
 - model messages outside the safe hook-specific context
-
-### Plugin Session Append State
-
-Prompt hooks may use per-session append state to track deterministic plugin
-bookkeeping such as memories already injected into the model-visible prompt.
-
-```ts
-interface PluginSessionStateAppend {
-  key: string;
-  value: unknown;
-}
-
-interface PluginSessionState {
-  list<T = unknown>(
-    key: string,
-  ): Promise<Array<{ createdAtMs: number; value: T }>>;
-}
-```
-
-Rules:
-
-1. Session state is implicitly namespaced by plugin name. Plugin code never
-   supplies a plugin name.
-2. Plugins can read only their own session append state.
-3. Session state is append-only in V1.
-4. Keys must be short validated strings.
-5. Values must be bounded JSON-serializable data.
-6. Session state is not an authorization source. Plugins must re-check current
-   visibility and access before reusing a stored id or fact.
-7. Core appends session state in the same durable session-log stream used to
-   reconstruct model-visible session state.
-8. Session state is plugin-visible bookkeeping, not automatically model-visible
-   prompt text.
-9. `list` returns entries from the current model-visible session projection,
-   not every append ever written for the conversation. If compaction or another
-   projection change removes the prompt contribution associated with an append,
-   that append must not be returned to the plugin hook.
-
-The memory plugin can use this surface to record injected memory ids:
-
-```ts
-const prior = await ctx.session.list<{ memoryIds: string[] }>(
-  "injected_memories",
-);
-```
 
 ### Turn Observation Hook
 
@@ -305,8 +255,7 @@ text.
 The memory plugin should use the generic hooks as follows:
 
 1. `userPrompt(ctx)` retrieves memories visible to the current requester and
-   source, excludes memories already recorded in session append state, returns
-   a concise memory block, and appends injected memory ids to session state.
+   source, then returns a concise memory block for the run's triggering prompt.
 2. `observeTurn(ctx)` enqueues an idempotent memory extraction task for the
    completed turn.
 3. `tasks.extractMemories(ctx)` reloads the bounded observation payload,
@@ -346,7 +295,7 @@ Core owns prompt rendering:
 5. Core records safe metadata about accepted contributions without exposing raw
    private prompt text through logs, traces, or dashboard APIs.
 6. Core must fail closed when prompt contribution rendering, validation, or
-   session-state append parsing fails.
+   schema validation fails.
 
 ## Failure Model
 
@@ -354,14 +303,8 @@ Core owns prompt rendering:
    and continue unless startup validation can catch the problem earlier.
 2. Oversized contribution: truncate only if the contribution contract supports
    deterministic truncation; otherwise omit and log safe metadata.
-3. Session append failure before prompt rendering: omit the corresponding
-   contribution or fail the turn before the model receives mismatched context.
-4. Session append failure after prompt rendering has been accepted: fail the
-   turn before model execution or retry from the prior durable session state.
-5. Observation hook failure: log safe metadata and do not change the completed
+3. Observation hook failure: log safe metadata and do not change the completed
    turn result.
-6. Malformed stored session append entries: ignore entries for plugin helper
-   reads and log safe metadata; do not repair into guessed state.
 
 ## Observability
 
@@ -372,7 +315,6 @@ Prompt hook logs and spans may include:
 - contribution count
 - contribution ids
 - contribution text character counts
-- session append keys
 - outcome and duration
 
 Prompt hook logs and spans must not include raw private prompt text, private
@@ -386,20 +328,19 @@ Use integration tests for:
 - plugin system prompt contributions appear in the static prompt without
   exposing requester-specific data
 - plugin user prompt contributions appear in model-visible user prompt context
-- user prompt hooks run for every user prompt
-- `isFirstPrompt` is true only for the first model-visible user prompt in the
-  current session projection
-- plugin session append state is implicitly namespaced by plugin
-- plugins cannot read another plugin's session state
-- session appends commit only when the corresponding prompt contribution result
-  is accepted
+- user prompt hooks run once for the triggering user prompt of each agent run
+- user prompt hooks do not run for steering messages delivered during an active
+  run
+- user prompt hooks do not run again when resuming from a stored prompt
+  checkpoint
+- user prompt hooks run when resuming a record captured before the prompt
+  checkpoint
 - private conversation prompt contribution payloads are redacted from logs,
   traces, and dashboard APIs
 
 Use unit tests for:
 
 - hook return-shape validation
-- session state key and value bounds
 - deterministic plugin ordering
 - memory tool schema rejection of model-supplied actor or destination fields
 
@@ -410,7 +351,6 @@ Use evals for:
 - explicit memory recall through `searchMemories` when automatic memory
   injection is disabled
 - explicit create/list/remove memory workflows
-- duplicate memory injection avoidance across follow-up prompts
 - secret rejection in explicit and passive memory paths
 
 ## Related Specs

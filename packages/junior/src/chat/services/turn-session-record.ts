@@ -112,9 +112,7 @@ export async function loadTurnSessionRecord(
       ? await getAgentTurnSessionRecord(ctx.conversationId, ctx.sessionId)
       : undefined;
   const hasAwaitingResumeRecord = Boolean(
-    existingSessionRecord &&
-    existingSessionRecord.state === "awaiting_resume" &&
-    existingSessionRecord.piMessages.length > 0,
+    existingSessionRecord && existingSessionRecord.state === "awaiting_resume",
   );
   return {
     canUseTurnSession,
@@ -303,7 +301,7 @@ export async function persistAuthPauseSessionRecord(args: {
       args.messages,
       latestSessionRecord?.piMessages,
     );
-    if (piMessages.length === 0 || !isContinuableBoundary(piMessages)) {
+    if (piMessages.length > 0 && !isContinuableBoundary(piMessages)) {
       return undefined;
     }
     return await upsertAgentTurnSessionRecord({

@@ -6,6 +6,8 @@ import {
 import { describe, expect, it } from "vitest";
 import {
   createPluginHookRunner,
+  getPluginSystemPromptContributions,
+  getPluginUserPromptContributions,
   getPluginOperationalReports,
   getPluginRoutes,
   getPluginSlackConversationLink,
@@ -92,6 +94,227 @@ function fakeSandbox(
 }
 
 describe("agent plugin hooks", () => {
+  it("collects system prompt contributions from configured plugins", async () => {
+    const previous = setPlugins([
+      defineJuniorPlugin({
+        manifest: {
+          name: "z-demo",
+          displayName: "Z Demo",
+          description: "Z demo",
+        },
+        hooks: {
+          systemPrompt(ctx) {
+            expect(ctx.platform).toBe("local");
+            expect("db" in ctx).toBe(false);
+            return [{ text: "Z contribution" }];
+          },
+        },
+      }),
+      defineJuniorPlugin({
+        manifest: {
+          name: "a-demo",
+          displayName: "A Demo",
+          description: "A demo",
+        },
+        hooks: {
+          systemPrompt() {
+            return [{ text: "A contribution" }];
+          },
+        },
+      }),
+    ]);
+    try {
+      await expect(
+        getPluginSystemPromptContributions(LOCAL_DESTINATION),
+      ).resolves.toEqual([
+        { id: "systemPrompt:0", pluginName: "a-demo", text: "A contribution" },
+        { id: "systemPrompt:0", pluginName: "z-demo", text: "Z contribution" },
+      ]);
+    } finally {
+      setPlugins(previous);
+    }
+  });
+
+  it("omits malformed system prompt messages", async () => {
+    const previous = setPlugins([
+      defineJuniorPlugin({
+        manifest: {
+          name: "agent-demo",
+          displayName: "Agent Demo",
+          description: "Agent demo",
+        },
+        hooks: {
+          systemPrompt() {
+            return [{ text: "" }] as any;
+          },
+        },
+      }),
+    ]);
+    try {
+      await expect(
+        getPluginSystemPromptContributions(LOCAL_DESTINATION),
+      ).resolves.toEqual([]);
+    } finally {
+      setPlugins(previous);
+    }
+  });
+
+  it("collects user prompt messages from configured plugins", async () => {
+    const previous = setPlugins([
+      defineJuniorPlugin({
+        manifest: {
+          name: "agent-demo",
+          displayName: "Agent Demo",
+          description: "Agent demo",
+        },
+        hooks: {
+          async userPrompt(ctx) {
+            expect(ctx.requester).toBeUndefined();
+            expect(ctx.source).toEqual(LOCAL_DESTINATION);
+            expect(ctx.text).toBe("remember this");
+            return [{ text: "remembered context" }];
+          },
+        },
+      }),
+    ]);
+    try {
+      await expect(
+        getPluginUserPromptContributions({
+          context: {
+            conversationId: "conversation-1",
+            source: LOCAL_DESTINATION,
+            destination: LOCAL_DESTINATION,
+            userText: "remember this",
+          },
+        }),
+      ).resolves.toEqual([
+        {
+          id: "userPrompt:0",
+          pluginName: "agent-demo",
+          text: "remembered context",
+        },
+      ]);
+    } finally {
+      setPlugins(previous);
+    }
+  });
+
+  it("omits invalid user prompt messages", async () => {
+    const previous = setPlugins([
+      defineJuniorPlugin({
+        manifest: {
+          name: "agent-demo",
+          displayName: "Agent Demo",
+          description: "Agent demo",
+        },
+        hooks: {
+          userPrompt() {
+            return [{ text: "" }] as any;
+          },
+        },
+      }),
+    ]);
+    try {
+      await expect(
+        getPluginUserPromptContributions({
+          context: {
+            conversationId: "conversation-1",
+            source: LOCAL_DESTINATION,
+            destination: LOCAL_DESTINATION,
+            userText: "hello",
+          },
+        }),
+      ).resolves.toEqual([]);
+    } finally {
+      setPlugins(previous);
+    }
+  });
+
+  it("omits empty user prompt message arrays", async () => {
+    const previous = setPlugins([
+      defineJuniorPlugin({
+        manifest: {
+          name: "agent-demo",
+          displayName: "Agent Demo",
+          description: "Agent demo",
+        },
+        hooks: {
+          userPrompt() {
+            return [];
+          },
+        },
+      }),
+    ]);
+    try {
+      await expect(
+        getPluginUserPromptContributions({
+          context: {
+            conversationId: "conversation-1",
+            source: LOCAL_DESTINATION,
+            destination: LOCAL_DESTINATION,
+            userText: "hello",
+          },
+        }),
+      ).resolves.toEqual([]);
+    } finally {
+      setPlugins(previous);
+    }
+  });
+
+  it("omits plugin contributions that exceed the aggregate prompt budget", async () => {
+    const previous = setPlugins([
+      defineJuniorPlugin({
+        manifest: {
+          name: "agent-demo",
+          displayName: "Agent Demo",
+          description: "Agent demo",
+        },
+        hooks: {
+          userPrompt() {
+            return [{ text: "x".repeat(8_000) }, { text: "y".repeat(8_000) }];
+          },
+        },
+      }),
+      defineJuniorPlugin({
+        manifest: {
+          name: "overflow-demo",
+          displayName: "Overflow Demo",
+          description: "Overflow demo",
+        },
+        hooks: {
+          userPrompt() {
+            return [{ text: "z" }];
+          },
+        },
+      }),
+    ]);
+    try {
+      await expect(
+        getPluginUserPromptContributions({
+          context: {
+            conversationId: "conversation-1",
+            source: LOCAL_DESTINATION,
+            destination: LOCAL_DESTINATION,
+            userText: "hello",
+          },
+        }),
+      ).resolves.toEqual([
+        {
+          id: "userPrompt:0",
+          pluginName: "agent-demo",
+          text: "x".repeat(8_000),
+        },
+        {
+          id: "userPrompt:1",
+          pluginName: "agent-demo",
+          text: "y".repeat(8_000),
+        },
+      ]);
+    } finally {
+      setPlugins(previous);
+    }
+  });
+
   it("collects turn-scoped tools from configured plugins", () => {
     const previous = setPlugins([
       defineJuniorPlugin({

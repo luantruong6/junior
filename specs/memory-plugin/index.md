@@ -13,10 +13,10 @@ contracts.
 
 ## Implementation Status
 
-This spec describes the intended V1 memory plugin shape. It depends on future
-plugin hook surfaces from `../plugin-prompt-hooks.md`; the current plugin API
-does not yet export or invoke `userPrompt`, `observeTurn`, plugin prompt session
-state, or plugin background task handlers.
+This spec describes the intended V1 memory plugin shape. Generic plugin prompt
+hooks and plugin prompt session state are available through
+`../plugin-prompt-hooks.md`. Passive learning still depends on future
+`observeTurn` and plugin background task handler surfaces.
 
 When automatic memory injection is enabled, the memory plugin makes relevant
 facts available before each response without making recall depend on the model
@@ -161,7 +161,6 @@ Core owns:
 
 - plugin loading and hook ordering
 - prompt rendering and size limits
-- plugin session append state
 - database migration application
 - runtime identity, source, and destination context
 - plugin task enqueueing, retry, redelivery, and worker execution
@@ -257,8 +256,8 @@ be exported as part of Junior core.
 Implement in this order:
 
 1. Core plugin hook surfaces needed by this spec: `userPrompt`, `observeTurn`,
-   plugin background tasks, `tools`, `ctx.db`, active-projection plugin session
-   state, host embedding provider access, and plugin config/policy access.
+   plugin background tasks, `tools`, `ctx.db`, host embedding provider access,
+   and plugin config/policy access.
 2. Memory plugin package with manifest, schema, migrations, store, and
    install-level policy evaluator.
 3. Explicit `createMemory`, `listMemories`, `searchMemories`, and

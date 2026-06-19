@@ -3,7 +3,7 @@
 ## Metadata
 
 - Created: 2026-06-13
-- Last Edited: 2026-06-13
+- Last Edited: 2026-06-19
 
 ## Purpose
 
@@ -24,8 +24,7 @@ requirements.
    and continue without vector recall for that memory.
 6. `userPrompt` retrieval failure: omit memory contribution, log safe metadata,
    and continue unless the failure indicates a broken required migration.
-7. Prompt contribution validation failure: omit the contribution and do not
-   append injected memory session state.
+7. Prompt message validation failure: omit the prompt message.
 8. `observeTurn` enqueue failure: log safe metadata and do not fail the
    completed turn.
 9. Task delivery failure: core retries according to the task runner policy.
@@ -97,12 +96,10 @@ Use integration tests for:
   context
 - `searchMemories` cannot search across unrelated users or conversations
 - `removeMemory` archives only visible memories
-- `userPrompt` injects visible memories into every user prompt when
+- `userPrompt` injects visible memories into each fresh triggering prompt when
   `autoInjectMemories` is `true`
-- `userPrompt` returns no memory contribution and appends no injected-memory
-  state when `autoInjectMemories` is `false`
-- injected memory ids are excluded only while their contribution remains in the
-  active session projection
+- `userPrompt` returns no memory contribution when `autoInjectMemories` is
+  `false`
 - memory recall survives a follow-up prompt without requiring a search tool when
   automatic memory injection is enabled
 - memory recall works through `searchMemories` when automatic memory injection

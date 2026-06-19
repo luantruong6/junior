@@ -851,15 +851,19 @@ describe("generateAssistantReply progressive MCP loading", () => {
       state: "awaiting_resume",
       resumeReason: "auth",
     });
-    expect(pausedSessionRecord?.piMessages).toHaveLength(3);
+    expect(pausedSessionRecord?.turnStartMessageIndex).toBeUndefined();
+    expect(pausedSessionRecord?.piMessages).toHaveLength(2);
     expect(pausedSessionRecord?.piMessages[0]).toMatchObject({
       role: "user",
       content: [{ type: "text", text: "prior question" }],
     });
     expect(pausedSessionRecord?.piMessages.at(-1)).toMatchObject({
-      role: "user",
-      content: [{ type: "text", text: "current follow-up" }],
+      role: "toolResult",
+      toolName: "callMcpTool",
     });
+    expect(JSON.stringify(pausedSessionRecord?.piMessages)).not.toContain(
+      "current follow-up",
+    );
 
     const reply = await generateAssistantReply("current follow-up", {
       ...makeReplyContext({
@@ -871,8 +875,9 @@ describe("generateAssistantReply progressive MCP loading", () => {
     });
 
     expect(reply.text).toBe("resumed reply");
-    expect(resumeMessages).toHaveLength(1);
-    expect(resumeMessages[0]?.at(-1)).toMatchObject({
+    expect(resumeMessages).toHaveLength(0);
+    expect(promptSeedMessages.at(-1)).toEqual(priorMessages);
+    expect(promptMessages.at(-1)).toMatchObject({
       role: "user",
       content: [
         {
@@ -882,7 +887,7 @@ describe("generateAssistantReply progressive MCP loading", () => {
         { type: "text", text: "current follow-up" },
       ],
     });
-    expect(resumeTurnContextCounts).toEqual([1]);
+    expect(resumeTurnContextCounts).toEqual([]);
     expect(turnContextInputs).toHaveLength(1);
     expect(turnContextInputs[0]?.includeSessionContext).toBe(true);
   });
@@ -925,6 +930,46 @@ describe("generateAssistantReply progressive MCP loading", () => {
       expect.objectContaining({ name: "demo-skill" }),
     ]);
     expect(turnContextInputs.at(-1)?.includeSessionContext).toBe(true);
+  });
+
+  it("does not duplicate a raw current prompt from a no-checkpoint resume record", async () => {
+    listToolsMock.mockReset();
+    listToolsMock.mockResolvedValue(makeDemoMcpTools());
+    const rawCurrentPrompt = {
+      role: "user",
+      content: [{ type: "text", text: "continue after auth" }],
+      timestamp: 2,
+    } as PiMessage;
+    const storedMessages = [
+      {
+        role: "user",
+        content: [{ type: "text", text: "prior question" }],
+        timestamp: 1,
+      },
+      rawCurrentPrompt,
+    ] as PiMessage[];
+    await upsertAgentTurnSessionRecord({
+      conversationId: "conversation-raw-current-resume",
+      sessionId: "turn-raw-current-resume",
+      sliceId: 2,
+      state: "awaiting_resume",
+      piMessages: storedMessages,
+      resumeReason: "auth",
+      errorMessage: "authorization required",
+    });
+
+    await generateAssistantReply("continue after auth", {
+      ...makeReplyContext({
+        conversationId: "conversation-raw-current-resume",
+        threadTs: "1712345.0092",
+        turnId: "turn-raw-current-resume",
+      }),
+    });
+
+    expect(promptSeedMessages.at(-1)).toEqual([storedMessages[0]]);
+    expect(JSON.stringify(promptMessages.at(-1))).toContain(
+      "continue after auth",
+    );
   });
 
   it("injects session context for crash retries loaded from stripped running history", async () => {

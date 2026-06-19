@@ -1,6 +1,12 @@
 export * from "./schemas";
 export * from "./context";
 export * from "./state";
+export {
+  promptMessageSchema,
+  type PromptMessage,
+  type SystemPromptContext,
+  type UserPromptContext,
+} from "./prompt";
 export * from "./dispatch";
 export * from "./database";
 export * from "./tools";

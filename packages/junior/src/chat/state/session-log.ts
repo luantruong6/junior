@@ -24,6 +24,7 @@ const AGENT_SESSION_LOG_PREFIX = "junior:agent-session-log";
 const AGENT_SESSION_LOG_SCHEMA_VERSION = 1;
 const INITIAL_SESSION_ID = "session_0";
 const SESSION_ID_PREFIX = "session_";
+const STATE_STORE_LOCK_TTL_MS = 5_000;
 
 const piMessageSchema = z
   .object({
@@ -429,7 +430,7 @@ function commitEntries(
   entries: SessionLogEntry[],
   existingRequester?: StoredSlackRequester,
   requester?: StoredSlackRequester,
-): SessionLogEntry[] {
+): { entries: SessionLogEntry[]; sessionId: string } {
   const matchingPrefix = countMatchingPrefix(existingMessages, nextMessages);
   if (matchingPrefix === existingMessages.length) {
     const newMessages = nextMessages.slice(matchingPrefix);
@@ -438,7 +439,10 @@ function commitEntries(
       requester &&
       !isDeepStrictEqual(existingRequester, requester)
     ) {
-      return [requesterRecordedEntry(requester, sessionId)];
+      return {
+        entries: [requesterRecordedEntry(requester, sessionId)],
+        sessionId,
+      };
     }
     // Attach requester to the last new user message — the current turn's
     // input. Using last rather than first avoids tagging older context
@@ -446,21 +450,24 @@ function commitEntries(
     const requesterIndex = requester
       ? findLastIndex(newMessages, (m) => m.role === "user")
       : -1;
-    return newMessages.map((message, index) =>
-      piEntry(
-        message,
-        sessionId,
-        index === requesterIndex ? requester : undefined,
+    return {
+      entries: newMessages.map((message, index) =>
+        piEntry(
+          message,
+          sessionId,
+          index === requesterIndex ? requester : undefined,
+        ),
       ),
-    );
+      sessionId,
+    };
   }
-  return [
-    resetEntry(
-      nextMessages,
-      nextSessionId(entries),
-      requester ?? existingRequester,
-    ),
-  ];
+  const resetSessionId = nextSessionId(entries);
+  return {
+    entries: [
+      resetEntry(nextMessages, resetSessionId, requester ?? existingRequester),
+    ],
+    sessionId: resetSessionId,
+  };
 }
 
 function redisStore(redisStateAdapter: RedisStateAdapter): SessionLogStore {
@@ -490,14 +497,34 @@ function stateStore(): SessionLogStore {
   return {
     async append({ entries, scope, ttlMs }) {
       const listKey = rawKey(scope);
-      for (const entry of entries) {
-        await stateAdapter.appendToList(listKey, entry, {
-          ttlMs: Math.max(1, ttlMs),
-        });
+      const lock = await stateAdapter.acquireLock(
+        `${listKey}:commit`,
+        STATE_STORE_LOCK_TTL_MS,
+      );
+      if (!lock) {
+        throw new Error("Could not acquire session log commit lock");
+      }
+      try {
+        const existingValue = await stateAdapter.get(listKey);
+        const existingEntries = Array.isArray(existingValue)
+          ? existingValue.map(decode)
+          : (await stateAdapter.getList(listKey)).map(decode);
+        await stateAdapter.set(
+          listKey,
+          [...existingEntries, ...entries],
+          Math.max(1, ttlMs),
+        );
+      } finally {
+        await stateAdapter.releaseLock(lock);
       }
     },
     async read(scope) {
-      const values = await stateAdapter.getList(rawKey(scope));
+      const listKey = rawKey(scope);
+      const value = await stateAdapter.get(listKey);
+      if (Array.isArray(value)) {
+        return value.map(decode);
+      }
+      const values = await stateAdapter.getList(listKey);
       return values.map(decode);
     },
   };
@@ -695,7 +722,7 @@ export async function commitMessages(
   const entries = await store.read(args);
   const existingProjection = project(entries);
   const currentId = currentSessionId(entries);
-  const nextEntries = commitEntries(
+  const commit = commitEntries(
     existingProjection.messages,
     args.messages,
     currentId,
@@ -705,12 +732,10 @@ export async function commitMessages(
   );
   await store.append({
     scope: args,
-    entries: nextEntries,
+    entries: commit.entries,
     ttlMs: args.ttlMs,
   });
   return {
-    sessionId:
-      nextEntries.find((entry) => entry.type === "projection_reset")
-        ?.sessionId ?? currentId,
+    sessionId: commit.sessionId,
   };
 }

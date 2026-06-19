@@ -25,8 +25,19 @@ import type {
   SandboxPrepareHookContext,
   ToolRegistrationHookContext,
 } from "./tools";
+import type {
+  PromptMessage,
+  SystemPromptContext,
+  UserPromptContext,
+} from "./prompt";
 
 export interface PluginHooks {
+  systemPrompt?(
+    ctx: SystemPromptContext,
+  ): Promise<PromptMessage[]> | PromptMessage[];
+  userPrompt?(
+    ctx: UserPromptContext,
+  ): Promise<PromptMessage[] | undefined> | PromptMessage[] | undefined;
   beforeToolExecute?(ctx: BeforeToolExecuteHookContext): Promise<void> | void;
   grantForEgress?(
     ctx: EgressHookContext,

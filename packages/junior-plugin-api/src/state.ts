@@ -13,14 +13,3 @@ export interface PluginState {
 export interface PluginReadState {
   get<T = unknown>(key: string): Promise<T | undefined>;
 }
-
-export interface PluginSessionStateAppend {
-  key: string;
-  value: unknown;
-}
-
-export interface PluginSessionState {
-  list<T = unknown>(
-    key: string,
-  ): Promise<Array<{ createdAtMs: number; value: T }>>;
-}
