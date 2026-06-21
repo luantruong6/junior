@@ -53,13 +53,12 @@ Plugin enablement is controlled by the normal plugin registration path. If an
 install does not want memory at all, it should not enable the memory plugin.
 
 V1 uses the default workplace guidance in this spec. Configurable extraction
-guidelines are a future extension. The deterministic validator enforces hard
-rules:
+guidelines are a future extension. The memory agent owns semantic memory
+decisions, including public/shareable eligibility and workplace-sensitive
+rejection. Deterministic code enforces structural hard rules:
 
-- no secrets
 - runtime-derived scope only
 - source visibility checks
-- public/shareable memory content only
 - `public` conversation visibility for passive capture only in V1
 - policy toggle checks
 - provider allowlist checks
@@ -201,9 +200,10 @@ Passive extraction must use policy as an input before model prompting and again
 after structured extraction output.
 
 The extraction prompt may describe allowed categories for quality. Policy
-enforcement should happen in a separate policy adjudication step after
-extraction proposes candidate facts. The deterministic validator remains the
-final enforcement point for hard safety rules.
+enforcement should happen through memory agent review after extraction proposes
+candidate facts. Deterministic validation remains the final
+enforcement point for structural rules such as runtime-derived authority,
+strict schemas, source visibility, provider allowlists, and lifecycle bounds.
 
 `passiveExtraction` is a boolean:
 
@@ -256,13 +256,13 @@ automatic memory injection.
 
 ## Explicit Tools And Policy
 
-Explicit `createMemory` requests are still subject to install policy.
+Explicit memory creation requests are still subject to install policy.
 
 For example, passive extraction is limited to public-conversation workplace
 knowledge in V1, but users may still explicitly store public/shareable personal
 preferences about themselves when the requested memory passes policy.
 
-The explicit tool path must run the same deterministic policy filter as passive
+The explicit tool path must use the same agentic policy guidance as passive
 extraction. Explicit user intent can make a fact eligible for storage under
 install policy, but it cannot override secret rejection, source/scope rules,
 workplace-sensitive category rejection, public-content restrictions, provider
@@ -271,10 +271,10 @@ and embedding policy, or retention and lifecycle policy.
 Tool errors should explain policy rejection at a high level without revealing
 hidden policy internals or sensitive content.
 
-Explicit `createMemory` may use the same policy adjudicator as passive
-extraction when the policy decision is not deterministic. If adjudication fails
-for an explicit tool request, the tool should return a retryable input error
-rather than storing the memory.
+Explicit memory creation must use the same memory agent review as passive
+extraction when the policy decision is not deterministic. If review fails for
+an explicit tool request, the tool should return a retryable input error rather
+than storing the memory.
 
 ## Retrieval And Policy
 

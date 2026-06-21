@@ -109,7 +109,7 @@ The memory plugin's `extractMemories` task handler must:
 5. Ignore assistant-authored claims as memory sources.
 6. Skip extraction when the bounded observation payload is unavailable,
    expired, malformed, or no longer visible to the plugin.
-7. Run policy adjudication for extracted candidates.
+7. Run memory agent review for extracted candidates.
 8. Reject malformed, low-confidence, incoherent, semantically duplicative,
    unsafe, or out-of-scope facts.
 9. Reject facts disallowed by install policy, including non-public or
@@ -128,7 +128,7 @@ The memory plugin's `extractMemories` task handler must:
 Extraction tasks must be idempotent. If the same completed turn is observed or
 delivered more than once, source idempotency fields must prevent duplicate
 memory writes. Semantic duplicate detection belongs in the extractor and
-retrieval slices, not exact-content storage identity.
+retrieval pipeline, not exact-content storage identity.
 
 The task handler must be safe to run in a separate serverless invocation from
 the original user turn. It must not depend on process memory, live Slack
@@ -168,43 +168,49 @@ Extraction must follow these rules:
 17. Store the minimum useful assertion rather than a direct quote or broad
     summary.
 
-The plugin must have a deterministic post-extraction validation layer. The
-extraction prompt is guidance, not the security boundary.
+The plugin must route extracted candidates through the memory agent before
+storage. The extraction prompt is guidance, not the security boundary.
 
-## Policy Adjudication
+## Memory Agent Review
 
-Policy enforcement may use a second model call after extraction. This should be
-the default V1 shape when passive extraction is enabled:
+The memory agent is the shared internal semantic system for explicit
+`createMemory` candidates and passive extraction candidates. Passive extraction
+may use separate generate-and-review model calls internally, but both steps
+belong to the memory agent rather than a caller-provided policy hook.
 
-1. The extraction model proposes structured candidate memories from the bounded
+The default V1 passive-extraction shape is:
+
+1. The memory agent proposes structured candidate memories from the bounded
    observation payload.
-2. A policy adjudicator, typically the configured fast/auxiliary model, reviews
-   each candidate against the installed memory policy and workplace guidance.
-3. The deterministic validator applies hard rules and rejects anything unsafe or
-   malformed before storage.
+2. The memory agent reviews each candidate against the installed memory policy
+   and workplace guidance.
+3. Deterministic validation applies only hard structural rules, such as schema
+   shape, runtime-owned authority, source visibility, lifecycle bounds,
+   idempotency, and storage constraints before storage.
 
-The policy adjudicator should receive only the candidate memory, the minimum
+Memory agent review should receive only the candidate memory, the minimum
 source context needed to judge it, and the installed policy guidance. It should
 not receive unrestricted transcript history, raw tool payloads, provider
-credentials, or unrelated conversation context.
+credentials, or unrelated conversation context unless those fields are part of
+the bounded extraction input.
 
-Policy adjudication output must be structured. It should include:
+Memory agent review output must be structured. It should include:
 
 - candidate id
-- decision: `allow` or `reject`
+- decision: `store` or `reject`
 - normalized rejection reason code when rejected
 - optional adjusted memory type, subject, scope, expiration, or content rewrite
 - confidence
 
-The adjudicator may narrow, rewrite, or reject extracted candidates, but it may
-not override hard validators. If extraction and policy adjudication disagree,
-the stricter outcome wins. If the policy adjudicator fails or returns malformed
-output, the candidate is rejected unless it came from an explicit tool workflow
-that can return a model-visible retryable error.
+The memory agent may narrow, rewrite, or reject extracted candidates, but it
+may not override hard structural validators. If extraction and review disagree,
+the stricter outcome wins. If the memory agent fails or returns malformed
+output, the candidate is rejected unless it came from an explicit tool
+workflow that can return a model-visible retryable error.
 
 ## Secret Rejection
 
-Every entry point must call the same secret detector before writing memory
+Every entry point must use the same policy guidance before writing memory
 content:
 
 - `createMemory`
@@ -212,11 +218,12 @@ content:
 - repair/import workflows
 - tests and fixture helpers that create real memory records
 
-Every entry point must also run the same deterministic policy filter before
-writing memory content. Explicit tools may use explicit user intent as a policy
-input, but they do not bypass the filter.
+Explicit tools may use explicit user intent as a policy input, but they do not
+bypass the policy guidance. Secret handling may use a dedicated scanner as a
+hard safety backstop, but scanner matches are not a substitute for agentic
+memory eligibility decisions.
 
-The detector must reject at least:
+The policy guidance must reject at least:
 
 - API keys and access tokens
 - Slack tokens
