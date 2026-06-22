@@ -65,6 +65,23 @@ V1 intentionally keeps this authoritative row lean. Subject/display labels,
 extraction confidence, and operational metadata should be added only with the
 extraction, graph, or admin consumer that needs them.
 
+Stored memory content must be canonical fact text, not perspective or
+provenance text. Runtime ownership, subject, source, actor, thread, channel,
+and requester identity belong in structured columns. They must not be baked
+into the `content` prose.
+
+Examples:
+
+- Good: `Prefers terse PR summaries`
+- Good: `Favorite CLI QA snack is mango chips`
+- Good: `Deploy runbooks live in Notion`
+- Bad: `The requester prefers terse PR summaries`
+- Bad: `David prefers terse PR summaries`
+- Bad: `My favorite CLI QA snack is mango chips`
+- Bad: `This thread says deploy runbooks live in Notion`
+
+Prompt rendering may add perspective at recall time. Storage must not.
+
 Scope and source fields are authority-bearing. Subject fields describe the
 memory's topic, but they must not grant visibility beyond scope. The stored
 subject key is runtime-derived internal metadata, not model-visible tool input
@@ -163,10 +180,12 @@ are enabled. The default should be a fixed-dimensional vector column compatible
 with the configured embedding model.
 
 Use cosine distance by default. `text-embedding-3-small` at 1536 dimensions is
-the expected default because it fits a common pgvector setup and matches the Ash
-prototype's default. Larger native embedding models must either be configured to
-return the stored dimension or wait for a migration/rebuild plan that changes
-the stored vector dimension.
+the expected fallback because it fits a common pgvector setup and matches the
+Ash prototype's default. The embedding model must still be deployment
+configurable through the host provider boundary, following the same
+Gateway-model configuration pattern as other Junior model roles. Larger native
+embedding models must either be configured to return the stored dimension or
+wait for a migration/rebuild plan that changes the stored vector dimension.
 
 ### Vector Index Strategy
 
@@ -183,7 +202,7 @@ Approximate vector search is a performance tool, not an authorization boundary.
 ### Embedding Provider
 
 Core must keep provider credentials and expose only a narrow host capability to
-trusted plugin hooks and tasks:
+plugin hooks and tasks:
 
 ```ts
 interface PluginEmbeddingProvider {
@@ -220,8 +239,10 @@ dimensions = 1536
 metric = cosine
 ```
 
-The exact provider name is deployment configuration. Stored embedding metadata
-records the resolved provider and model used for each vector.
+The exact provider name and model id are deployment configuration. The memory
+plugin should not hardcode an embedding model outside the default fallback.
+Stored embedding metadata records the resolved provider and model used for each
+vector.
 
 ### Write Path
 

@@ -7,6 +7,8 @@ import { mswServer } from "../../msw/server";
 
 const ORIGINAL_ENV = { ...process.env };
 
+const db = {};
+
 function beforeToolContext(requester: {
   email?: string;
   fullName?: string;
@@ -38,6 +40,7 @@ function beforeToolContext(requester: {
         warn() {},
       },
       plugin: { name: "github" },
+      db,
       requester,
       tool: {
         input: { command: "git commit -m test" },
@@ -159,6 +162,7 @@ async function grantForEgress(input: {
 }) {
   const plugin = githubPlugin({ additionalUserScopes: ["repo"] });
   return await plugin.hooks?.grantForEgress?.({
+    db,
     log: pluginLog,
     plugin: { name: "github" },
     request: {
@@ -203,6 +207,7 @@ function githubIssueCredentialContext(input: {
       ? { credentialSubject: { type: "user" as const, userId: "U456" } }
       : {}),
     grant: input.grant,
+    db,
     log: pluginLog,
     plugin: { name: "github" },
     tokens: {
@@ -572,6 +577,7 @@ describe("github plugin", () => {
         access: "read",
         reason: "github.api-read",
       },
+      db,
       log: pluginLog,
       plugin: { name: "github" },
       tokens: {},
@@ -623,6 +629,7 @@ describe("github plugin", () => {
         access: "read" as const,
         reason: "github.api-read",
       },
+      db,
       log: pluginLog,
       plugin: { name: "github" },
       tokens: {},
@@ -666,6 +673,7 @@ describe("github plugin", () => {
     const missingActor = await plugin.hooks?.issueCredential?.({
       actor: { type: "system", id: "scheduler" },
       grant: { name: "user-write", access: "write" },
+      db,
       log: pluginLog,
       plugin: { name: "github" },
       tokens: {},
@@ -746,6 +754,7 @@ describe("github plugin", () => {
 
     const plugin = githubPlugin();
     const account = await plugin.hooks?.resolveOAuthAccount?.({
+      db,
       log: pluginLog,
       plugin: { name: "github" },
       tokens: {
@@ -1015,6 +1024,7 @@ describe("github plugin", () => {
 
     const plugin = githubPlugin();
     const ctx: SandboxPrepareHookContext = {
+      db,
       log: {
         error() {},
         info() {},

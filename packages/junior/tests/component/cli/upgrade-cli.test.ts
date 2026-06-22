@@ -13,7 +13,7 @@ import { createSqlStore } from "@/chat/conversations/sql/store";
 import type { PiMessage } from "@/chat/pi/messages";
 import { persistThreadStateById } from "@/chat/runtime/thread-state";
 import { upsertAgentTurnSessionRecord } from "@/chat/state/turn-session";
-import { resolveUpgradePluginSet, runUpgradeMigrations } from "@/cli/upgrade";
+import { resolveUpgradePluginSet } from "@/cli/upgrade";
 import { migrateConversationsToSql } from "@/cli/upgrade/migrations/conversations-sql";
 import { redisConversationStateMigration } from "@/cli/upgrade/migrations/redis-conversation-state";
 import {
@@ -112,52 +112,6 @@ export const plugins = {
     }
   });
 
-  it("requires SQL before running upgrade migrations", async () => {
-    const stateAdapter = getStateAdapter();
-    await stateAdapter.connect();
-    const legacyMessage = inboundMessage("m1");
-    const legacyWork = {
-      schemaVersion: 1,
-      conversationId: CONVERSATION_ID,
-      destination: SLACK_DESTINATION,
-      lastEnqueuedAtMs: 1_500,
-      messages: [legacyMessage],
-      needsRun: true,
-      updatedAtMs: 2_000,
-    };
-    await stateAdapter.set(
-      `junior:conversation-work:state:${CONVERSATION_ID}`,
-      legacyWork,
-    );
-    await stateAdapter.set("junior:conversation-work:index", [
-      CONVERSATION_ID,
-      "missing-conversation",
-    ]);
-    const logs: string[] = [];
-
-    await expect(
-      runUpgradeMigrations({
-        io: { info: (line) => logs.push(line) },
-        stateAdapter,
-      }),
-    ).rejects.toThrow(
-      "Junior SQL database URL is required for conversation metadata upgrade",
-    );
-    await expect(
-      stateAdapter.get(`junior:conversation-work:state:${CONVERSATION_ID}`),
-    ).resolves.toEqual(legacyWork);
-    await expect(
-      stateAdapter.get("junior:conversation-work:index"),
-    ).resolves.toEqual([CONVERSATION_ID, "missing-conversation"]);
-    await expect(
-      stateAdapter.get(CONVERSATION_BY_ACTIVITY_INDEX_KEY),
-    ).resolves.toBeNull();
-    await expect(
-      stateAdapter.get(CONVERSATION_ACTIVE_INDEX_KEY),
-    ).resolves.toBeNull();
-    expect(logs).toEqual([]);
-  });
-
   it("migrates legacy conversation work before SQL conversation backfill", async () => {
     const stateAdapter = getStateAdapter();
     await stateAdapter.connect();
@@ -175,7 +129,7 @@ export const plugins = {
     );
     await stateAdapter.set("junior:conversation-work:index", [CONVERSATION_ID]);
     const fixture = await createLocalJuniorSqlFixture();
-    const sqlStore = createSqlStore(fixture.executor);
+    const sqlStore = createSqlStore(fixture.sql);
 
     try {
       const context = {
@@ -232,7 +186,7 @@ export const plugins = {
     const stateAdapter = getStateAdapter();
     await stateAdapter.connect();
     const fixture = await createLocalJuniorSqlFixture();
-    const sqlStore = createSqlStore(fixture.executor);
+    const sqlStore = createSqlStore(fixture.sql);
 
     try {
       for (let index = 0; index < 3; index++) {
@@ -497,7 +451,7 @@ export const plugins = {
       state: stateAdapter,
     });
     const fixture = await createLocalJuniorSqlFixture();
-    const sqlStore = createSqlStore(fixture.executor);
+    const sqlStore = createSqlStore(fixture.sql);
 
     try {
       const context = {

@@ -2,7 +2,6 @@ import { Type, type TSchema } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
 import {
   PluginToolInputError,
-  type PluginDb,
   type PluginToolDefinition,
   type Source,
   type Requester,
@@ -10,6 +9,7 @@ import {
 import {
   createMemoryStore,
   type CreateMemoryInput,
+  type MemoryDb,
   type MemoryRecord,
 } from "./store";
 import {
@@ -39,9 +39,10 @@ const KNOWN_TOOL_INPUT_ERROR_MESSAGES = new Set([
 export interface MemoryToolContext {
   agent: MemoryAgent;
   conversationId?: string;
-  db: PluginDb;
+  db: MemoryDb;
   requester?: Requester;
   source: Source;
+  userText?: string;
 }
 
 function throwToolInputError(message: string): never {
@@ -166,10 +167,13 @@ function parseExpiresAt(value: string | undefined): number | undefined {
   if (!value) {
     return undefined;
   }
+  if (value === "never") {
+    return undefined;
+  }
   const parts = parseIsoTimestampParts(value);
   const expiresAtMs = Date.parse(value);
   if (!parts || !Number.isFinite(expiresAtMs)) {
-    throwToolInputError("expires_at must be a valid ISO timestamp.");
+    throwToolInputError('expires_at must be "never" or a valid ISO timestamp.');
   }
   const calendarDate = new Date(
     Date.UTC(parts.year, parts.month - 1, parts.day),
@@ -182,7 +186,7 @@ function parseExpiresAt(value: string | undefined): number | undefined {
     parts.minute > 59 ||
     parts.second > 59
   ) {
-    throwToolInputError("expires_at must be a valid ISO timestamp.");
+    throwToolInputError('expires_at must be "never" or a valid ISO timestamp.');
   }
   return expiresAtMs;
 }
@@ -218,7 +222,7 @@ const createMemoryInputSchema = Type.Object(
       Type.String({
         minLength: 1,
         description:
-          "Optional exact ISO timestamp when this memory should expire.",
+          'Expiration selector. Omit or use "never" when the memory should not expire, or use an exact ISO timestamp such as "2027-06-21T00:00:00Z".',
       }),
     ),
   },
@@ -319,7 +323,7 @@ function compactMemory(memory: MemoryRecord) {
 export function createMemoryCreateTool(context: MemoryToolContext) {
   return {
     description:
-      "Remember a public/shareable fact about the current requester for later. Use only when the requester explicitly asks Junior to remember something about themselves. Pass one self-contained memory candidate; include the requester as the subject in the content itself when needed, such as 'The requester prefers terse updates'. Do not pass vague references like 'remember this'. Do not include secrets, private personal details, medical/legal/financial/sensitive facts, or facts about another person's private life. Runtime context derives all actor ids, Slack ids, scope keys, source ids, and subject ids.",
+      "Remember a public/shareable fact about the current requester for later. Use only when the requester explicitly asks Junior to remember something about themselves. Pass one self-contained memory candidate in natural language, such as 'I prefer terse updates'. Do not pass vague references like 'remember this'. Do not include secrets, private personal details, medical/legal/financial/sensitive facts, or facts about another person's private life. Runtime context derives all actor ids, Slack ids, scope keys, source ids, and subject ids; the memory agent decides the canonical stored content, subject, and target.",
     executionMode: "sequential",
     inputSchema: createMemoryInputSchema,
     execute: async (input, options) => {
@@ -341,6 +345,13 @@ export function createMemoryCreateTool(context: MemoryToolContext) {
                   ? { expiresAtMs: requestedExpiresAtMs }
                   : {}),
                 runtimeContext,
+                ...(context.userText?.trim()
+                  ? {
+                      sourceContext: {
+                        currentUserText: context.userText.trim(),
+                      },
+                    }
+                  : {}),
               }),
             ),
           );
@@ -348,8 +359,12 @@ export function createMemoryCreateTool(context: MemoryToolContext) {
           if (error instanceof PluginToolInputError) {
             throw error;
           }
+          const detail =
+            error instanceof Error && error.message.trim()
+              ? `: ${error.message}`
+              : "";
           throw new PluginToolInputError(
-            "Memory agent returned invalid output.",
+            `Memory agent review failed${detail}`,
             { cause: error },
           );
         }

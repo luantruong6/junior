@@ -3,12 +3,12 @@
 ## Metadata
 
 - Created: 2026-06-12
-- Last Edited: 2026-06-13
+- Last Edited: 2026-06-22
 
 ## Purpose
 
 Define how explicitly enabled plugins extend Junior's shared SQL database with
-packaged migrations and access that database from trusted runtime hooks without
+packaged migrations and access that database from plugin hooks without
 requiring a memory-specific storage API or a globally merged plugin schema type.
 
 ## Scope
@@ -18,7 +18,7 @@ requiring a memory-specific storage API or a globally merged plugin schema type.
 - Migration ordering, checksums, and application through `junior upgrade`.
 - Plugin-owned storage migration hooks for moving existing plugin state into
   plugin SQL tables.
-- The `ctx.db` surface exposed to trusted plugin hooks.
+- The `ctx.db` surface exposed to plugin hooks.
 - Drizzle table ownership and typing boundaries for plugin code.
 - Database behavior for plugins.
 
@@ -54,8 +54,8 @@ at runtime.
 
 Declarative `plugin.yaml` packages are a separate manifest-only shape. If they
 are packaged next to `migrations/`, Junior treats those migration files as
-inert. A database-backed code plugin package should expose JavaScript
-registration and `migrations/` package content, not a same-plugin `plugin.yaml`
+inert. A SQL-owning code plugin package should expose JavaScript registration
+and `migrations/` package content, not a same-plugin `plugin.yaml`
 manifest that would also be loaded as a declarative plugin. Local `plugin.yaml`
 roots do not contribute SQL migrations in V1.
 
@@ -66,7 +66,7 @@ that include a plugin `manifest.name` and an associated `packageName`.
 
 Package-name plugins and local `plugin.yaml` roots have an empty applied
 migration list. This keeps the migration identity tied to the JavaScript
-registration name that owns database access and storage migration hooks.
+registration name that owns SQL migrations and storage migration hooks.
 
 Junior must never scan arbitrary `node_modules`, package dependencies, or
 undeclared directories for migrations.
@@ -132,12 +132,11 @@ part of V1 migration discovery.
 ### Storage Migration Hooks
 
 Schema migrations are not enough when an existing plugin has durable state in a
-non-SQL store. A trusted runtime plugin may provide a storage migration hook:
+non-SQL store. A plugin may provide a storage migration hook:
 
 ```ts
 defineJuniorPlugin({
   manifest,
-  database: {},
   hooks: {
     async migrateStorage(ctx) {
       // Read old plugin-owned state through ctx.state.
@@ -164,15 +163,13 @@ output this means reading the virtual `#junior/config` plugin set; in tests or
 programmatic callers this may be passed explicitly in the migration context.
 Package-only declarative plugins do not contribute SQL schema migrations or
 storage migration hooks. `@sentry/junior` core must not import plugin packages
-to synthesize runtime registrations; database-backed plugins such as the
-scheduler must be enabled through the same JavaScript registration module used
-by runtime.
+to synthesize runtime registrations; SQL-owning plugins such as the scheduler
+must be enabled through the same JavaScript registration module used by runtime.
 
 The hook context is intentionally narrow:
 
 ```ts
 interface StorageMigrationContext extends PluginContext {
-  db: PluginDb;
   state: PluginState;
 }
 ```
@@ -188,9 +185,8 @@ Rules:
 4. `migrateStorage` hooks should read and write plugin-owned state and
    plugin-owned SQL tables. Plugins are trusted host code; core does not
    enforce this ownership boundary.
-5. `migrateStorage` hooks must use `ctx.db` for SQL writes. A plugin with a
-   `migrateStorage` hook must declare database access and must fail upgrade
-   before the hook runs if no SQL database is configured.
+5. `migrateStorage` hooks must use `ctx.db` for SQL writes. `junior upgrade`
+   must fail before the hook runs if Junior cannot resolve a SQL database.
 6. `migrateStorage` hooks may read existing plugin state through `ctx.state`. This is
    the only V1 bridge from pre-SQL plugin state into SQL.
 7. `migrateStorage` hooks must return migration counters using the same result shape
@@ -214,6 +210,11 @@ keeping the scheduler store interface stable.
 
 Plugin migrations are privileged host code. The primary trust boundary is
 explicit plugin installation and code review, not SQL sandboxing.
+
+Code plugins that use `ctx.db` are trusted host code. Core must not introduce
+database facades solely to prevent those plugins from accessing core tables or
+schemas. Ownership rules are review and convention boundaries unless a concrete
+security, migration, lifecycle, or model-visible boundary requires enforcement.
 
 V1 plugin migrations must be expand-only:
 
@@ -247,38 +248,28 @@ boundary.
 
 ### Runtime DB Access
 
-Trusted runtime hook contexts may expose `ctx.db` when all of these are true:
+Plugin hook contexts expose `ctx.db`. Runtime provides the shared Junior SQL
+database connection to every plugin hook context. Junior startup fails when it
+cannot resolve a SQL database URL.
 
-1. A Junior SQL database URL is configured.
-2. The plugin is explicitly enabled.
-3. The plugin declared database access through code registration.
-4. The hook is running in host runtime code, not sandboxed model-controlled
-   code.
+This surface is only for plugin hooks running in Junior host runtime code. It
+must not be exposed to sandboxed model-controlled code.
 
 Runtime does not validate plugin migration state before creating `ctx.db`.
 `junior upgrade` is the only command that applies plugin migrations and checks
 stored migration checksums. Deployments must run `junior upgrade` before serving
-traffic for a build that enables or changes database-backed plugins.
+traffic for a build that enables or changes SQL-owning plugins.
 
-The V1 surface is a shared database connection/query capability:
+The V1 runtime surface is the shared Junior Drizzle database connection. Hook
+contexts expose this as `ctx.db`, not `ctx.database`, a nested `ctx.db.db`, or a
+custom plugin database facade.
 
-```ts
-interface PluginDb {
-  select: JuniorDrizzleConnection["select"];
-  insert: JuniorDrizzleConnection["insert"];
-  update: JuniorDrizzleConnection["update"];
-  delete: JuniorDrizzleConnection["delete"];
-  execute(statement: string, params?: readonly unknown[]): Promise<void>;
-  query<T = unknown>(
-    statement: string,
-    params?: readonly unknown[],
-  ): Promise<T[]>;
-  transaction<T>(callback: (tx: PluginDb) => Promise<T>): Promise<T>;
-}
-```
-
-Hook contexts should expose this as `ctx.db`, not `ctx.database` or a nested
-`ctx.db.db`.
+The public plugin API treats `ctx.db` as an opaque `object`. It does not
+re-export Drizzle database types, wrap Drizzle methods, or try to compose every
+installed plugin schema into one global type. A TypeScript plugin that wants
+typed queries should locally type `ctx.db` against its own Drizzle schema at
+the plugin boundary, then pass that typed connection into its plugin-owned
+store.
 
 `ctx.db` is not model-visible and must not be exposed to sandbox tools, skill
 text, MCP tools, or tool input schemas.
@@ -287,39 +278,52 @@ text, MCP tools, or tool input schemas.
 
 Plugins own their table objects and row types.
 
-Plugin code can import its own Drizzle table objects and use them with
-`ctx.db`:
+Plugin code can import its own Drizzle table objects, type the runtime database
+against that schema, and use the typed connection in its store:
 
 ```ts
+import type { PgDatabase } from "drizzle-orm/pg-core";
+import type { PgQueryResultHKT } from "drizzle-orm/pg-core/session";
 import { memories } from "./db/schema";
+import * as schema from "./db/schema";
 
-const rows = await ctx.db.select().from(memories);
+type MemoryDb = PgDatabase<PgQueryResultHKT, typeof schema>;
+
+const db = ctx.db as MemoryDb;
+const rows = await db.select().from(memories);
 ```
 
 The table object carries the row type for plugin queries. Core does not need to
-merge plugin schemas into `juniorSqlSchema` for this query style to be typed.
+merge plugin schemas into `juniorSqlSchema`, and plugin-api does not need a
+Drizzle dependency, for this query style to be typed inside the plugin package.
 
 V1 does not support:
 
 - auto-importing `src/db/schema.ts` by convention
 - `ctx.db.query.<pluginTable>` relation helpers for plugin tables
 - a public type that represents every installed plugin table
+- raw SQL helpers on `ctx.db` as a plugin-facing abstraction
 
 If a future plugin needs globally composed Drizzle schema typing, that must be
 added through an explicit code registration contract, not filesystem
 auto-discovery.
 
-### Database Plugins
+### Plugin DB Access
 
-Junior deployments require a SQL database. Plugins that use SQL still declare
-database access through code registration so runtime contexts know whether to
-expose `ctx.db`:
+Junior deployments require a SQL database. Hook contexts receive `ctx.db`
+because JavaScript plugin registrations are trusted host code. Plugins do not
+declare a separate database capability.
+
+Plugins that own SQL schema publish migrations through their package
+`migrations/` directory and named JavaScript registration. Plugins that move
+existing non-SQL state into SQL provide `hooks.migrateStorage`:
 
 ```ts
 defineJuniorPlugin({
   manifest,
-  database: {},
-  hooks,
+  hooks: {
+    migrateStorage,
+  },
 });
 ```
 
@@ -327,8 +331,8 @@ Rules:
 
 1. Runtime and `junior upgrade` fail when Junior cannot resolve a SQL database
    URL.
-2. A plugin receives `ctx.db` only when it declares database access through code
-   registration.
+2. Plugin hook contexts receive `ctx.db` regardless of whether the plugin owns
+   migrations.
 3. Migration application and checksum validation happen only in `junior
 upgrade`.
 4. Declarative `plugin.yaml` cannot declare executable database behavior.
@@ -342,6 +346,10 @@ memory store for the memory plugin.
 Plugin stores must parse database rows at their boundary before returning
 domain records. Drizzle table types are compile-time help, not runtime
 validation for data read from the database.
+
+Core may keep lower-level SQL executor types for migrations, locks, raw catalog
+queries, and connection lifecycle. Those executor types are not plugin hook
+interfaces and must not be passed as `ctx.db`.
 
 ## Failure Model
 
@@ -385,7 +393,7 @@ Use integration tests with the local Postgres-compatible PGlite fixture for:
 - deterministic plugin migration order
 - checksum mismatch failure
 - missing database URL failure
-- plugins without database declarations do not receive `ctx.db`
+- plugin hook contexts receive `ctx.db`
 - typed plugin table queries using plugin-owned Drizzle table objects
 - plugin storage migration hooks run after plugin schema migrations
 - plugin storage migration hooks are idempotent across repeated upgrade runs
@@ -395,7 +403,6 @@ Use unit tests for:
 - migration filename validation
 - table-prefix derivation from plugin names
 - build/package bundling including `migrations/`
-- `ctx.db` presence checks in hook context construction
 
 No evals are required for the database extension mechanism itself.
 

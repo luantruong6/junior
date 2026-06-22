@@ -38,11 +38,12 @@ provide fixtures for Junior test files.
 
 ## Database Lifecycle
 
-The harness is opt-in outside CI. `JUNIOR_TEST_DATABASE_URL` enables global
-Postgres setup; when it is unset, Postgres-harness-specific tests must skip and
-the existing PGlite-backed tests continue to run. CI provides
-`JUNIOR_TEST_DATABASE_URL` through the workflow Postgres service so the harness
-contract is still exercised on pull requests.
+The harness uses Junior's normal SQL database configuration. Vitest and eval
+configs load `apps/example/.env` as local defaults before workspace/package
+overrides, so local tests use `postgres://junior:junior@localhost:54322/junior`
+without per-command environment overrides. CI provides `DATABASE_URL` through
+the workflow Postgres service, and explicit developer or CI env vars still take
+precedence over env-file defaults.
 
 Global setup creates a run-scoped database prefix from the test process and a
 random suffix. It creates a migrated template database once per Vitest run, then
@@ -54,8 +55,8 @@ database name derived from `VITEST_POOL_ID` so test files can remain parallel.
 The harness must terminate only connections with the configured test
 application name before dropping or recreating test databases.
 
-Worker setup sets `JUNIOR_DATABASE_URL` to the worker database URL before test
-files import product modules. Tests that use normal Junior imports such as
+Worker setup sets `DATABASE_URL` to the worker database URL before test files
+import product modules. Tests that use normal Junior imports such as
 configured conversation stores, plugin DB resolution, or `createJuniorSqlExecutor`
 must therefore use the test database without changing import paths, injecting a
 special executor, or mocking database factories.
@@ -91,7 +92,7 @@ empty isolated database and does not apply Junior migrations implicitly.
 
 Transactional fixtures pin all SQL calls to one `pg.Client`.
 
-`executor.transaction()` inside a transactional fixture must use savepoints, not
+`fixture.sql.transaction()` inside a transactional fixture must use savepoints, not
 commit the outer test transaction. Nested transactions create nested savepoints.
 Failed nested transactions roll back to their savepoint and release it from the
 fixture's stack before rethrowing.
@@ -99,14 +100,13 @@ fixture's stack before rethrowing.
 `withLock()` may use Postgres advisory transaction locks inside the current
 transaction. Empty lock names are invalid.
 
-Tests that use transactional fixtures must inject the returned executor or a
-store built from it. Production singleton database construction uses the
+Tests that use transactional fixtures must inject the returned `fixture.sql` or
+a store built from it. Production singleton database construction uses the
 worker-scoped global test database and before-each reset; it is not eligible for
 transaction rollback isolation.
 
-Calling `executor.close()` on a transactional fixture must be equivalent to
-calling the fixture's `close()`: rollback happens once, the client is released
-once, and repeated close calls are no-ops.
+Closing a transactional fixture rolls back once, releases the client once, and
+repeated close calls are no-ops.
 
 ## Migration Contract
 
@@ -143,7 +143,7 @@ and Drizzle database objects are created inside worker/test processes.
   name through the generated worker database URL.
 - Transactional fixture state must never commit to the worker database.
 - Normal production-style imports must use the worker test database when
-  `JUNIOR_TEST_DATABASE_URL` is configured.
+  `DATABASE_URL` is configured by the test/eval environment.
 
 ## Observability
 

@@ -15,7 +15,7 @@ import * as readline from "node:readline/promises";
 import { createJiti } from "jiti";
 import { loadAppPluginSet } from "@/plugin-module";
 import { normalizeLocalConversationId } from "@/chat/local/conversation";
-import type { LocalAgentReply } from "@/chat/local/runner";
+import type { LocalAgentReply, LocalToolResult } from "@/chat/local/runner";
 import type { JuniorPluginSet } from "@/plugins";
 
 export const CHAT_USAGE = "usage: junior chat\n       junior chat -p <message>";
@@ -78,6 +78,39 @@ async function reportStatus(io: ChatIo, status: string): Promise<void> {
   }
 }
 
+function formatToolPayload(payload: unknown): string {
+  if (
+    payload &&
+    typeof payload === "object" &&
+    !Array.isArray(payload) &&
+    Object.keys(payload).length === 0
+  ) {
+    return "";
+  }
+  const rendered = JSON.stringify(payload);
+  if (rendered.length <= 500) {
+    return ` ${rendered}`;
+  }
+  return ` ${rendered.slice(0, 497)}...`;
+}
+
+async function reportToolResult(
+  io: ChatIo,
+  result: LocalToolResult,
+): Promise<void> {
+  if (!result.ok) {
+    await reportStatus(
+      io,
+      `tool: ${result.toolName} error ${result.error ?? "Tool execution failed"}`,
+    );
+    return;
+  }
+  await reportStatus(
+    io,
+    `tool: ${result.toolName} ok${formatToolPayload(result.result ?? {})}`,
+  );
+}
+
 function writeStream(
   stream: NodeJS.WritableStream,
   text: string,
@@ -121,7 +154,7 @@ async function configureLocalChatPlugins(): Promise<void> {
     import("@/chat/plugins/agent-hooks"),
     import("@/chat/plugins/registry"),
     import("@/chat/plugins/validation"),
-    import("@/chat/plugins/db"),
+    import("@/chat/db"),
   ]);
   const pluginSet = await loadLocalPluginSet();
   const plugins = pluginsModule.pluginHookRegistrationsFromPluginSet(pluginSet);
@@ -143,7 +176,7 @@ async function configureLocalChatPlugins(): Promise<void> {
         pluginSet?.registrations ?? [],
       );
     }
-    databaseModule.validatePluginDatabaseRequirements(plugins);
+    databaseModule.getDb();
     agentHooksModule.setPlugins(plugins);
   } catch (error) {
     registryModule.setPluginCatalogConfig(previousPluginCatalogConfig);
@@ -210,6 +243,9 @@ async function runPrompt(
       onStatus: async (status) => {
         await reportStatus(io, status);
       },
+      onToolResult: async (result) => {
+        await reportToolResult(io, result);
+      },
     },
   );
   return result.outcome === "success" ? 0 : 1;
@@ -247,6 +283,9 @@ async function runInteractive(io: ChatIo): Promise<void> {
             },
             onStatus: async (status) => {
               await reportStatus(io, status);
+            },
+            onToolResult: async (result) => {
+              await reportToolResult(io, result);
             },
           },
         );

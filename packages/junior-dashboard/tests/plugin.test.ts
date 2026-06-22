@@ -17,6 +17,7 @@ const log = {
   info() {},
   warn() {},
 };
+const db = {};
 
 afterEach(() => {
   for (const name of envNames) {
@@ -48,6 +49,7 @@ describe("juniorDashboardPlugin", () => {
     expect(
       plugin.hooks?.slackConversationLink?.({
         conversationId: "slack:C1:123",
+        db,
         log,
         plugin: { name: "dashboard" },
       }),
@@ -64,6 +66,7 @@ describe("juniorDashboardPlugin", () => {
     expect(
       plugin.hooks?.slackConversationLink?.({
         conversationId: "slack:D1:123",
+        db,
         log,
         plugin: { name: "dashboard" },
       }),

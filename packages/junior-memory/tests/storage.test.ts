@@ -1,54 +1,73 @@
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   createLocalPgliteFixture,
   type LocalPgliteFixture,
-} from "@sentry/junior-test-fixtures/pglite";
-import { PluginToolInputError, type PluginDb } from "@sentry/junior-plugin-api";
+} from "@sentry/junior-testing/pglite";
+import {
+  PluginToolInputError,
+  type PluginLogger,
+  type PluginModel,
+  type PluginState,
+} from "@sentry/junior-plugin-api";
 import { describe, expect, it } from "vitest";
 import * as memorySqlSchema from "../src/db/schema";
-import type { CreateMemoryRequest, MemoryAgent } from "../src/agent";
+import {
+  createMemoryAgent,
+  type CreateMemoryRequest,
+  type MemoryAgent,
+} from "../src/agent";
+import { createMemoryPlugin } from "../src/plugin";
 import {
   createMemoryCreateTool,
   createMemoryListTool,
   createMemoryRemoveTool,
   createMemorySearchTool,
 } from "../src/tools";
-import { createMemoryStore } from "../src/store";
+import { createMemoryStore, type MemoryDb } from "../src/store";
 
 const TEST_NOW_MS = Date.parse("2026-06-19T12:00:00.000Z");
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-type MemoryFixture = LocalPgliteFixture<unknown>;
+type MemoryFixture = LocalPgliteFixture<MemoryDb>;
 
-function pluginDb(fixture: MemoryFixture): PluginDb {
-  const db = fixture.db() as {
-    delete: PluginDb["delete"];
-    insert: PluginDb["insert"];
-    select: PluginDb["select"];
-    update: PluginDb["update"];
-  };
-  return {
-    delete: db.delete.bind(db) as PluginDb["delete"],
-    execute: (statement, params) => fixture.execute(statement, params),
-    insert: db.insert.bind(db) as PluginDb["insert"],
-    query: <T = unknown>(statement: string, params?: readonly unknown[]) =>
-      fixture.query<T>(statement, params),
-    select: db.select.bind(db) as PluginDb["select"],
-    transaction: async (callback) =>
-      await fixture.transaction(async () => await callback(pluginDb(fixture))),
-    update: db.update.bind(db) as PluginDb["update"],
-  };
+const noopLogger: PluginLogger = {
+  error() {},
+  info() {},
+  warn() {},
+};
+
+const memoryState: PluginState = {
+  async delete() {},
+  async get() {
+    return undefined;
+  },
+  async set() {},
+  async setIfNotExists() {
+    return true;
+  },
+  async withLock(_key, _ttlMs, callback) {
+    return await callback();
+  },
+};
+
+function memoryDb(fixture: MemoryFixture): MemoryDb {
+  return fixture.db();
 }
 
 async function createMemoryFixture(): Promise<MemoryFixture> {
-  const fixture = await createLocalPgliteFixture<unknown>(memorySqlSchema);
-  const migration = await readFile(
-    resolve(__dirname, "../migrations/0000_dizzy_millenium_guard.sql"),
-    "utf8",
-  );
-  await fixture.execute(migration);
+  const fixture = await createLocalPgliteFixture<MemoryDb>(memorySqlSchema);
+  const migrationsDir = resolve(__dirname, "../migrations");
+  const migrations = (await readdir(migrationsDir))
+    .filter((filename) => filename.endsWith(".sql"))
+    .sort();
+  for (const migrationFile of migrations) {
+    const migration = await readFile(resolve(migrationsDir, migrationFile), {
+      encoding: "utf8",
+    });
+    await fixture.execute(migration);
+  }
   return fixture;
 }
 
@@ -97,6 +116,10 @@ function localContext(
   };
 }
 
+function testCanonicalContent(content: string): string {
+  return content.replace(/^I prefer /, "Prefers ").replace(/^I use /, "Uses ");
+}
+
 function allowMemory(
   target: "requester" | "conversation",
   onRequest?: (request: CreateMemoryRequest) => void,
@@ -107,7 +130,7 @@ function allowMemory(
       return {
         decision: "store",
         target,
-        content: candidate.content,
+        content: testCanonicalContent(candidate.content),
         ...(candidate.expiresAtMs !== undefined
           ? { expiresAtMs: candidate.expiresAtMs }
           : {}),
@@ -120,29 +143,87 @@ const rejectMemory: MemoryAgent = {
   reviewCreateRequest() {
     return {
       decision: "reject",
-      reason: "not public/shareable",
+      reason: "not_public_shareable",
     };
   },
 };
 
 describe("memory plugin storage", () => {
+  it("normalizes nullable structured review responses", async () => {
+    const calls: Parameters<PluginModel["completeObject"]>[0][] = [];
+    const model: PluginModel = {
+      async completeObject(input) {
+        calls.push(input);
+        return {
+          object: {
+            decision: "store",
+            target: "requester",
+            content: "Uses qa-structured-output in CLI QA.",
+            reason: null,
+            expiresAtMs: null,
+          },
+        };
+      },
+    };
+    const agent = createMemoryAgent(model);
+
+    await expect(
+      agent.reviewCreateRequest({
+        content: "I use qa-structured-output in CLI QA.",
+        runtimeContext: localContext(),
+      }),
+    ).resolves.toEqual({
+      decision: "store",
+      target: "requester",
+      content: "Uses qa-structured-output in CLI QA.",
+    });
+    expect(calls[0]?.schema).toBeDefined();
+  });
+
+  it("normalizes nullable structured rejection responses", async () => {
+    const model: PluginModel = {
+      async completeObject() {
+        return {
+          object: {
+            decision: "reject",
+            target: null,
+            content: null,
+            reason: "not_public_shareable",
+            expiresAtMs: null,
+          },
+        };
+      },
+    };
+    const agent = createMemoryAgent(model);
+
+    await expect(
+      agent.reviewCreateRequest({
+        content: "remember this",
+        runtimeContext: localContext(),
+      }),
+    ).resolves.toEqual({
+      decision: "reject",
+      reason: "not_public_shareable",
+    });
+  });
+
   it("persists, recalls, and archives visible memories", async () => {
     const fixture = await createMemoryFixture();
 
     try {
       const requesterContext = slackContext();
       let nowMs = TEST_NOW_MS;
-      const store = createMemoryStore(pluginDb(fixture), requesterContext, {
+      const store = createMemoryStore(memoryDb(fixture), requesterContext, {
         now: () => nowMs,
       });
 
       const personal = await store.createMemory({
-        content: "The requester prefers short PR summaries.",
+        content: "Prefers short PR summaries.",
         idempotencyKey: "memory-test:personal",
       });
       nowMs = TEST_NOW_MS + 1;
       const conversation = await store.createConversationMemory({
-        content: "The channel keeps deploy runbooks in Notion.",
+        content: "Deploy runbooks live in Notion.",
         idempotencyKey: "memory-test:conversation",
       });
 
@@ -186,7 +267,7 @@ ORDER BY created_at_ms ASC
       ]);
 
       const otherRequesterStore = createMemoryStore(
-        pluginDb(fixture),
+        memoryDb(fixture),
         slackContext({ userId: "U456" }),
         { now: () => nowMs },
       );
@@ -194,7 +275,7 @@ ORDER BY created_at_ms ASC
         expect.objectContaining({ id: conversation.memory.id }),
       ]);
       const otherConversationStore = createMemoryStore(
-        pluginDb(fixture),
+        memoryDb(fixture),
         slackContext({
           channelId: "C999",
           threadTs: "1718800001.000000",
@@ -219,7 +300,7 @@ ORDER BY created_at_ms ASC
         otherConversationStore.archiveMemory({ id: conversation.memory.id }),
       ).rejects.toThrow("Memory was not found in the current context.");
       const otherTeamStore = createMemoryStore(
-        pluginDb(fixture),
+        memoryDb(fixture),
         slackContext({ teamId: "T999", userId: "U456" }),
         { now: () => nowMs },
       );
@@ -253,7 +334,7 @@ ORDER BY created_at_ms ASC
         agent: allowMemory("requester", (request) => {
           reviewedRequests.push(request);
         }),
-        db: pluginDb(fixture),
+        db: memoryDb(fixture),
         ...slackContext(),
       };
       const tools = {
@@ -264,7 +345,7 @@ ORDER BY created_at_ms ASC
       };
 
       await expect(
-        tools.createMemory.execute!(
+        tools.createMemory.execute(
           {
             content: "I prefer terse status updates.",
           },
@@ -274,7 +355,7 @@ ORDER BY created_at_ms ASC
         ok: true,
         created: true,
         memory: {
-          content: "I prefer terse status updates.",
+          content: "Prefers terse status updates.",
         },
       });
       expect(reviewedRequests[0]).toMatchObject({
@@ -295,13 +376,15 @@ ORDER BY created_at_ms ASC
           },
         },
       });
+      expect(reviewedRequests[0]).not.toHaveProperty("expiresAtMs");
       await expect(
         createMemoryCreateTool({
           ...context,
           agent: allowMemory("conversation"),
-        }).execute!(
+        }).execute(
           {
-            content: "The channel keeps incident notes in Linear.",
+            content: "Incident notes live in Linear.",
+            expires_at: "never",
           },
           { toolCallId: "tool-create-conversation" },
         ),
@@ -309,55 +392,55 @@ ORDER BY created_at_ms ASC
         ok: true,
         created: true,
         memory: {
-          content: "The channel keeps incident notes in Linear.",
+          content: "Incident notes live in Linear.",
         },
       });
 
       await expect(
-        tools.listMemories.execute!({ limit: 10 }, {}),
+        tools.listMemories.execute({ limit: 10 }, {}),
       ).resolves.toMatchObject({
         ok: true,
         memories: [
           expect.objectContaining({
-            content: "The channel keeps incident notes in Linear.",
+            content: "Incident notes live in Linear.",
           }),
           expect.objectContaining({
-            content: "I prefer terse status updates.",
+            content: "Prefers terse status updates.",
           }),
         ],
       });
       await expect(
-        tools.searchMemories.execute!({ query: "incident notes" }, {}),
+        tools.searchMemories.execute({ query: "incident notes" }, {}),
       ).resolves.toMatchObject({
         ok: true,
         memories: [
           expect.objectContaining({
-            content: "The channel keeps incident notes in Linear.",
+            content: "Incident notes live in Linear.",
           }),
         ],
       });
 
-      const listResult = (await tools.listMemories.execute!(
+      const listResult = (await tools.listMemories.execute(
         { limit: 10 },
         {},
       )) as {
         memories: Array<{ content: string; id: string }>;
       };
       const personal = listResult.memories.find(
-        (memory) => memory.content === "I prefer terse status updates.",
+        (memory) => memory.content === "Prefers terse status updates.",
       );
       expect(personal).toBeDefined();
       await expect(
-        tools.removeMemory.execute!({ id: personal!.id.slice(0, 12) }, {}),
+        tools.removeMemory.execute({ id: personal!.id.slice(0, 12) }, {}),
       ).resolves.toMatchObject({
         ok: true,
         memory: {
           id: personal!.id,
-          content: "I prefer terse status updates.",
+          content: "Prefers terse status updates.",
         },
       });
       await expect(
-        tools.searchMemories.execute!({ query: "terse status" }, {}),
+        tools.searchMemories.execute({ query: "terse status" }, {}),
       ).resolves.toEqual({ ok: true, memories: [] });
 
       await expect(
@@ -370,15 +453,16 @@ ORDER BY created_at_ms ASC
               );
             },
           },
-        }).execute!(
+        }).execute(
           {
             content: "I prefer missing retry ids to fail.",
+            expires_at: "never",
           },
           {},
         ),
       ).rejects.toThrow(PluginToolInputError);
       await expect(
-        tools.createMemory.execute!(
+        tools.createMemory.execute(
           {
             content: "I prefer invalid expiration to fail.",
             expires_at: "not-a-date",
@@ -387,7 +471,7 @@ ORDER BY created_at_ms ASC
         ),
       ).rejects.toThrow(PluginToolInputError);
       await expect(
-        tools.createMemory.execute!(
+        tools.createMemory.execute(
           {
             content: "I prefer valid expiration to be stored.",
             expires_at: "2026-06-19T13:00:00+00:00",
@@ -398,23 +482,25 @@ ORDER BY created_at_ms ASC
         ok: true,
         created: true,
         memory: {
-          content: "I prefer valid expiration to be stored.",
+          content: "Prefers valid expiration to be stored.",
           expiresAtMs: Date.parse("2026-06-19T13:00:00+00:00"),
         },
       });
       await expect(
-        tools.createMemory.execute!(
+        tools.createMemory.execute(
           {
             content: "I prefer hidden fields to fail.",
+            expires_at: "never",
             scope: "conversation",
           } as never,
           { toolCallId: "tool-create-hidden-field" },
         ),
       ).rejects.toThrow(PluginToolInputError);
       await expect(
-        tools.createMemory.execute!(
+        tools.createMemory.execute(
           {
             content: " \n\t ",
+            expires_at: "never",
           },
           { toolCallId: "tool-create-empty-content" },
         ),
@@ -422,11 +508,12 @@ ORDER BY created_at_ms ASC
       await expect(
         createMemoryCreateTool({
           agent: rejectMemory,
-          db: pluginDb(fixture),
+          db: memoryDb(fixture),
           ...slackContext(),
-        }).execute!(
+        }).execute(
           {
             content: "I prefer rejected memories not to be stored.",
+            expires_at: "never",
           },
           { toolCallId: "tool-create-rejected" },
         ),
@@ -434,27 +521,125 @@ ORDER BY created_at_ms ASC
       await expect(
         createMemoryCreateTool({
           agent: allowMemory("requester"),
-          db: pluginDb(fixture),
+          db: memoryDb(fixture),
           source: slackContext().source,
-        }).execute!(
+        }).execute(
           {
             content: "I prefer requester context failures to be visible.",
+            expires_at: "never",
           },
           { toolCallId: "tool-create-missing-requester" },
         ),
       ).rejects.toThrow(PluginToolInputError);
       await expect(
-        tools.createMemory.execute!(
+        tools.createMemory.execute(
           {
             content: "I prefer duplicate-safe retries.",
+            expires_at: "never",
           },
           { toolCallId: "tool-create-personal" },
         ),
       ).resolves.toMatchObject({
         ok: true,
-        created: false,
-        memory: { content: "I prefer terse status updates." },
+        created: true,
+        memory: { content: "Prefers duplicate-safe retries." },
       });
+      await expect(
+        tools.searchMemories.execute({ query: "duplicate-safe retries" }, {}),
+      ).resolves.toMatchObject({
+        ok: true,
+        memories: [
+          expect.objectContaining({
+            content: "Prefers duplicate-safe retries.",
+          }),
+        ],
+      });
+    } finally {
+      await fixture.close();
+    }
+  }, 15_000);
+
+  it("injects visible active memories into user prompt context", async () => {
+    const fixture = await createMemoryFixture();
+
+    try {
+      let nowMs = TEST_NOW_MS;
+      const context = slackContext();
+      const store = createMemoryStore(memoryDb(fixture), context, {
+        now: () => nowMs,
+      });
+      const personal = await store.createMemory({
+        content: "Prefers PR summaries with risks first.",
+        idempotencyKey: "memory-test:recall-personal",
+      });
+      nowMs += 1;
+      const conversation = await store.createConversationMemory({
+        content: "Release notes live in Notion.",
+        idempotencyKey: "memory-test:recall-conversation",
+      });
+      nowMs += 1;
+      await store.createMemory({
+        content: "Prefers PR summary obsolete wording.",
+        expiresAtMs: TEST_NOW_MS + 1,
+        idempotencyKey: "memory-test:recall-expired",
+      });
+      nowMs += 1;
+      await createMemoryStore(
+        memoryDb(fixture),
+        slackContext({ userId: "U456" }),
+        { now: () => nowMs },
+      ).createMemory({
+        content: "Prefers PR summary unrelated owner.",
+        idempotencyKey: "memory-test:recall-other-user",
+      });
+
+      const plugin = createMemoryPlugin();
+      const result = await plugin.hooks?.userPrompt?.({
+        ...context,
+        db: memoryDb(fixture),
+        log: noopLogger,
+        plugin: { name: "memory" },
+        state: memoryState,
+        text: "Draft a PR summary and mention release notes.",
+      });
+
+      expect(result).toEqual([
+        {
+          text: expect.stringContaining(personal.memory.content),
+        },
+      ]);
+      const text = result?.[0]?.text ?? "";
+      expect(text).toContain(conversation.memory.content);
+      expect(text).not.toContain(personal.memory.id);
+      expect(text).not.toContain(conversation.memory.id);
+      expect(text).not.toContain("obsolete wording");
+      expect(text).not.toContain("unrelated owner");
+    } finally {
+      await fixture.close();
+    }
+  }, 15_000);
+
+  it("skips user prompt memory recall when prompt text is blank", async () => {
+    const fixture = await createMemoryFixture();
+
+    try {
+      const context = slackContext();
+      await createMemoryStore(memoryDb(fixture), context).createMemory({
+        content: "Prefers PR summaries with risks first.",
+        idempotencyKey: "memory-test:recall-blank",
+      });
+
+      const plugin = createMemoryPlugin();
+      await expect(
+        plugin.hooks?.userPrompt?.({
+          ...context,
+          db: memoryDb(fixture),
+          log: noopLogger,
+          plugin: { name: "memory" },
+          state: memoryState,
+          text: "   ",
+        }),
+      ).resolves.toBeUndefined();
     } finally {
       await fixture.close();
     }
@@ -466,36 +651,42 @@ ORDER BY created_at_ms ASC
     try {
       const firstTool = createMemoryCreateTool({
         agent: allowMemory("requester"),
-        db: pluginDb(fixture),
+        db: memoryDb(fixture),
         ...slackContext(),
       });
       const secondTool = createMemoryCreateTool({
         agent: allowMemory("requester"),
-        db: pluginDb(fixture),
+        db: memoryDb(fixture),
         ...slackContext({ threadTs: "1718800001.000000" }),
       });
 
       await expect(
-        firstTool.execute!(
-          { content: "I prefer the first remembered fact." },
+        firstTool.execute(
+          {
+            content: "I prefer the first remembered fact.",
+            expires_at: "never",
+          },
           { toolCallId: "tool-create-reused-id" },
         ),
       ).resolves.toMatchObject({ created: true });
       await expect(
-        secondTool.execute!(
-          { content: "I prefer the second remembered fact." },
+        secondTool.execute(
+          {
+            content: "I prefer the second remembered fact.",
+            expires_at: "never",
+          },
           { toolCallId: "tool-create-reused-id" },
         ),
       ).resolves.toMatchObject({ created: true });
 
       await expect(
-        createMemoryStore(pluginDb(fixture), slackContext()).listMemories({}),
+        createMemoryStore(memoryDb(fixture), slackContext()).listMemories({}),
       ).resolves.toEqual([
         expect.objectContaining({
-          content: "I prefer the second remembered fact.",
+          content: "Prefers the second remembered fact.",
         }),
         expect.objectContaining({
-          content: "I prefer the first remembered fact.",
+          content: "Prefers the first remembered fact.",
         }),
       ]);
     } finally {
@@ -508,17 +699,17 @@ ORDER BY created_at_ms ASC
 
     try {
       let nowMs = TEST_NOW_MS;
-      const store = createMemoryStore(pluginDb(fixture), localContext(), {
+      const store = createMemoryStore(memoryDb(fixture), localContext(), {
         now: () => nowMs,
       });
 
       const personal = await store.createMemory({
-        content: "The requester prefers local CLI memory checks.",
+        content: "Prefers local CLI memory checks.",
         idempotencyKey: "memory-test:local-personal",
       });
       nowMs = TEST_NOW_MS + 1;
       const conversation = await store.createConversationMemory({
-        content: "This local session tracks memory plugin validation.",
+        content: "Memory plugin validation is tracked in this local session.",
         idempotencyKey: "memory-test:local-conversation",
       });
 
@@ -533,7 +724,7 @@ ORDER BY created_at_ms ASC
       ]);
 
       const otherConversationStore = createMemoryStore(
-        pluginDb(fixture),
+        memoryDb(fixture),
         localContext({ conversationId: "local:junior:other-memory-test" }),
         { now: () => nowMs },
       );
@@ -560,7 +751,7 @@ ORDER BY created_at_ms ASC
 
     try {
       let nowMs = TEST_NOW_MS;
-      const store = createMemoryStore(pluginDb(fixture), slackContext(), {
+      const store = createMemoryStore(memoryDb(fixture), slackContext(), {
         now: () => nowMs,
       });
 
@@ -621,17 +812,66 @@ INSERT INTO junior_memory_memories (
     }
   }, 15_000);
 
+  it("recreates archived memories instead of resolving retries to hidden rows", async () => {
+    const fixture = await createMemoryFixture();
+
+    try {
+      let nowMs = TEST_NOW_MS;
+      const store = createMemoryStore(memoryDb(fixture), slackContext(), {
+        now: () => nowMs,
+      });
+
+      const archived = await store.createMemory({
+        content: "Prefers short deployment summaries.",
+        idempotencyKey: "explicit-create-archived",
+      });
+
+      nowMs = TEST_NOW_MS + 1;
+      await store.archiveMemory({ id: archived.memory.id });
+
+      nowMs = TEST_NOW_MS + 2;
+      const recreated = await store.createMemory({
+        content: "Prefers short deployment summaries.",
+        idempotencyKey: "explicit-create-archived",
+      });
+      expect(recreated).toMatchObject({
+        created: true,
+        memory: { content: archived.memory.content },
+      });
+      expect(recreated.memory.id).not.toBe(archived.memory.id);
+
+      nowMs = TEST_NOW_MS + 3;
+      await expect(
+        store.createMemory({
+          content: "Changed content with the recreated retry key.",
+          idempotencyKey: "explicit-create-archived",
+        }),
+      ).resolves.toMatchObject({
+        created: false,
+        memory: {
+          id: recreated.memory.id,
+          content: recreated.memory.content,
+        },
+      });
+      await expect(store.listMemories({})).resolves.toEqual([
+        expect.objectContaining({ id: recreated.memory.id }),
+      ]);
+    } finally {
+      await fixture.close();
+    }
+  }, 15_000);
+
   it("treats expired memories as inactive for archive and recreate", async () => {
     const fixture = await createMemoryFixture();
 
     try {
       let nowMs = TEST_NOW_MS;
-      const store = createMemoryStore(pluginDb(fixture), slackContext(), {
+      const store = createMemoryStore(memoryDb(fixture), slackContext(), {
         now: () => nowMs,
       });
 
       const expired = await store.createMemory({
-        content: "The requester temporarily prefers quiet deploy reminders.",
+        content: "Temporarily prefers quiet deploy reminders.",
         expiresAtMs: TEST_NOW_MS + 10,
         idempotencyKey: "memory-test:expires",
       });
@@ -646,7 +886,7 @@ INSERT INTO junior_memory_memories (
 
       nowMs = TEST_NOW_MS + 12;
       const recreated = await store.createMemory({
-        content: "The requester temporarily prefers quiet deploy reminders.",
+        content: "Temporarily prefers quiet deploy reminders.",
         idempotencyKey: "memory-test:expires-recreated",
       });
 
@@ -668,12 +908,11 @@ INSERT INTO junior_memory_memories (
 
     try {
       let nowMs = TEST_NOW_MS;
-      const store = createMemoryStore(pluginDb(fixture), slackContext(), {
+      const store = createMemoryStore(memoryDb(fixture), slackContext(), {
         now: () => nowMs,
       });
       const target = await store.createConversationMemory({
-        content:
-          "The oldest durable memory mentions release cutover rehearsal.",
+        content: "Release cutover rehearsal is durable.",
         idempotencyKey: "memory-test:search-target",
       });
 
@@ -698,13 +937,13 @@ INSERT INTO junior_memory_memories (
     const fixture = await createMemoryFixture();
 
     try {
-      const store = createMemoryStore(pluginDb(fixture), slackContext(), {
+      const store = createMemoryStore(memoryDb(fixture), slackContext(), {
         now: () => TEST_NOW_MS,
       });
 
       await expect(
         store.createMemory({
-          content: "The requester prefers short PR summaries.",
+          content: "Prefers short PR summaries.",
           idempotencyKey: "memory-test:smuggle",
           scope: "conversation",
           subjectKey: "slack:T123:U999",
@@ -728,7 +967,7 @@ INSERT INTO junior_memory_memories (
     const fixture = await createMemoryFixture();
 
     try {
-      const store = createMemoryStore(pluginDb(fixture), slackContext(), {
+      const store = createMemoryStore(memoryDb(fixture), slackContext(), {
         now: () => TEST_NOW_MS,
       });
 

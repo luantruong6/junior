@@ -1,13 +1,7 @@
 import { afterEach, expect } from "vitest";
 import { assistantMessages, describeEval, toolCalls } from "vitest-evals";
-import { getChatConfig } from "@/chat/config";
-import {
-  closeConfiguredPluginDb,
-  createPluginDbForExecutor,
-} from "@/chat/plugins/db";
-import { createJuniorSqlExecutor } from "@/chat/sql/executor";
-import type { JuniorSqlExecutor } from "@/chat/sql/db";
-import { createMemoryStore } from "@sentry/junior-memory";
+import { closeDb, getDb } from "@/chat/db";
+import { createMemoryStore, type MemoryDb } from "@sentry/junior-memory";
 import { juniorMemoryMemories } from "../../../junior-memory/src/db/schema";
 import { mention, rubric, slackEvals } from "../../src/helpers";
 
@@ -21,31 +15,6 @@ interface MemoryThread {
   channel_id: string;
   id: string;
   thread_ts: string;
-}
-
-function createEvalSqlExecutor(): JuniorSqlExecutor {
-  const { sql } = getChatConfig();
-  if (!sql.databaseUrl) {
-    throw new Error(
-      "Memory evals require DATABASE_URL from the Junior Postgres test setup.",
-    );
-  }
-  return createJuniorSqlExecutor({
-    connectionString: sql.databaseUrl,
-    driver: sql.driver,
-  });
-}
-
-async function withMemoryDb<T>(
-  callback: (executor: JuniorSqlExecutor) => Promise<T>,
-): Promise<T> {
-  const executor = createEvalSqlExecutor();
-  try {
-    return await callback(executor);
-  } finally {
-    await closeConfiguredPluginDb();
-    await executor.close();
-  }
 }
 
 function memoryContext(thread: MemoryThread) {
@@ -68,15 +37,11 @@ function memoryContext(thread: MemoryThread) {
 
 async function seedMemory(args: {
   content: string;
-  executor: JuniorSqlExecutor;
   idempotencyKey: string;
   scope?: "conversation" | "personal";
   thread: MemoryThread;
 }) {
-  const store = createMemoryStore(
-    createPluginDbForExecutor(args.executor),
-    memoryContext(args.thread),
-  );
+  const store = createMemoryStore(memoryDb(), memoryContext(args.thread));
   const input = {
     content: args.content,
     idempotencyKey: args.idempotencyKey,
@@ -87,9 +52,12 @@ async function seedMemory(args: {
   return await store.createMemory(input);
 }
 
-async function readMemories(executor: JuniorSqlExecutor) {
-  const db = createPluginDbForExecutor(executor);
-  return await db
+function memoryDb(): MemoryDb {
+  return getDb() as unknown as MemoryDb;
+}
+
+async function readMemories() {
+  return await memoryDb()
     .select()
     .from(juniorMemoryMemories)
     .orderBy(juniorMemoryMemories.createdAtMs, juniorMemoryMemories.id);
@@ -105,8 +73,25 @@ function visibleAssistantText(result: {
     .join("\n");
 }
 
+function expectVisibleMemoryId(text: string, id: string): void {
+  const parts = text.match(/\bmem_[a-zA-Z0-9_-]+\b/g) ?? [];
+  expect(parts.some((part) => id.startsWith(part) && part.length >= 12)).toBe(
+    true,
+  );
+}
+
+function expectCanonicalMemoryContent(
+  content: string,
+  expectedPattern: RegExp,
+): void {
+  expect(content).toMatch(expectedPattern);
+  expect(content).not.toMatch(
+    /\b(the requester|the user|requester|user|David|this thread|this channel|channel|Slack|I|my)\b/i,
+  );
+}
+
 afterEach(async () => {
-  await closeConfiguredPluginDb();
+  await closeDb();
 });
 
 describeEval("Memory Workflows", slackEvals, (it) => {
@@ -116,45 +101,86 @@ describeEval("Memory Workflows", slackEvals, (it) => {
     thread_ts: "17000000.memory-explicit",
   };
 
-  it("createMemory submits only a memory candidate and does not write a rejected memory", async ({
+  it("when explicitly asked to remember a public first-person preference, store one personal memory", async ({
     run,
   }) => {
-    await withMemoryDb(async (executor) => {
-      const result = await run({
-        overrides: memoryPluginOverrides,
-        events: [
-          mention("Please remember that I prefer terse PR summaries.", {
-            thread: explicitRememberThread,
-          }),
+    const result = await run({
+      overrides: memoryPluginOverrides,
+      events: [
+        mention("Please remember that I prefer terse PR summaries.", {
+          thread: explicitRememberThread,
+        }),
+        mention("List the exact stored memory content for that preference.", {
+          thread: explicitRememberThread,
+        }),
+      ],
+      criteria: rubric({
+        pass: [
+          "Treat createMemory arguments as candidate input, not stored content.",
+          "The assistant uses the exact canonical stored memory content. Good: 'Prefers terse PR summaries'. Bad: 'The requester prefers terse PR summaries'. Bad: 'I prefer terse PR summaries'.",
+          "The assistant does not ask the user to provide hidden scope, actor, Slack, or subject identifiers.",
         ],
-        criteria: rubric({
-          pass: [
-            "The assistant treats the request as an explicit memory request.",
-            "The assistant does not ask the user to provide hidden scope, actor, Slack, or subject identifiers.",
-            "If storage is unavailable or rejected, the assistant says it could not store the memory rather than claiming it was saved.",
-            "Ignore Junior's automatic processing or completion reaction; judge memory storage success only from the assistant text and memory tool result.",
-          ],
-          fail: [
-            "Do not ask the user for Slack ids, actor ids, scope names, or subject ids.",
-            "Do not claim the memory was definitely saved if the memory tool rejected it.",
-          ],
-        }),
-      });
-
-      const createCall = toolCalls(result.session).find(
-        (call) => call.name === "createMemory",
-      );
-      expect(createCall).toBeDefined();
-      expect(createCall?.arguments).toEqual(
-        expect.objectContaining({
-          content: expect.stringMatching(/\bterse\b.*\bPR summaries\b/i),
-        }),
-      );
-      expect(Object.keys(createCall?.arguments ?? {}).sort()).toEqual([
-        "content",
-      ]);
-      expect(await readMemories(executor)).toHaveLength(0);
+        fail: [
+          "Do not fail only because the createMemory candidate uses natural first-person or display-name phrasing; the stored/listed memory content is the contract.",
+          "Do not ask the user for Slack ids, actor ids, scope names, or subject ids.",
+          "Do not present requester names, display names, 'the requester', 'the user', 'I', 'my', thread labels, channel labels, or source labels as the stored memory content.",
+          "Do not say the memory failed to save.",
+        ],
+      }),
     });
+
+    const createCall = toolCalls(result.session).find(
+      (call) => call.name === "createMemory",
+    );
+    expect(createCall?.arguments).toEqual(
+      expect.objectContaining({
+        content: expect.stringMatching(/\bterse\b.*\bPR summaries\b/i),
+      }),
+    );
+    expect(await readMemories()).toEqual([
+      expect.objectContaining({
+        archivedAtMs: null,
+        content: expect.stringMatching(/^Prefers terse PR summaries\.?$/i),
+        scope: "personal",
+        subjectType: "user",
+      }),
+    ]);
+    const rows = await readMemories();
+    expectCanonicalMemoryContent(
+      rows[0]!.content,
+      /^Prefers terse PR summaries\.?$/i,
+    );
+  });
+
+  const thirdPartyRememberThread = {
+    id: "thread-memory-third-party-remember",
+    channel_id: "CMEMORYTHIRDPARTY",
+    thread_ts: "17000000.memory-third-party",
+  };
+
+  it("when asked to remember another person's personal preference, store nothing", async ({
+    run,
+  }) => {
+    await run({
+      overrides: memoryPluginOverrides,
+      events: [
+        mention("Please remember that David prefers terse PR summaries.", {
+          thread: thirdPartyRememberThread,
+        }),
+      ],
+      criteria: rubric({
+        pass: [
+          "The assistant does not store David's personal preference as a requester memory.",
+          "The assistant does not ask the user for hidden scope, actor, Slack, or subject identifiers.",
+        ],
+        fail: [
+          "Do not claim David's preference was saved as a memory.",
+          "Do not ask the user for Slack ids, actor ids, scope names, or subject ids.",
+        ],
+      }),
+    });
+
+    expect(await readMemories()).toEqual([]);
   });
 
   const listThread = {
@@ -166,47 +192,46 @@ describeEval("Memory Workflows", slackEvals, (it) => {
   it("listMemories reads visible memories before answering what Junior remembers", async ({
     run,
   }) => {
-    await withMemoryDb(async (executor) => {
-      await seedMemory({
-        content: "The requester prefers terse PR summaries.",
-        executor,
-        idempotencyKey: "eval-memory-list",
-        thread: listThread,
-      });
-
-      const result = await run({
-        overrides: memoryPluginOverrides,
-        events: [
-          mention("What do you remember about how I like PR summaries?", {
-            thread: listThread,
-          }),
-        ],
-        criteria: rubric({
-          pass: [
-            "The assistant answers from memory that the requester prefers terse PR summaries.",
-            "The assistant does not ask the user to restate the preference.",
-          ],
-          fail: [
-            "Do not answer as if no relevant memory exists.",
-            "Do not mention hidden storage fields, scope keys, or Slack ids.",
-          ],
-        }),
-      });
-
-      expect(
-        toolCalls(result.session).some((call) => call.name === "listMemories"),
-      ).toBe(true);
-      expect(visibleAssistantText(result)).toMatch(
-        /\bterse\b.*\bPR summaries\b/i,
-      );
-      expect(await readMemories(executor)).toEqual([
-        expect.objectContaining({
-          archivedAtMs: null,
-          content: "The requester prefers terse PR summaries.",
-          scope: "personal",
-        }),
-      ]);
+    const seeded = await seedMemory({
+      content: "Prefers terse PR summaries.",
+      idempotencyKey: "eval-memory-list",
+      thread: listThread,
     });
+
+    const result = await run({
+      overrides: memoryPluginOverrides,
+      events: [
+        mention(
+          "List the exact memories you have about how I like PR summaries, including the memory id.",
+          {
+            thread: listThread,
+          },
+        ),
+      ],
+      criteria: rubric({
+        pass: [
+          "The assistant lists the stored memory about terse PR summaries.",
+          "The assistant includes a memory id or id prefix from the memory tool output.",
+          "The assistant does not ask the user to restate the preference.",
+        ],
+        fail: [
+          "Do not answer as if no relevant memory exists.",
+          "Do not mention hidden storage fields, scope keys, or Slack ids.",
+        ],
+      }),
+    });
+
+    expect(visibleAssistantText(result)).toMatch(
+      /\bterse\b.*\bPR summaries\b/i,
+    );
+    expectVisibleMemoryId(visibleAssistantText(result), seeded.memory.id);
+    expect(await readMemories()).toEqual([
+      expect.objectContaining({
+        archivedAtMs: null,
+        content: "Prefers terse PR summaries.",
+        scope: "personal",
+      }),
+    ]);
   });
 
   const searchThread = {
@@ -218,60 +243,97 @@ describeEval("Memory Workflows", slackEvals, (it) => {
   it("searchMemories finds the relevant stored memory for a targeted recall request", async ({
     run,
   }) => {
-    await withMemoryDb(async (executor) => {
-      await seedMemory({
-        content:
-          "The requester prefers incident reports with bullet summaries.",
-        executor,
-        idempotencyKey: "eval-memory-search-match",
-        thread: searchThread,
-      });
-      await seedMemory({
-        content: "The requester prefers terse PR summaries.",
-        executor,
-        idempotencyKey: "eval-memory-search-distractor",
-        thread: searchThread,
-      });
-
-      const result = await run({
-        overrides: memoryPluginOverrides,
-        events: [
-          mention("Based on memory, how do I like incident reports?", {
-            thread: searchThread,
-          }),
-        ],
-        criteria: rubric({
-          pass: [
-            "The assistant answers from memory that the requester likes incident reports with bullet summaries.",
-            "The assistant does not substitute the unrelated PR summary preference.",
-          ],
-          fail: [
-            "Do not answer from the unrelated PR summary memory.",
-            "Do not ask the user to restate the incident report preference.",
-          ],
-        }),
-      });
-
-      expect(
-        toolCalls(result.session).some(
-          (call) => call.name === "searchMemories",
-        ),
-      ).toBe(true);
-      expect(visibleAssistantText(result)).toMatch(
-        /\bincident reports\b.*\bbullet summaries\b/i,
-      );
-      expect(await readMemories(executor)).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            content:
-              "The requester prefers incident reports with bullet summaries.",
-          }),
-          expect.objectContaining({
-            content: "The requester prefers terse PR summaries.",
-          }),
-        ]),
-      );
+    const match = await seedMemory({
+      content: "Prefers incident reports with bullet summaries.",
+      idempotencyKey: "eval-memory-search-match",
+      thread: searchThread,
     });
+    await seedMemory({
+      content: "Prefers terse PR summaries.",
+      idempotencyKey: "eval-memory-search-distractor",
+      thread: searchThread,
+    });
+
+    const result = await run({
+      overrides: memoryPluginOverrides,
+      events: [
+        mention(
+          "Search memory for my incident report preference and include the matching memory id with the answer.",
+          {
+            thread: searchThread,
+          },
+        ),
+      ],
+      criteria: rubric({
+        pass: [
+          "The assistant answers from memory that the user likes incident reports with bullet summaries.",
+          "The assistant includes the matching memory id or id prefix from the memory search result.",
+          "The assistant does not substitute the unrelated PR summary preference.",
+        ],
+        fail: [
+          "Do not answer from the unrelated PR summary memory.",
+          "Do not ask the user to restate the incident report preference.",
+        ],
+      }),
+    });
+
+    expect(visibleAssistantText(result)).toMatch(
+      /\bincident reports\b.*\bbullet summaries\b/i,
+    );
+    expectVisibleMemoryId(visibleAssistantText(result), match.memory.id);
+    expect(await readMemories()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          content: "Prefers incident reports with bullet summaries.",
+        }),
+        expect.objectContaining({
+          content: "Prefers terse PR summaries.",
+        }),
+      ]),
+    );
+  });
+
+  const autoRecallThread = {
+    id: "thread-memory-auto-recall",
+    channel_id: "CMEMORYAUTORECALL",
+    thread_ts: "17000000.memory-auto-recall",
+  };
+
+  it("automatically injects relevant memories without requiring a recall tool", async ({
+    run,
+  }) => {
+    await seedMemory({
+      content: "Prefers PR summaries with risks first.",
+      idempotencyKey: "eval-memory-auto-recall",
+      thread: autoRecallThread,
+    });
+
+    await run({
+      overrides: memoryPluginOverrides,
+      events: [
+        mention("How should I structure my next PR summary?", {
+          thread: autoRecallThread,
+        }),
+      ],
+      criteria: rubric({
+        pass: [
+          "The assistant uses memory to say the user prefers PR summaries with risks first.",
+          "The assistant does not ask the user to restate the preference.",
+        ],
+        fail: [
+          "Do not answer as if no relevant preference exists.",
+          "Do not mention hidden storage fields, scope keys, or Slack ids.",
+        ],
+      }),
+    });
+
+    expect(await readMemories()).toEqual([
+      expect.objectContaining({
+        archivedAtMs: null,
+        content: "Prefers PR summaries with risks first.",
+        scope: "personal",
+      }),
+    ]);
   });
 
   const removeThread = {
@@ -281,43 +343,37 @@ describeEval("Memory Workflows", slackEvals, (it) => {
   };
 
   it("removeMemory archives the selected stored memory", async ({ run }) => {
-    await withMemoryDb(async (executor) => {
-      await seedMemory({
-        content: "The requester prefers terse PR summaries.",
-        executor,
-        idempotencyKey: "eval-memory-remove",
-        thread: removeThread,
-      });
-
-      const result = await run({
-        overrides: memoryPluginOverrides,
-        events: [
-          mention("Please forget that I prefer terse PR summaries.", {
-            thread: removeThread,
-          }),
-        ],
-        criteria: rubric({
-          pass: [
-            "The assistant removes the matching stored memory.",
-            "The assistant does not ask the user for hidden ids or scope fields.",
-          ],
-          fail: [
-            "Do not claim the memory was removed if the remove tool was not called.",
-            "Do not ask the user for Slack ids, scope keys, or subject ids.",
-          ],
-        }),
-      });
-
-      expect(
-        toolCalls(result.session).some((call) => call.name === "removeMemory"),
-      ).toBe(true);
-      expect(await readMemories(executor)).toEqual([
-        expect.objectContaining({
-          archivedAtMs: expect.any(Number),
-          archiveReason: "tool_removed",
-          content: "The requester prefers terse PR summaries.",
-        }),
-      ]);
+    await seedMemory({
+      content: "Prefers terse PR summaries.",
+      idempotencyKey: "eval-memory-remove",
+      thread: removeThread,
     });
+
+    await run({
+      overrides: memoryPluginOverrides,
+      events: [
+        mention("Please forget that I prefer terse PR summaries.", {
+          thread: removeThread,
+        }),
+      ],
+      criteria: rubric({
+        pass: [
+          "The assistant removes the matching stored memory.",
+          "The assistant does not ask the user for hidden ids or scope fields.",
+        ],
+        fail: [
+          "Do not claim the memory was removed if the assistant cannot identify the matching remembered preference.",
+          "Do not ask the user for Slack ids, scope keys, or subject ids.",
+        ],
+      }),
+    });
+
+    expect(await readMemories()).toEqual([
+      expect.objectContaining({
+        archivedAtMs: expect.any(Number),
+        archiveReason: "tool_removed",
+        content: "Prefers terse PR summaries.",
+      }),
+    ]);
   });
 });

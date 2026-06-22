@@ -1,8 +1,6 @@
-import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   defineJuniorPlugin,
-  type PluginDb,
   type Destination,
   type Source,
 } from "@sentry/junior-plugin-api";
@@ -12,13 +10,9 @@ import {
   createSchedulerSqlStore,
   schedulerPlugin,
   type ScheduledTask,
+  type SchedulerDb,
 } from "@sentry/junior-scheduler";
-import * as pluginDbModule from "@/chat/plugins/db";
-import {
-  createPluginDbForExecutor,
-  migratePluginSchemas,
-  readPluginMigrations,
-} from "@/chat/plugins/db";
+import { getDb } from "@/chat/db";
 import {
   createOrGetDispatch,
   getDispatchRecord,
@@ -38,7 +32,6 @@ import { setPlugins } from "@/chat/plugins/agent-hooks";
 import { GET as heartbeat } from "@/handlers/heartbeat";
 import { createSlackDirectCredentialSubject } from "@/chat/credentials/subject";
 import { createConversationWorkQueueTestAdapter } from "../fixtures/conversation-work";
-import { createLocalJuniorSqlFixture } from "../fixtures/sql";
 import { createWaitUntilCollector } from "../fixtures/wait-until";
 import { getCapturedSlackApiCalls } from "../msw/handlers/slack-api";
 
@@ -59,35 +52,11 @@ const SLACK_SOURCE = {
   channelId: "C123",
 } satisfies Source;
 
-let schedulerSqlFixture:
-  | Awaited<ReturnType<typeof createLocalJuniorSqlFixture>>
-  | undefined;
-let schedulerPluginDb: PluginDb | undefined;
-
-function schedulerMigrationsDir(): string {
-  return path.resolve(process.cwd(), "../junior-scheduler/migrations");
-}
-
-async function migrateSchedulerSchema(
-  fixture: Awaited<ReturnType<typeof createLocalJuniorSqlFixture>>,
-) {
-  await migratePluginSchemas(
-    fixture.executor,
-    readPluginMigrations({
-      dir: schedulerMigrationsDir(),
-      pluginName: "scheduler",
-    }),
-  );
-}
+let schedulerDb: SchedulerDb | undefined;
 
 async function useSchedulerSqlStore() {
-  schedulerSqlFixture = await createLocalJuniorSqlFixture();
-  await migrateSchedulerSchema(schedulerSqlFixture);
-  schedulerPluginDb = createPluginDbForExecutor(schedulerSqlFixture.executor);
-  vi.spyOn(pluginDbModule, "getPluginDbForRegistration").mockImplementation(
-    (plugin) => (plugin.database ? schedulerPluginDb : undefined),
-  );
-  return createSchedulerSqlStore(schedulerPluginDb);
+  schedulerDb = getDb() as unknown as SchedulerDb;
+  return createSchedulerSqlStore(schedulerDb);
 }
 
 function createTask(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
@@ -217,9 +186,7 @@ describe("plugin heartbeat", () => {
   afterEach(async () => {
     global.fetch = originalFetch;
     setPlugins([]);
-    await schedulerSqlFixture?.close();
-    schedulerSqlFixture = undefined;
-    schedulerPluginDb = undefined;
+    schedulerDb = undefined;
     await disconnectStateAdapter();
     delete process.env.JUNIOR_SCHEDULER_SECRET;
     delete process.env.CRON_SECRET;
@@ -506,29 +473,6 @@ describe("plugin heartbeat", () => {
       metadata: { runId: "run-1" },
       source: { channelId: "C123" },
     });
-  });
-
-  it("exposes plugin DB access to heartbeat contexts for database plugins", () => {
-    const db = {} as any;
-    const spy = vi
-      .spyOn(pluginDbModule, "getPluginDbForRegistration")
-      .mockReturnValue(db);
-    const plugin = defineJuniorPlugin({
-      database: {},
-      manifest: {
-        name: "database-plugin",
-        displayName: "Database Plugin",
-        description: "Heartbeat database context test",
-      },
-    });
-
-    const ctx = createHeartbeatContext({
-      plugin,
-      nowMs: Date.parse("2026-05-26T12:00:00.000Z"),
-    });
-
-    expect(spy).toHaveBeenCalledWith(plugin);
-    expect(ctx.db).toBe(db);
   });
 
   it("keeps plugin state isolated when plugin names and keys contain delimiters", async () => {

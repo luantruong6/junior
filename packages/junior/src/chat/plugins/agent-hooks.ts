@@ -13,9 +13,10 @@ import type {
   SlackToolRegistrationHookContext,
   UserPromptContext,
 } from "@sentry/junior-plugin-api";
+import { getDb } from "@/chat/db";
 import { logInfo, logWarn } from "@/chat/logging";
-import { getPluginDbForRegistration } from "@/chat/plugins/db";
 import { createPluginLogger } from "@/chat/plugins/logging";
+import { createPluginModel } from "@/chat/plugins/model";
 import type { PluginPromptContributionContext } from "@/chat/plugins/prompt";
 import { createPluginState } from "@/chat/plugins/state";
 import { SANDBOX_WORKSPACE_ROOT } from "@/chat/sandbox/paths";
@@ -87,19 +88,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function basePluginContext(plugin: PluginRegistration) {
   const name = plugin.manifest.name;
-  const db = getPluginDbForRegistration(plugin);
   return {
     plugin: { name },
     log: createPluginLogger(name),
-    ...(db ? { db } : {}),
+    db: getDb(),
   };
 }
 
 function systemPromptPluginContext(plugin: PluginRegistration) {
-  const name = plugin.manifest.name;
   return {
-    plugin: { name },
-    log: createPluginLogger(name),
+    ...basePluginContext(plugin),
   };
 }
 
@@ -110,7 +108,7 @@ function invocationPluginContext(
     "conversationId" | "destination" | "requester" | "source" | "userText"
   >,
 ): UserPromptContext {
-  const base = systemPromptPluginContext(plugin);
+  const base = basePluginContext(plugin);
   const common = {
     ...base,
     conversationId: context.conversationId,
@@ -393,6 +391,7 @@ export function getPluginTools(
             slack: slackContext!,
             source: context.source,
             userText: context.userText,
+            model: createPluginModel(pluginName),
             state: createPluginState(pluginName),
           }
         : {
@@ -406,6 +405,7 @@ export function getPluginTools(
               destination?.platform === "local" ? destination : undefined,
             source: context.source,
             userText: context.userText,
+            model: createPluginModel(pluginName),
             state: createPluginState(pluginName),
           };
     const pluginTools = hook(pluginContext);

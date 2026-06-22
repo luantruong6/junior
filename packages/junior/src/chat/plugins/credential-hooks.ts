@@ -12,8 +12,8 @@ import type {
   StoredTokens,
   UserTokenStore,
 } from "@/chat/credentials/user-token-store";
+import { getDb } from "@/chat/db";
 import { getPlugins } from "@/chat/plugins/agent-hooks";
-import { getPluginDbForRegistration } from "@/chat/plugins/db";
 import { createPluginLogger } from "@/chat/plugins/logging";
 
 interface SafeSchema<T> {
@@ -73,11 +73,10 @@ function pluginFor(provider: string) {
 
 function basePluginContext(plugin: NonNullable<ReturnType<typeof pluginFor>>) {
   const pluginName = plugin.manifest.name;
-  const db = getPluginDbForRegistration(plugin);
   return {
     plugin: { name: pluginName },
     log: createPluginLogger(pluginName),
-    ...(db ? { db } : {}),
+    db: getDb(),
   };
 }
 
