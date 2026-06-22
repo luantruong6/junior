@@ -25,6 +25,7 @@ related:
 | `JUNIOR_SLASH_COMMAND`                      | No          | Slack slash command for account-management flows. Defaults to `/jr`; the Slack app command must match this value.                                     |
 | `AI_MODEL`                                  | No          | Primary model selection override for main agent runs. Defaults to `openai/gpt-5.4`; Junior chooses the reasoning effort per run automatically.        |
 | `AI_FAST_MODEL`                             | No          | Faster model for lightweight tasks and routing/classification passes before the main turn begins. Defaults to `openai/gpt-5.4-mini`.                  |
+| `AI_EMBEDDING_MODEL`                        | No          | Embedding model for plugin-owned vector retrieval. Defaults to `openai/text-embedding-3-small`; memory v1 stores fixed 1536-dimensional vectors.      |
 | `AI_VISION_MODEL`                           | No          | Dedicated image-understanding model; unset disables vision features.                                                                                  |
 | `AI_WEB_SEARCH_MODEL`                       | No          | Override for the `webSearch` tool model. Defaults to `openai/gpt-5.4`; does not fall through to `AI_MODEL`.                                           |
 | `JUNIOR_BASE_URL`                           | No          | Canonical base URL for callback/auth URL generation.                                                                                                  |
@@ -32,6 +33,10 @@ related:
 | `CRON_SECRET` or `JUNIOR_SCHEDULER_SECRET`  | Conditional | Bearer token for the internal heartbeat route; use `CRON_SECRET` with Vercel Cron, or `JUNIOR_SCHEDULER_SECRET` for a non-Vercel heartbeat caller.    |
 | `JUNIOR_TIMEZONE`                           | No          | Default IANA timezone for scheduler authoring when the scheduler plugin is enabled. Defaults to `America/Los_Angeles`.                                |
 | `AI_GATEWAY_API_KEY`                        | No          | AI gateway auth if used in your setup.                                                                                                                |
+
+When `@sentry/junior-memory` is enabled, the configured Postgres database must
+support pgvector because the plugin migration creates the `vector` extension
+and stores 1536-dimensional memory embeddings.
 
 Generate `JUNIOR_SECRET` with Node, then store the generated value in every environment that runs the same app:
 

@@ -3,6 +3,7 @@ import type {
   Destination,
   Platform,
   PluginContext,
+  PluginEmbedder,
   Requester,
   Source,
 } from "./context";
@@ -29,6 +30,7 @@ export type SystemPromptContext = Pick<
 export type UserPromptContext = Pick<PluginContext, "db" | "log" | "plugin"> & {
   conversationId?: string;
   destination?: Destination;
+  embedder: PluginEmbedder;
   requester?: Requester;
   source: Source;
   state: PluginState;
