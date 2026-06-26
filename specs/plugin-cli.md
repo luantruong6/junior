@@ -3,7 +3,7 @@
 ## Metadata
 
 - Created: 2026-06-13
-- Last Edited: 2026-06-13
+- Last Edited: 2026-06-26
 
 ## Purpose
 
@@ -19,7 +19,6 @@ without making those commands model-visible tools or sandbox commands.
 
 ## Non-Goals
 
-- Implementing plugin CLI commands in V1.
 - Letting `plugin.yaml` register executable CLI code.
 - Exposing plugin CLI commands to the model.
 - Running plugin CLI commands inside the agent sandbox.
@@ -33,7 +32,7 @@ without making those commands model-visible tools or sandbox commands.
 Plugin CLI commands are app-owned runtime code registered through app-code plugin
 registration, not declarative `plugin.yaml`.
 
-The rough plugin shape is:
+The plugin shape is:
 
 ```ts
 defineJuniorPlugin({
@@ -43,16 +42,35 @@ defineJuniorPlugin({
       {
         name: "memory",
         summary: "Inspect and repair Junior memory state",
-        run,
+        configure(command, junior) {
+          command
+            .command("search")
+            .argument("[query...]", "Search query")
+            .requiredOption("--scope <scope>", "Memory scope")
+            .requiredOption("--scope-key <key>", "Scope key")
+            .action(
+              junior.action(async (ctx, queryParts, options) => {
+                // Plugin-owned command behavior.
+              }),
+            );
+        },
       },
     ],
   },
 });
 ```
 
-The exact API may change before implementation. The required contract is that
-commands are explicitly registered by enabled plugins and run with a narrow
-host-provided context.
+Commands are explicitly registered by enabled code plugins and run with a
+narrow host-provided context. Junior owns the root CLI program and creates the
+top-level `Command` instance for each plugin command. Plugins may configure
+subcommands, arguments, options, help text, and actions under that command, but
+they do not receive or mutate the root program.
+
+CLI bootstrap imports the configured app-code plugin module before dispatching
+app-scoped commands, validates all plugin CLI command names against core command
+names and other enabled plugins, and then dispatches matching plugin commands.
+`junior init` remains independent because it can run before an app plugin module
+exists.
 
 ### Command Namespace
 
@@ -69,13 +87,38 @@ V1 should prefer one top-level command per plugin, such as:
 junior memory ...
 ```
 
-Subcommands below that namespace are plugin-owned.
+Subcommands below that namespace are plugin-owned. Plugin CLI commands should
+use subcommands rather than adding many top-level verbs. A top-level plugin
+command may not be renamed during configuration, and top-level aliases are not
+allowed because they occupy the host-owned root namespace. Junior validates the
+declared command name before attaching it to the root CLI.
+
+### CLI Framework
+
+Junior uses Commander for plugin CLI parsing and help rendering. Commander is
+an intentional part of the plugin CLI surface: plugin command configuration
+receives a Commander `Command` instance scoped to the plugin's declared
+top-level namespace. Core CLI commands may continue to use host-owned dispatch
+internals as long as plugin commands keep the Commander contract.
+
+Plugin code should use Commander-native subcommands, arguments, options,
+choices, generated help, and async actions. Plugin actions must be wrapped with
+the Junior-provided action helper so the host can inject the plugin CLI context
+and normalize exit codes.
+
+The root command remains host-owned:
+
+- plugins must not attach commands to the root program
+- plugins must not call `process.exit`
+- plugins must not bypass the Junior action wrapper for privileged behavior
+- plugins may split subcommand configuration across files and compose them from
+  their plugin-owned CLI module
 
 ### Command Context
 
 Plugin CLI command handlers may receive:
 
-- parsed argv for the plugin command
+- Commander-parsed arguments and options for the plugin subcommand
 - stdout/stderr writers
 - safe logger
 - plugin metadata
@@ -132,10 +175,12 @@ Required checks when implemented:
 
 - plugin CLI command discovery is explicit and deterministic
 - command conflicts fail before dispatch
+- plugin commands configure only their host-created top-level namespace
 - disabled plugins do not expose commands
 - plugin commands cannot access another plugin's state unless core provides an
   explicit shared admin surface
-- invalid arguments print usage and exit non-zero without side effects
+- invalid arguments use generated usage/help and exit non-zero without side
+  effects
 - private content is omitted from default output
 
 ## Related Specs

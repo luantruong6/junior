@@ -195,3 +195,10 @@ export function pluginRuntimeRegistrationsFromPluginSet(
     []
   );
 }
+
+/** Return registrations that expose host CLI commands. */
+export function pluginCliRegistrationsFromPluginSet(
+  pluginSet: JuniorPluginSet | undefined,
+): PluginRegistration[] {
+  return pluginSet?.registrations.filter((plugin) => plugin.cli) ?? [];
+}
