@@ -10,7 +10,16 @@ import {
   generateAssistantReply as generateAssistantReplyImpl,
   type AssistantReply,
 } from "@/chat/respond";
-import { createLocalSource } from "@sentry/junior-plugin-api";
+import {
+  createLocalSource,
+  localDestinationSchema,
+  type LocalDestination,
+} from "@sentry/junior-plugin-api";
+import { logException } from "@/chat/logging";
+import {
+  processPluginTask,
+  scheduleSessionCompletedPluginTasks,
+} from "@/chat/plugins/task-runner";
 import type { ToolExecutionReport } from "@/chat/tools/agent-tools";
 import { THREAD_STATE_TTL_MS } from "chat";
 import {
@@ -34,10 +43,6 @@ import {
 import { coerceThreadArtifactsState } from "@/chat/state/artifacts";
 import { coerceThreadConversationState } from "@/chat/state/conversation";
 import { commitMessages, loadProjection } from "@/chat/state/session-log";
-import {
-  localDestinationSchema,
-  type LocalDestination,
-} from "@sentry/junior-plugin-api";
 
 const DELIVERED_STATE_PERSIST_ATTEMPTS = 3;
 
@@ -169,6 +174,7 @@ export async function runLocalAgentTurn(
     throw new Error("Local reply delivery is required");
   }
   const destination = localDestination(input.conversationId);
+  const source = createLocalSource(destination.conversationId);
 
   const generateAssistantReply =
     deps.generateAssistantReply ?? generateAssistantReplyImpl;
@@ -229,7 +235,7 @@ export async function runLocalAgentTurn(
         actor: { type: "system", id: "local-cli" },
       },
       destination,
-      source: createLocalSource(destination.conversationId),
+      source,
       requester: {
         fullName: "Local CLI",
         platform: "local",
@@ -329,6 +335,47 @@ export async function runLocalAgentTurn(
       messages: reply.piMessages,
       ttlMs: THREAD_STATE_TTL_MS,
     });
+  }
+  if (reply.diagnostics.outcome === "success") {
+    try {
+      await scheduleSessionCompletedPluginTasks(
+        {
+          conversationId: input.conversationId,
+          sessionId: turnId,
+        },
+        {
+          send: async (message) => {
+            try {
+              await processPluginTask(message);
+            } catch (error) {
+              logException(
+                error,
+                "local_plugin_session_completed_task_failed",
+                {},
+                {
+                  conversationId: input.conversationId,
+                  pluginName: message.plugin,
+                  taskName: message.name,
+                  turnId,
+                },
+                "Local plugin session.completed task failed after reply delivery",
+              );
+            }
+          },
+        },
+      );
+    } catch (error) {
+      logException(
+        error,
+        "local_plugin_session_completed_task_failed",
+        {},
+        {
+          conversationId: input.conversationId,
+          turnId,
+        },
+        "Local plugin session.completed task failed after reply delivery",
+      );
+    }
   }
 
   return {

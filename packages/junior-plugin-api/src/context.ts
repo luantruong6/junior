@@ -57,8 +57,8 @@ export interface PluginEmbedder {
 }
 
 export interface PluginContext {
-  /** Shared database connection for plugin hooks. */
-  db: object;
+  /** Shared Drizzle database connection for plugin runtime code. */
+  db: unknown;
   log: PluginLogger;
   plugin: PluginMetadata;
 }

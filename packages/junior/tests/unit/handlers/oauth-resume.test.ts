@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RetryableTurnError } from "@/chat/runtime/turn";
 import { disconnectStateAdapter, getStateAdapter } from "@/chat/state/adapter";
+import { createSlackSource } from "@sentry/junior-plugin-api";
 
 const { logExceptionMock, postMessageMock, setStatusMock } = vi.hoisted(() => ({
   logExceptionMock: vi.fn(),
@@ -64,6 +65,15 @@ const TEST_SLACK_DESTINATION = {
   channelId: "C-test",
 } as const;
 
+function testSlackSource(threadTs: string) {
+  return createSlackSource({
+    teamId: TEST_SLACK_DESTINATION.teamId,
+    channelId: TEST_SLACK_DESTINATION.channelId,
+    channelType: "channel",
+    threadTs,
+  });
+}
+
 describe("resumeAuthorizedRequest", () => {
   beforeEach(async () => {
     vi.useFakeTimers();
@@ -94,6 +104,7 @@ describe("resumeAuthorizedRequest", () => {
           actor: { type: "user", userId: "U-test" },
         },
         destination: TEST_SLACK_DESTINATION,
+        source: testSlackSource("1700000000.0001"),
         requester: { platform: "slack", teamId: "T-test", userId: "U-test" },
       },
       generateReply: () => new Promise<never>(() => {}),
@@ -131,6 +142,7 @@ describe("resumeAuthorizedRequest", () => {
             actor: { type: "user", userId: "U-test" },
           },
           destination: TEST_SLACK_DESTINATION,
+          source: testSlackSource("1700000000.0004"),
           requester: { platform: "slack", teamId: "T-test", userId: "U-test" },
         },
         generateReply: async () => {
@@ -173,6 +185,7 @@ describe("resumeAuthorizedRequest", () => {
             actor: { type: "user", userId: "U-test" },
           },
           destination: TEST_SLACK_DESTINATION,
+          source: testSlackSource("1700000000.0005"),
           requester: { platform: "slack", teamId: "T-test", userId: "U-test" },
         },
         generateReply: async () => ({
@@ -213,6 +226,46 @@ describe("resumeAuthorizedRequest", () => {
     );
   });
 
+  it("schedules plugin tasks after a successful resumed turn", async () => {
+    const scheduleSessionCompletedPluginTasks = vi.fn(async () => undefined);
+
+    await resumeSlackTurn({
+      messageText: "continue this turn",
+      channelId: "C-test",
+      threadTs: "1700000000.0006",
+      replyContext: {
+        credentialContext: {
+          actor: { type: "user", userId: "U-test" },
+        },
+        correlation: {
+          conversationId: "slack:T-test:C-test:1700000000.0006",
+          turnId: "turn_1700000000_0006",
+        },
+        destination: TEST_SLACK_DESTINATION,
+        source: testSlackSource("1700000000.0006"),
+        requester: { platform: "slack", teamId: "T-test", userId: "U-test" },
+      },
+      generateReply: async () => ({
+        text: "Final resumed answer",
+        diagnostics: {
+          assistantMessageCount: 1,
+          modelId: "fake-agent-model",
+          outcome: "success",
+          toolCalls: [],
+          toolErrorCount: 0,
+          toolResultCount: 0,
+          usedPrimaryText: true,
+        },
+      }),
+      scheduleSessionCompletedPluginTasks,
+    });
+
+    expect(scheduleSessionCompletedPluginTasks).toHaveBeenCalledWith({
+      conversationId: "slack:T-test:C-test:1700000000.0006",
+      sessionId: "turn_1700000000_0006",
+    });
+  });
+
   it("releases the thread lock before scheduling another timeout slice", async () => {
     const onTimeoutPause = vi.fn(async () => {
       const stateAdapter = getStateAdapter();
@@ -236,6 +289,7 @@ describe("resumeAuthorizedRequest", () => {
           actor: { type: "user", userId: "U-test" },
         },
         destination: TEST_SLACK_DESTINATION,
+        source: testSlackSource("1700000000.0002"),
         requester: { platform: "slack", teamId: "T-test", userId: "U-test" },
       },
       generateReply: async () => {
@@ -265,6 +319,7 @@ describe("resumeAuthorizedRequest", () => {
           actor: { type: "user", userId: "U-test" },
         },
         destination: TEST_SLACK_DESTINATION,
+        source: testSlackSource("1700000000.0003"),
         requester: { platform: "slack", teamId: "T-test", userId: "U-test" },
       },
       generateReply: async () => {

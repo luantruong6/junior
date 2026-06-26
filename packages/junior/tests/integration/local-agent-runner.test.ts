@@ -4,6 +4,10 @@ import type {
   generateAssistantReply,
   ReplyRequestContext,
 } from "@/chat/respond";
+import {
+  defineJuniorPlugin,
+  type PluginSessionContext,
+} from "@sentry/junior-plugin-api";
 import { normalizeLocalConversationId } from "@/chat/local/conversation";
 import {
   runLocalAgentTurn,
@@ -12,6 +16,7 @@ import {
   type LocalToolResult,
 } from "@/chat/local/runner";
 import type { PiMessage } from "@/chat/pi/messages";
+import { persistCompletedSessionRecord } from "@/chat/services/turn-session-record";
 import {
   getPersistedSandboxState,
   getPersistedThreadState,
@@ -42,6 +47,31 @@ function successReply(
       usedPrimaryText: true,
     },
   };
+}
+
+async function persistCompletedSessionForFakeReply(
+  context: ReplyRequestContext,
+  piMessages: PiMessage[],
+): Promise<void> {
+  const conversationId = context.correlation?.conversationId;
+  const sessionId = context.correlation?.turnId;
+  if (!conversationId || !sessionId) {
+    throw new Error("Local fake reply requires session correlation ids");
+  }
+  await persistCompletedSessionRecord({
+    conversationId,
+    destination: context.destination,
+    source: context.source,
+    sessionId,
+    sliceId: 1,
+    allMessages: piMessages,
+    logContext: {
+      modelId: "fake-local-agent",
+      runId: context.correlation?.runId,
+    },
+    surface: context.surface,
+    turnStartMessageIndex: context.piMessages?.length ?? 0,
+  });
 }
 
 describe("local agent runner", () => {
@@ -186,6 +216,89 @@ describe("local agent runner", () => {
         params: { content: "The requester prefers short updates." },
         result: { ok: true },
       },
+    ]);
+  });
+
+  it("runs plugin tasks inline after completed local turns", async () => {
+    const conversationId = normalizeLocalConversationId({
+      alias: "plugin-task",
+      cwd: "/tmp/local-agent-runner-plugin-task",
+    });
+    expect(conversationId).toBeDefined();
+
+    const loadedSessions: PluginSessionContext[] = [];
+    const { setPlugins } = await import("@/chat/plugins/agent-hooks");
+    setPlugins([
+      defineJuniorPlugin({
+        manifest: {
+          name: "local-task-demo",
+          displayName: "Local Task Demo",
+          description: "Local task demo",
+        },
+        tasks: {
+          captureSession: {
+            async run(ctx) {
+              loadedSessions.push(await ctx.session.load());
+            },
+          },
+        },
+      }),
+    ]);
+
+    try {
+      await runLocalAgentTurn(
+        {
+          conversationId: conversationId!,
+          message: "capture this local turn",
+        },
+        {
+          deliverReply: async () => undefined,
+          generateAssistantReply: async (_text, context) => {
+            const piMessages = [
+              {
+                role: "user",
+                content: "capture this local turn",
+              },
+              {
+                role: "assistant",
+                content: "captured",
+              },
+            ] as PiMessage[];
+            await persistCompletedSessionForFakeReply(context, piMessages);
+            return successReply("captured", {
+              piMessages,
+            });
+          },
+        },
+      );
+    } finally {
+      setPlugins([]);
+    }
+
+    expect(loadedSessions).toEqual([
+      expect.objectContaining({
+        conversationId,
+        destination: {
+          platform: "local",
+          conversationId,
+        },
+        messages: [
+          {
+            role: "user",
+            text: "capture this local turn",
+          },
+          {
+            role: "assistant",
+            text: "captured",
+          },
+        ],
+        sessionId: "local-turn-1",
+        source: {
+          platform: "local",
+          type: "priv",
+          conversationId,
+        },
+      }),
     ]);
   });
 

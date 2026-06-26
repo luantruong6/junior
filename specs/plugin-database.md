@@ -27,7 +27,7 @@ requiring a memory-specific storage API or a globally merged plugin schema type.
 - Auto-discovering TypeScript schema files by convention.
 - Generating plugin migrations from the host app.
 - Applying migrations from request handlers or plugin hooks.
-- Providing a database sandbox for untrusted plugin code.
+- Providing a database sandbox for plugin code.
 - Exposing a globally typed Drizzle schema containing every installed plugin
   table.
 - Defining memory's concrete table schema.
@@ -183,8 +183,7 @@ Rules:
 3. `migrateStorage` hooks must be idempotent. Re-running `junior upgrade` must not
    duplicate rows, corrupt state, or require deleting old state first.
 4. `migrateStorage` hooks should read and write plugin-owned state and
-   plugin-owned SQL tables. Plugins are trusted host code; core does not
-   enforce this ownership boundary.
+   plugin-owned SQL tables. Core does not enforce this ownership boundary.
 5. `migrateStorage` hooks must use `ctx.db` for SQL writes. `junior upgrade`
    must fail before the hook runs if Junior cannot resolve a SQL database.
 6. `migrateStorage` hooks may read existing plugin state through `ctx.state`. This is
@@ -208,13 +207,14 @@ keeping the scheduler store interface stable.
 
 ### Migration Safety
 
-Plugin migrations are privileged host code. The primary trust boundary is
-explicit plugin installation and code review, not SQL sandboxing.
+Plugin migrations are app-owned host code. The primary boundary is explicit
+plugin installation and code review, not SQL sandboxing.
 
-Code plugins that use `ctx.db` are trusted host code. Core must not introduce
-database facades solely to prevent those plugins from accessing core tables or
-schemas. Ownership rules are review and convention boundaries unless a concrete
-security, migration, lifecycle, or model-visible boundary requires enforcement.
+Code plugins that use `ctx.db` are app-owned runtime code. Core must not
+introduce database facades solely to prevent plugins from accessing core tables
+or schemas. Ownership rules are review and convention boundaries unless a
+concrete security, migration, lifecycle, or model-visible boundary requires
+enforcement.
 
 V1 plugin migrations must be expand-only:
 
@@ -223,7 +223,7 @@ V1 plugin migrations must be expand-only:
 - add indexes to plugin-owned tables
 - add compatible constraints after existing data is clean
 
-Trusted plugin migrations should not:
+Plugin migrations should not:
 
 - drop tables or columns
 - rewrite large tables synchronously
@@ -264,12 +264,11 @@ The V1 runtime surface is the shared Junior Drizzle database connection. Hook
 contexts expose this as `ctx.db`, not `ctx.database`, a nested `ctx.db.db`, or a
 custom plugin database facade.
 
-The public plugin API treats `ctx.db` as an opaque `object`. It does not
-re-export Drizzle database types, wrap Drizzle methods, or try to compose every
-installed plugin schema into one global type. A TypeScript plugin that wants
-typed queries should locally type `ctx.db` against its own Drizzle schema at
-the plugin boundary, then pass that typed connection into its plugin-owned
-store.
+The public plugin API exposes `ctx.db` as `unknown`. Core does not wrap Drizzle
+methods, publish a partial database facade, or try to compose every installed
+plugin schema into one global type. A TypeScript plugin that wants typed
+queries should locally type `ctx.db` against its own Drizzle schema at the
+plugin boundary, then pass that typed connection into its plugin-owned store.
 
 `ctx.db` is not model-visible and must not be exposed to sandbox tools, skill
 text, MCP tools, or tool input schemas.
@@ -302,7 +301,7 @@ V1 does not support:
 - auto-importing `src/db/schema.ts` by convention
 - `ctx.db.query.<pluginTable>` relation helpers for plugin tables
 - a public type that represents every installed plugin table
-- raw SQL helpers on `ctx.db` as a plugin-facing abstraction
+- custom raw SQL helpers on `ctx.db` as a plugin-facing abstraction
 
 If a future plugin needs globally composed Drizzle schema typing, that must be
 added through an explicit code registration contract, not filesystem
@@ -311,8 +310,8 @@ auto-discovery.
 ### Plugin DB Access
 
 Junior deployments require a SQL database. Hook contexts receive `ctx.db`
-because JavaScript plugin registrations are trusted host code. Plugins do not
-declare a separate database capability.
+because JavaScript plugin registrations are app-owned runtime code. Plugins do
+not declare a separate database capability.
 
 Plugins that own SQL schema publish migrations through their package
 `migrations/` directory and named JavaScript registration. Plugins that move
@@ -361,8 +360,7 @@ interfaces and must not be passed as `ctx.db`.
 5. Plugin storage migration hook failure: upgrade fails after schema migration and
    before the new runtime serves traffic.
 6. Plugin database query failure during a hook: the hook fails according to its
-   owning hook spec; prompt and observation hooks must fail closed with safe
-   logging.
+   owning hook spec; prompt hooks must fail closed with safe logging.
 
 ## Observability
 

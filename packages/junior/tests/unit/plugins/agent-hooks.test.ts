@@ -441,6 +441,62 @@ describe("agent plugin hooks", () => {
     }
   });
 
+  it("validates plugin task registration names", () => {
+    const previous = setPlugins([]);
+    try {
+      expect(() =>
+        setPlugins([
+          defineJuniorPlugin({
+            manifest: {
+              name: "agent-demo",
+              displayName: "Agent Demo",
+              description: "Agent demo",
+            },
+            tasks: {
+              processSession: {
+                run() {},
+              },
+            },
+          }),
+        ]),
+      ).not.toThrow();
+
+      expect(() =>
+        setPlugins([
+          defineJuniorPlugin({
+            manifest: {
+              name: "agent-demo",
+              displayName: "Agent Demo",
+              description: "Agent demo",
+            },
+            tasks: {
+              "bad-task": {
+                run() {},
+              },
+            },
+          }),
+        ]),
+      ).toThrow('Plugin task "bad-task"');
+
+      expect(() =>
+        setPlugins([
+          defineJuniorPlugin({
+            manifest: {
+              name: "agent-demo",
+              displayName: "Agent Demo",
+              description: "Agent demo",
+            },
+            tasks: {
+              processSession: {} as any,
+            },
+          }),
+        ]),
+      ).toThrow('Plugin task "processSession"');
+    } finally {
+      setPlugins(previous);
+    }
+  });
+
   it("collects route handlers from configured plugins", async () => {
     const previous = setPlugins([
       defineJuniorPlugin({

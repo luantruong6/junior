@@ -7,8 +7,8 @@
 
 ## Purpose
 
-Define passive memory learning through completed-turn observation and plugin
-background tasks.
+Define passive memory learning through completed-session plugin background
+tasks.
 
 ## What Belongs In Memory
 
@@ -60,41 +60,24 @@ Examples that must not be stored:
 
 ## Passive Learning
 
-The memory plugin observes completed turns through `observeTurn(ctx)`.
+The memory plugin learns passively from its `extractMemories`
+`session.completed` plugin background task. Junior core schedules registered
+plugin tasks after successful completed sessions; the memory plugin owns the
+memory-specific decision about whether that completed session is learnable.
 
-The observation hook must:
+Core scheduling must:
 
 1. Run only after the user-visible turn is durably committed enough that
-   observation failure cannot fail delivery.
-2. Enqueue one plugin background task for extraction from the completed turn.
-3. Ignore assistant-authored claims as memory sources.
-4. Skip task enqueueing when the source is not allowed to expose private turn
-   text to the trusted memory plugin.
-5. Skip task enqueueing when install policy disables passive extraction for the
-   current source, scope, or requester.
-6. Skip task enqueueing unless the source conversation is classified as
-   `public` by Junior's existing conversation privacy/destination visibility
-   contracts.
-7. Use a stable idempotency key derived from the completed turn or source event.
+   scheduling failure cannot fail delivery.
+2. Enqueue the registered `extractMemories` plugin background task for the
+   completed session.
+3. Use a stable task id derived from the plugin, task name, and
+   completed-session reference.
 
-The observation hook does not perform extraction inline. It requests work from
-core:
-
-```ts
-await ctx.tasks.enqueue({
-  name: "extractMemories",
-  idempotencyKey: ctx.observationId,
-  payload: {
-    observationId: ctx.observationId,
-  },
-});
-```
-
-The payload must contain stable references and safe metadata only. It must not
-contain raw private user text, raw assistant text, raw tool payloads,
-credentials, or tokens. Core owns how the task is delivered: the existing
-serverless queue, a signed callback, a future dedicated task worker, or a local
-test worker are all valid implementations.
+The task params must contain stable references and safe metadata only. They must
+not contain raw private user text, raw assistant text, raw tool payloads,
+credentials, or tokens. Core owns how the task is delivered through the generic
+plugin background task contract.
 
 Core must not require plugin code to know queue topic names, queue message
 shape, Vercel-specific APIs, callback routes, visibility timeouts, or
@@ -104,14 +87,17 @@ acknowledgement semantics.
 
 The memory plugin's `extractMemories` task handler must:
 
-1. Reload the bounded observation payload for the referenced completed turn
-   through `ctx.observation.load()`.
+1. Reload the bounded completed-session projection through
+   `ctx.session.load()`.
 2. Reload current install-level memory policy.
-3. Process only that completed turn.
-4. Extract candidate facts with a structured model output contract.
-5. Ignore assistant-authored claims as memory sources.
-6. Skip extraction when the bounded observation payload is unavailable,
-   expired, malformed, or no longer visible to the plugin.
+3. Skip extraction when passive extraction is disabled, the source is not
+   learnable, the source is private, the source conversation is not classified
+   as public by Junior's existing conversation privacy/destination visibility
+   contracts, or the bounded session projection is unavailable, expired,
+   malformed, or no longer visible to the plugin.
+4. Process only that completed turn.
+5. Extract candidate facts with a structured model output contract.
+6. Ignore assistant-authored claims as memory sources.
 7. Run memory agent review for extracted candidates.
 8. Reject malformed, low-confidence, incoherent, semantically duplicative,
    unsafe, or out-of-scope facts.
@@ -188,7 +174,7 @@ belong to the memory agent rather than a caller-provided policy hook.
 The default V1 passive-extraction shape is:
 
 1. The memory agent proposes structured candidate memories from the bounded
-   observation payload.
+   completed-session task projection.
 2. The memory agent reviews each candidate against the installed memory policy
    and workplace guidance.
 3. Deterministic validation applies only hard structural rules, such as schema

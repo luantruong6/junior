@@ -1,5 +1,5 @@
 import type { StorageMigrationResult } from "@sentry/junior-plugin-api";
-import { pluginHookRegistrationsFromPluginSet } from "@/plugins";
+import { pluginRuntimeRegistrationsFromPluginSet } from "@/plugins";
 import { getDb } from "@/chat/db";
 import { createPluginLogger } from "@/chat/plugins/logging";
 import { createPluginState } from "@/chat/plugins/state";
@@ -33,10 +33,7 @@ function addResult(
   };
 }
 
-function dbForPlugin(
-  context: MigrationContext,
-  sqlUrlDb: object | undefined,
-): object {
+function dbForPlugin(context: MigrationContext, sqlUrlDb: unknown): unknown {
   return context.db ?? sqlUrlDb ?? getDb();
 }
 
@@ -61,7 +58,7 @@ export async function runPluginStorageMigrations(
   const sqlUrlDb = ownedExecutor ? ownedExecutor.db() : undefined;
   try {
     let result = emptyResult();
-    const plugins = pluginHookRegistrationsFromPluginSet(pluginSet)
+    const plugins = pluginRuntimeRegistrationsFromPluginSet(pluginSet)
       .filter((plugin) => plugin.hooks?.migrateStorage)
       .sort((left, right) =>
         left.manifest.name.localeCompare(right.manifest.name),

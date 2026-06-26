@@ -19,7 +19,143 @@ afterEach(async () => {
     process.env.JUNIOR_SECRET = originalJuniorSecret;
   }
   vi.doUnmock("@vercel/queue");
+  vi.doUnmock("@/chat/plugins/task-runner");
   vi.resetModules();
+});
+
+describe("plugin task Vercel queue integration", () => {
+  it("passes parsed plugin task payloads through the Vercel callback", async () => {
+    const routeHandler = vi.fn();
+    const handleCallback = vi.fn(() => routeHandler);
+    const processPluginTask = vi.fn(async () => undefined);
+
+    vi.doMock("@vercel/queue", () => ({
+      QueueClient: vi.fn(),
+      handleCallback,
+      registerDevConsumer: vi.fn(),
+    }));
+    vi.doMock("@/chat/plugins/task-runner", () => ({
+      processPluginTask,
+    }));
+
+    const { createVercelPluginTaskCallback } =
+      await import("@/chat/plugins/task-callback");
+    const { signPluginTaskQueueMessage } =
+      await import("@/chat/plugins/task-signing");
+
+    expect(createVercelPluginTaskCallback()).toBe(routeHandler);
+
+    type TestQueueMetadata = {
+      consumerGroup: string;
+      createdAt: Date;
+      deliveryCount: number;
+      expiresAt: Date;
+      messageId: string;
+      region: string;
+      topicName: string;
+    };
+    const metadata: TestQueueMetadata = {
+      consumerGroup: "consumer",
+      createdAt: new Date(1_000),
+      deliveryCount: 1,
+      expiresAt: new Date(2_000),
+      messageId: "msg_1",
+      region: "iad1",
+      topicName: "topic",
+    };
+    const call = handleCallback.mock.calls[0] as unknown as
+      | [
+          (message: unknown, metadata: TestQueueMetadata) => Promise<void>,
+          {
+            retry?: (error: unknown, metadata: TestQueueMetadata) => unknown;
+          },
+        ]
+      | undefined;
+    const handler = call?.[0];
+    const retry = call?.[1].retry;
+    expect(handler).toEqual(expect.any(Function));
+    expect(retry).toEqual(expect.any(Function));
+    if (!handler || !retry) {
+      throw new Error("Expected plugin task queue handler and retry hook");
+    }
+
+    await expect(
+      handler({ malformed: true }, metadata),
+    ).resolves.toBeUndefined();
+    expect(processPluginTask).not.toHaveBeenCalled();
+
+    const message = {
+      name: "extractMemories",
+      params: {
+        conversationId: "local:test:plugin-callback",
+        sessionId: "turn-1",
+      },
+      plugin: "memory",
+    };
+    await expect(handler(message, metadata)).resolves.toBeUndefined();
+    expect(processPluginTask).not.toHaveBeenCalled();
+
+    process.env.JUNIOR_SECRET = "plugin-task-secret";
+    const signedMessage = signPluginTaskQueueMessage(message);
+    await expect(handler(signedMessage, metadata)).resolves.toBeUndefined();
+    expect(processPluginTask).toHaveBeenCalledWith(message);
+
+    processPluginTask.mockRejectedValueOnce(new Error("task failed"));
+    await expect(handler(signedMessage, metadata)).rejects.toThrow(
+      "task failed",
+    );
+    expect(retry(new Error("still failing"), metadata)).toBeUndefined();
+    expect(
+      retry(new Error("still failing"), { ...metadata, deliveryCount: 5 }),
+    ).toEqual({ acknowledge: true });
+  });
+
+  it("sends plugin task messages with the derived idempotency key", async () => {
+    const send = vi.fn(async () => ({ messageId: "msg_1" }));
+    const QueueClient = vi.fn(function QueueClientMock() {
+      return { send };
+    });
+
+    vi.doMock("@vercel/queue", () => ({
+      QueueClient,
+      handleCallback: vi.fn(),
+      registerDevConsumer: vi.fn(),
+    }));
+
+    process.env.JUNIOR_SECRET = "plugin-task-secret";
+
+    const [
+      { PLUGIN_TASK_QUEUE_TOPIC, sendVercelPluginTask },
+      { pluginTaskId },
+    ] = await Promise.all([
+      import("@/chat/plugins/task-queue"),
+      import("@/chat/plugins/task-message"),
+    ]);
+    const message = {
+      name: "extractMemories",
+      params: {
+        conversationId: "local:test:plugin-send",
+        sessionId: "turn-1",
+      },
+      plugin: "memory",
+    };
+
+    await sendVercelPluginTask(message);
+
+    expect(send).toHaveBeenCalledWith(
+      PLUGIN_TASK_QUEUE_TOPIC,
+      {
+        ...message,
+        signedAtMs: expect.any(Number),
+        signatureVersion: "v1",
+        signature: expect.any(String),
+      },
+      {
+        idempotencyKey: pluginTaskId(message),
+        retentionSeconds: 3600,
+      },
+    );
+  });
 });
 
 describe("registerVercelConversationWorkDevConsumer", () => {

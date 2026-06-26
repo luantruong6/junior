@@ -6,6 +6,7 @@
  * durably record success, failure, auth pause, or another safe pause boundary.
  */
 import { logException, logWarn } from "@/chat/logging";
+import { createSlackSource } from "@sentry/junior-plugin-api";
 import {
   ResumeTurnBusyError,
   resumeSlackTurn,
@@ -59,6 +60,10 @@ export interface AgentContinueRunnerOptions {
   generateReply?: typeof generateAssistantReply;
   resumeTurn?: typeof resumeSlackTurn;
   scheduleAgentContinue?: (request: AgentContinueRequest) => Promise<void>;
+  scheduleSessionCompletedPluginTasks?: (params: {
+    conversationId: string;
+    sessionId: string;
+  }) => Promise<void>;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -217,6 +222,8 @@ export async function continueSlackAgentRun(
     threadTs: thread.threadTs,
     lockKey: payload.conversationId,
     generateReply: options.generateReply,
+    scheduleSessionCompletedPluginTasks:
+      options.scheduleSessionCompletedPluginTasks,
     beforeStart: async () => {
       let sessionRecord: AgentTurnSessionRecord | undefined;
       try {
@@ -266,6 +273,15 @@ export async function continueSlackAgentRun(
           teamId: destination.teamId,
           userId: userMessage.author.userId,
         });
+        // TODO(v0.76.0): Remove once pre-source awaiting_resume Slack records have drained.
+        const source =
+          activeSessionRecord.source ??
+          createSlackSource({
+            channelId: destination.channelId,
+            messageTs: getTurnUserSlackMessageTs(userMessage),
+            teamId: destination.teamId,
+            threadTs: thread.threadTs,
+          });
 
         return {
           messageText: userMessage.text,
@@ -279,6 +295,7 @@ export async function continueSlackAgentRun(
             },
             requester,
             destination: payload.destination,
+            source,
             correlation: {
               conversationId: payload.conversationId,
               turnId: payload.sessionId,
