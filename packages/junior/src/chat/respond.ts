@@ -1143,6 +1143,20 @@ export async function generateAssistantReply(
     }));
 
     // ── MCP provider activation ──────────────────────────────────────
+    // If a prior turn left an MCP provider pending user authorization, skip
+    // eager restoration of that provider here. Without this guard, a later
+    // unrelated turn in the same conversation can try to activate the
+    // still-unauthenticated provider, throw McpAuthorizationPauseError, and
+    // abort before the agent sees the user's request.
+    //
+    // Skipping only suppresses the eager-restore path. The agent can still
+    // trigger the auth flow intentionally (via loadSkill + searchMcpTools)
+    // when the user's request genuinely requires that provider.
+    const pendingMcpProvider =
+      context.pendingAuth?.kind === "mcp"
+        ? context.pendingAuth.provider
+        : undefined;
+
     // Restore providers visible in durable Pi session history. In serverless
     // runtimes, later slices and follow-up turns usually run in a fresh
     // process, so in-memory MCP clients cannot be reused.
@@ -1151,6 +1165,9 @@ export async function generateAssistantReply(
       ...inferActiveMcpProvidersFromPiMessages(priorPiMessages),
     ]);
     for (const provider of providersToRestore) {
+      if (provider === pendingMcpProvider) {
+        continue; // awaiting user authorization — skip to avoid aborting unrelated turns
+      }
       if (await turnMcpToolManager.activateProvider(provider)) {
         await recordConnectedMcpProvider(provider);
       }
@@ -1161,6 +1178,9 @@ export async function generateAssistantReply(
     }
     // Activate MCP for skills recovered from durable Pi history.
     for (const skill of activeSkills) {
+      if (skill.pluginProvider === pendingMcpProvider) {
+        continue; // awaiting user authorization — skip to avoid aborting unrelated turns
+      }
       if (await turnMcpToolManager.activateForSkill(skill)) {
         await recordConnectedMcpProvider(skill.pluginProvider!);
       }

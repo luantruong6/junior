@@ -25,12 +25,14 @@ const {
   assistantReplyWithoutContext,
   assistantReplyWithContext,
   priorBudgetContext,
+  unrelatedAuthPendingReply,
 } = vi.hoisted(() => ({
   agentProbe: {
     continueCallCount: 0,
     directProviderSearch: false,
     promptCallCount: 0,
     searchToolNames: [] as string[][],
+    shouldBypassSkill: false,
   },
   MCP_TOOL_NAME: "mcp__eval-auth__budget-echo",
   SKILL_NAME: "eval-auth",
@@ -38,6 +40,8 @@ const {
   assistantReplyWithContext:
     "The budget deadline you mentioned earlier was Friday.",
   priorBudgetContext: "You need the budget by Friday.",
+  unrelatedAuthPendingReply:
+    "An unrelated answer that does not require Notion or eval-auth.",
 }));
 
 function resetAgentProbe(): void {
@@ -45,6 +49,7 @@ function resetAgentProbe(): void {
   agentProbe.continueCallCount = 0;
   agentProbe.directProviderSearch = false;
   agentProbe.searchToolNames.length = 0;
+  agentProbe.shouldBypassSkill = false;
 }
 
 function extractTextContent(message: unknown): string {
@@ -143,6 +148,16 @@ vi.mock("@earendil-works/pi-agent-core", () => {
       this.aborted = false;
       this.state.messages.push(message);
 
+      if (agentProbe.shouldBypassSkill) {
+        // Simulate an unrelated request that does not need any MCP tools.
+        this.state.messages.push({
+          role: "assistant",
+          content: [{ type: "text", text: unrelatedAuthPendingReply }],
+          stopReason: "stop",
+        });
+        return {};
+      }
+
       if (agentProbe.directProviderSearch) {
         const searchMcpTools = this.state.tools.find(
           (tool) => tool.name === "searchMcpTools",
@@ -167,8 +182,20 @@ vi.mock("@earendil-works/pi-agent-core", () => {
         throw new Error("loadSkill tool missing");
       }
 
-      await loadSkillTool.execute("tool-load-skill", {
+      const loadSkillResult = (await loadSkillTool.execute("tool-load-skill", {
         skill_name: SKILL_NAME,
+      })) as {
+        ok?: boolean;
+        skill_name?: string;
+      };
+      this.state.messages.push({
+        role: "toolResult",
+        toolCallId: "tool-load-skill",
+        toolName: "loadSkill",
+        skill_name: loadSkillResult.skill_name,
+        ok: loadSkillResult.ok,
+        details: loadSkillResult,
+        isError: false,
       });
 
       if (this.aborted) {
@@ -235,7 +262,11 @@ vi.mock("@earendil-works/pi-agent-core", () => {
     }
   }
 
-  return { Agent: FakeAgent };
+  return {
+    Agent: FakeAgent,
+    estimateContextTokens: () => ({ tokens: 0 }),
+    estimateTokens: () => 0,
+  };
 });
 
 const ORIGINAL_ENV = { ...process.env };
@@ -829,4 +860,129 @@ describe("mcp auth runtime slack integration", () => {
       "slack:C125:1700000000.003",
     );
   });
+
+  it.each([
+    {
+      label: "same requester",
+      currentRequesterId: "U123",
+      currentRequesterName: "dcramer",
+    },
+    {
+      label: "different requester",
+      currentRequesterId: "U999",
+      currentRequesterName: "paul",
+    },
+  ])(
+    "does not abort unrelated turns for the $label when MCP auth is already pending from a prior turn",
+    async ({ currentRequesterId, currentRequesterName }) => {
+      const threadId = "slack:C126:1700000000.004";
+      const { createTestChatRuntime } = chatRuntimeModule;
+      const { slackRuntime } = createTestChatRuntime({
+        services: {
+          visionContext: {
+            listThreadReplies: async () => [],
+          },
+        },
+      });
+
+      const destination = {
+        platform: "slack" as const,
+        teamId: "T123",
+        channelId: "C126",
+      };
+
+      const thread = createTestThread({
+        id: threadId,
+        state: {
+          conversation: {
+            messages: [
+              {
+                id: "assistant-1",
+                role: "assistant",
+                text: "Please authorize via the link I sent you.",
+                createdAtMs: 1,
+                author: {
+                  userName: "junior",
+                  isBot: true,
+                },
+              },
+            ],
+          },
+        },
+      });
+      await mirrorThreadStateToAdapter(thread);
+
+      await slackRuntime.handleNewMention(
+        thread,
+        createTestMessage({
+          id: "user-auth",
+          threadId,
+          text: "what did i say about the budget?",
+          isMention: true,
+          author: {
+            userId: "U123",
+            userName: "dcramer",
+          },
+          raw: {
+            channel: "C126",
+            team_id: "T123",
+            ts: "1700000000.005",
+            thread_ts: "1700000000.004",
+          },
+        }),
+        { destination },
+      );
+
+      expect(
+        await threadStateModule.getPersistedThreadState(threadId),
+      ).toMatchObject({
+        conversation: {
+          processing: {
+            pendingAuth: {
+              kind: "mcp",
+              provider: EVAL_MCP_AUTH_PROVIDER,
+              requesterId: "U123",
+              sessionId: "turn_user-auth",
+              linkSentAtMs: expect.any(Number),
+            },
+          },
+        },
+      });
+
+      const authLinkCount =
+        getCapturedSlackApiCalls("chat.postEphemeral").length;
+      agentProbe.shouldBypassSkill = true;
+
+      await slackRuntime.handleNewMention(
+        thread,
+        createTestMessage({
+          id: "user-4",
+          threadId,
+          text: "what time is it?", // completely unrelated to eval-auth
+          isMention: true,
+          author: {
+            userId: currentRequesterId,
+            userName: currentRequesterName,
+          },
+          raw: {
+            channel: "C126",
+            team_id: "T123",
+            ts: "1700000000.006",
+            thread_ts: "1700000000.004",
+          },
+        }),
+        { destination },
+      );
+
+      expect(getCapturedSlackApiCalls("chat.postEphemeral")).toHaveLength(
+        authLinkCount,
+      );
+
+      expect(thread.posts.at(-1)).toEqual(
+        expect.objectContaining({
+          markdown: unrelatedAuthPendingReply,
+        }),
+      );
+    },
+  );
 });
