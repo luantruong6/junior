@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ACTIVE_LOCK_TTL_MS } from "@/chat/state/locks";
 import { createTestMessage } from "../../fixtures/slack-harness";
 
 const ORIGINAL_ENV = { ...process.env };
@@ -29,35 +30,7 @@ describe("state adapter lock lease", () => {
     vi.resetModules();
   });
 
-  it("keeps an active SDK-sized lock leased past the old static ttl", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date(0));
-
-    const { disconnectStateAdapter, getStateAdapter } =
-      await loadMemoryStateAdapter();
-    const adapter = getStateAdapter();
-    await adapter.connect();
-
-    const lock = await adapter.acquireLock("thread-1", 30_000);
-    expect(lock).not.toBeNull();
-    if (!lock) {
-      return;
-    }
-
-    await vi.advanceTimersByTimeAsync(6 * 60 * 1000);
-
-    await expect(adapter.acquireLock("thread-1", 30_000)).resolves.toBeNull();
-
-    await adapter.releaseLock(lock);
-    const nextLock = await adapter.acquireLock("thread-1", 30_000);
-    expect(nextLock).not.toBeNull();
-    if (nextLock) {
-      await adapter.releaseLock(nextLock);
-    }
-    await disconnectStateAdapter();
-  });
-
-  it("stops the heartbeat when the lock is released", async () => {
+  it("lets short locks expire at their requested ttl", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(0));
 
@@ -67,6 +40,30 @@ describe("state adapter lock lease", () => {
 
     const lock = await adapter.acquireLock("thread-1", 30_000);
     expect(lock).not.toBeNull();
+    expect(vi.getTimerCount()).toBe(0);
+    if (!lock) {
+      return;
+    }
+
+    await vi.advanceTimersByTimeAsync(31_000);
+
+    const nextLock = await adapter.acquireLock("thread-1", 30_000);
+    expect(nextLock).not.toBeNull();
+    if (nextLock) {
+      await adapter.releaseLock(nextLock);
+    }
+  });
+
+  it("stops the active-lock heartbeat when the lock is released", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(0));
+
+    const { getStateAdapter } = await loadMemoryStateAdapter();
+    const adapter = getStateAdapter();
+    await adapter.connect();
+
+    const lock = await adapter.acquireLock("thread-1", ACTIVE_LOCK_TTL_MS);
+    expect(lock).not.toBeNull();
     expect(vi.getTimerCount()).toBe(1);
 
     if (lock) {
@@ -74,6 +71,29 @@ describe("state adapter lock lease", () => {
     }
 
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("keeps an active lock leased past its initial ttl", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(0));
+
+    const { getStateAdapter } = await loadMemoryStateAdapter();
+    const adapter = getStateAdapter();
+    await adapter.connect();
+
+    const lock = await adapter.acquireLock("thread-1", ACTIVE_LOCK_TTL_MS);
+    expect(lock).not.toBeNull();
+    if (!lock) {
+      return;
+    }
+
+    await vi.advanceTimersByTimeAsync(ACTIVE_LOCK_TTL_MS + 1_000);
+
+    await expect(
+      adapter.acquireLock("thread-1", ACTIVE_LOCK_TTL_MS),
+    ).resolves.toBeNull();
+
+    await adapter.releaseLock(lock);
   });
 
   it("stops heartbeating active locks after the configured turn window", async () => {
@@ -86,7 +106,7 @@ describe("state adapter lock lease", () => {
     const adapter = getStateAdapter();
     await adapter.connect();
 
-    const lock = await adapter.acquireLock("thread-1", 30_000);
+    const lock = await adapter.acquireLock("thread-1", ACTIVE_LOCK_TTL_MS);
     expect(lock).not.toBeNull();
     if (!lock) {
       return;
@@ -94,7 +114,7 @@ describe("state adapter lock lease", () => {
 
     await vi.advanceTimersByTimeAsync(181_000);
 
-    const nextLock = await adapter.acquireLock("thread-1", 30_000);
+    const nextLock = await adapter.acquireLock("thread-1", ACTIVE_LOCK_TTL_MS);
     expect(nextLock).not.toBeNull();
     if (nextLock) {
       await adapter.releaseLock(nextLock);
