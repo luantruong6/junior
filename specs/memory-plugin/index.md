@@ -3,7 +3,7 @@
 ## Metadata
 
 - Created: 2026-06-13
-- Last Edited: 2026-06-20
+- Last Edited: 2026-06-24
 
 ## Purpose
 
@@ -15,8 +15,9 @@ contracts.
 
 This spec describes the intended V1 memory plugin shape. Generic plugin prompt
 hooks and plugin prompt session state are available through
-`../plugin-prompt-hooks.md`. Passive learning runs through plugin background
-tasks defined in `../plugin-tasks.md`.
+`../plugin-prompt-hooks.md`. Passive learning uses the typed task contract in
+`../plugin-tasks.md`: a `session.completed` task loads a bounded completed-run
+projection and invokes the memory-owned internal extraction agent.
 
 V1 stores only public/shareable memory content. Scope controls who can see a
 record; it is not a content sensitivity model. Private, sensitive, secret, or
@@ -30,12 +31,12 @@ Explicit tools also support user-directed memory management.
 ## Scope
 
 - What is eligible for long-term memory.
-- Install-level policy controls for workplace-safe extraction and recall.
+- Default V1 policy guidance for workplace-safe extraction and recall.
 - Memory plugin package shape and required plugin hooks.
 - Plugin-owned SQL storage, retrieval indexes, embeddings, and model-provider
   boundaries.
 - Automatic recall through `userPrompt` when the memory plugin is enabled.
-- Passive learning through a plugin background task handler.
+- Passive learning through the memory plugin's `session.completed` task.
 - Explicit `createMemory`, `removeMemory`, `listMemories`, and
   `searchMemories` tools.
 - Scope, attribution, lifecycle, tool, model, public-content, and secret
@@ -63,14 +64,13 @@ Read these files as one canonical spec:
 
 - [storage.md](./storage.md): SQL storage model, retrieval indexes, pgvector,
   embedding model provider, and operational storage rules.
-- [policy.md](./policy.md): install-level controls for memory categories,
-  passive extraction, workplace-sensitive facts, model/provider use, and
-  retention.
+- [policy.md](./policy.md): default V1 controls for memory categories, passive
+  extraction, workplace-sensitive facts, model/provider use, and retention.
 - [security.md](./security.md): authority boundaries, multi-user visibility,
   model/tool boundaries, task payload safety, and redaction rules.
 - [retrieval.md](./retrieval.md): automatic recall, tool-mediated recall,
   hybrid ranking, automatic injection mechanics, and performance strategy.
-- [extraction.md](./extraction.md): passive completed-session extraction,
+- [extraction.md](./extraction.md): passive session processing, extraction,
   storable-fact policy, semantic duplicate detection, and supersession.
 - [tools.md](./tools.md): model-visible memory management and recall tools.
 - [admin.md](./admin.md): future operator/admin CLI command shape for memory
@@ -126,7 +126,7 @@ External storage and retrieval assumptions are based on primary documentation:
 
 ## Plugin Shape
 
-The V1 memory implementation is a plugin registered through
+The V1 memory implementation is a trusted host plugin registered through
 `defineJuniorPlugin({ manifest, hooks, tasks })`.
 
 The plugin uses the package name and plugin name `memory`. Plugin database
@@ -141,37 +141,37 @@ The V1 runtime plugin interface is:
 ```ts
 defineJuniorPlugin({
   manifest,
+  tasks: {
+    processSession,
+  },
   hooks: {
     userPrompt,
     tools,
   },
-  tasks: {
-    extractMemories,
-  },
 });
 ```
 
-Embedding generation and repair are part of the memory store/extraction path in
-V1. A separately queued embedding repair task should wait until the plugin task
-contract supports a real non-session trigger.
+The exact hook names are owned by their generic plugin specs. The memory plugin
+needs these broad V1 surfaces: automatic recall when the plugin is enabled,
+completed-session background processing, model-visible memory tools, SQL
+access, and host-owned model and embedding-provider access. A future admin CLI
+surface is specified separately in [`./admin.md`](./admin.md).
 
-The exact hook and task type names are owned by their generic plugin specs. The
-memory plugin needs these broad V1 surfaces: automatic recall when the plugin is
-enabled, completed-session background task handling, model-visible
-memory tools, SQL access, and host-owned embedding-provider access. A future
-admin CLI surface is specified separately in [`./admin.md`](./admin.md).
+Installations that do not want memory should disable the memory plugin rather
+than split recall from the plugin. Future install-level memory policy may narrow
+passive extraction, stored categories, providers, and retention defaults.
 
-The plugin must also receive install-level memory policy before hooks execute.
-Policy controls whether passive extraction is enabled, what categories and
-scopes may be stored, which providers may receive memory text, and which
-retention defaults apply. Installations that do not want automatic memory recall
-should disable the memory plugin rather than split recall from the plugin.
-
-V1 passive extraction targets workplace knowledge from conversations classified
-as `public` by Junior's existing conversation privacy/destination visibility
-contracts. Private, direct, unknown, or unsupported sources can still use
-explicit memory tools for public/shareable memories when policy allows them,
-but passive learning from those sources is out of scope for V1.
+V1 passive extraction targets public/shareable, durable facts from the
+completed run transcript for supported runtime contexts, including
+user-authored messages and tool results. Extraction should prefer reusable
+knowledge about how to achieve a result, such as stable source-of-truth,
+workflow, query location, prerequisite, caveat, or decision-path knowledge.
+Point-in-time answers from analytics, search, issue, metric, incident,
+availability, or status queries are not memory unless the answer is stable
+beyond the run. Local CLI contexts are valid passive-learning sources for
+development and QA. Non-local sources must be `type: "pub"` and have a stable
+runtime source key. Private, sensitive, secret, or otherwise restricted facts
+are rejected rather than stored.
 
 V1 uses the default extraction guidance in `policy.md`. Install-provided
 extraction guidelines are out of scope for V1.
@@ -182,9 +182,8 @@ The plugin owns:
 - generated SQL migrations under `migrations/*.sql`
 - a small memory store module around `ctx.db`
 - extraction and retrieval policy
-- install-level memory policy evaluation
-- the `extractMemories` task handler and embedding repair inside the memory
-  store/extraction path
+- memory policy guidance inside the memory agent
+- passive extraction through a typed `session.completed` plugin task
 - memory tool definitions
 - future memory admin command definitions
 
@@ -194,7 +193,6 @@ Core owns:
 - prompt rendering and size limits
 - database migration application
 - runtime identity, source, and destination context
-- plugin task enqueueing, retry, redelivery, and worker execution
 - model and embedding provider credential custody
 - tool schema validation and tool execution boundaries
 - plugin config loading
@@ -231,13 +229,14 @@ V1 supports two visibility scopes:
 | Scope          | Stored authority                                 | Visible to                                   |
 | -------------- | ------------------------------------------------ | -------------------------------------------- |
 | `personal`     | current requester actor                          | same requester in compatible runtime context |
-| `conversation` | current source/destination conversation identity | later turns in the same conversation         |
+| `conversation` | current source/destination conversation identity | later requests in the same conversation      |
 
 Rules:
 
 1. Scope is derived from runtime context. Model-visible tool arguments never
    provide requester ids, team ids, channel ids, thread ids, or conversation ids.
-2. Personal memory is the default for first-person facts in interactive turns.
+2. Personal memory is the default for first-person facts in interactive
+   requests.
    The current author/requester must be the subject of any personal-scoped
    identity, preference, or relationship fact. For example, `I am on the
 billing team` may become a personal memory for that requester, while `David
@@ -324,20 +323,18 @@ be exported as part of Junior core.
 
 The V1 contract has these implementation dependencies:
 
-1. Core plugin surfaces needed by this spec: `userPrompt`,
-   plugin background tasks, `tools`, `ctx.db`, host embedding provider access,
-   and plugin config/policy access. The explicit memory tool path also needs
-   the tool-hook `ctx.model` review capability.
+1. Core plugin surfaces needed by this spec: `userPrompt`, `session.completed`,
+   `tools`, `ctx.db`, host model access, and host embedding provider access.
 2. Memory plugin package with manifest, schema, migrations, store, and
-   install-level policy evaluator.
+   memory agent policy guidance.
 3. Explicit `createMemory`, `listMemories`, `searchMemories`, and
    `removeMemory` tools with context-bound authority. `createMemory` submits a
    candidate memory; the memory agent uses the tool-hook model capability to
    own subject and scope decisions.
 4. Automatic recall from stored memories through `userPrompt`, using lexical
    ranking before embeddings are available.
-5. Embedding provider integration, vector storage, and embedding repair tasks.
-6. `session.completed` task scheduling and `extractMemories` task execution.
+5. Embedding provider integration and vector storage.
+6. `session.completed` passive extraction over completed agent-run sessions.
 7. Deduplication, TTL archival, and conservative supersession.
 8. Optional vector index tuning and hybrid ranking improvements.
 9. Admin CLI inspection and repair commands after redaction and access
@@ -349,6 +346,7 @@ The V1 contract has these implementation dependencies:
 - `../plugin.md`
 - `../plugin-runtime.md`
 - `../plugin-prompt-hooks.md`
+- `../plugin-tasks.md`
 - `../plugin-database.md`
 - `../plugin-cli.md`
 - `./policy.md`

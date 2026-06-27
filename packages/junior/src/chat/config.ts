@@ -183,7 +183,7 @@ function parseSlashCommand(rawValue: string | undefined): string {
 
 // Compile-time assertion: `getModel`'s second generic is constrained to
 // `keyof (typeof MODELS)[TProvider]`, so a stale default becomes a tsc error.
-const DEFAULT_MODEL_ID = getModel("vercel-ai-gateway", "openai/gpt-5.4").id;
+const DEFAULT_MODEL_ID = getModel("vercel-ai-gateway", "openai/gpt-5.5").id;
 const DEFAULT_FAST_MODEL_ID = getModel(
   "vercel-ai-gateway",
   "openai/gpt-5.4-mini",
@@ -234,17 +234,19 @@ function parseReactionEmoji(
 function readBotConfig(env: NodeJS.ProcessEnv): BotConfig {
   const functionMaxDurationSeconds = resolveFunctionMaxDurationSeconds(env);
   const maxTurnTimeoutMs = resolveMaxTurnTimeoutMs(functionMaxDurationSeconds);
+  const modelId = validateGatewayModelId(env.AI_MODEL) ?? DEFAULT_MODEL_ID;
+  const fastModelId =
+    validateGatewayModelId(env.AI_FAST_MODEL ?? env.AI_MODEL) ??
+    DEFAULT_FAST_MODEL_ID;
 
   return {
     userName: toOptionalTrimmed(env.JUNIOR_BOT_NAME) ?? "junior",
-    modelId: validateGatewayModelId(env.AI_MODEL) ?? DEFAULT_MODEL_ID,
+    modelId,
     modelContextWindowTokens: parseOptionalPositiveInteger(
       "AI_MODEL_CONTEXT_WINDOW_TOKENS",
       env.AI_MODEL_CONTEXT_WINDOW_TOKENS,
     ),
-    fastModelId:
-      validateGatewayModelId(env.AI_FAST_MODEL ?? env.AI_MODEL) ??
-      DEFAULT_FAST_MODEL_ID,
+    fastModelId,
     embeddingModelId:
       validateEmbeddingModelId(env.AI_EMBEDDING_MODEL) ??
       DEFAULT_EMBEDDING_MODEL_ID,

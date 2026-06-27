@@ -1,6 +1,7 @@
 import { Type, type TSchema } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
 import {
+  getSourceKey,
   PluginToolInputError,
   type PluginToolDefinition,
   type Source,
@@ -20,6 +21,8 @@ import {
 } from "./agent";
 import { memoryRuntimeContextSchema, type MemoryRuntimeContext } from "./types";
 
+export type MemoryReviewer = Pick<MemoryAgent, "reviewCreateRequest">;
+
 const MAX_TOOL_CONTENT_CHARS = 4_000;
 const DEFAULT_RESULT_LIMIT = 20;
 const DEFAULT_SEARCH_LIMIT = 10;
@@ -38,7 +41,7 @@ const KNOWN_TOOL_INPUT_ERROR_MESSAGES = new Set([
 
 /** Runtime-owned context used to bind memory tools to visible scopes. */
 export interface MemoryToolContext {
-  agent: MemoryAgent;
+  agent: MemoryReviewer;
   conversationId?: string;
   db: MemoryDb;
   embedder?: MemoryEmbeddingProvider;
@@ -287,14 +290,11 @@ function parseToolInput<T>(schema: TSchema, input: unknown): T {
 }
 
 function sourceIdempotencyKey(context: MemoryToolContext): string {
-  if (context.source.platform === "local") {
-    return context.source.conversationId;
-  }
-  const threadKey = context.source.threadTs ?? context.source.messageTs;
-  if (!threadKey) {
+  const sourceKey = getSourceKey(context.source);
+  if (!sourceKey) {
     throwToolInputError("Memory creation requires source message context.");
   }
-  return `slack:${context.source.teamId}:${context.source.channelId}:${threadKey}`;
+  return sourceKey;
 }
 
 function createInput(
@@ -327,7 +327,7 @@ function compactMemory(memory: MemoryRecord) {
 export function createMemoryCreateTool(context: MemoryToolContext) {
   return {
     description:
-      "Remember a public/shareable fact about the current requester for later. Use when the requester explicitly asks Junior to remember something about themselves, including ordinary technical, workflow, communication, tool, language, product, repository, or project preferences and opinions. Pass one self-contained memory candidate in natural language, preserving the user's memory intent as directly as possible, such as 'I prefer terse updates' or 'I think types in Python are bad'. Do not ask the requester to rephrase ordinary technical/workflow preferences; pass the candidate to this tool and let the memory agent decide store vs reject. Do not rewrite first-person requester claims into display-name or third-person phrasing. Do not pass vague references like 'remember this'. Do not include secrets, private personal details, medical/legal/financial/sensitive facts, or facts about another person's private life. Runtime context derives all actor ids, Slack ids, scope keys, source ids, and subject ids; the memory agent decides the canonical stored content, subject, and target.",
+      "Explicit memory-write tool. Use only when the latest user message directly asks Junior to remember, store, save, or forget-and-replace a public/shareable fact. Do not use for ordinary statements like 'I prefer X', 'I use Y', or 'X goes before Y' unless the user also asks you to remember/store/save it; passive memory learning handles those after the visible reply. Pass one self-contained natural-language candidate preserving the user's explicit memory intent. Do not ask the user to rephrase ordinary first-person facts, and do not rewrite them into display-name or third-person wording. Do not include secrets, private personal details, medical/legal/financial/sensitive facts, or another person's personal preference, opinion, habit, identity, relationship, workflow, or private life. Runtime context derives actor, scope, source, and subject ids; the memory agent decides the canonical stored content, subject, and target.",
     executionMode: "sequential",
     inputSchema: createMemoryInputSchema,
     execute: async (input, options) => {

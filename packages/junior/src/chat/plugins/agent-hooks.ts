@@ -11,6 +11,7 @@ import type {
   SlackConversationLink,
   PluginRegistration,
   SlackToolRegistrationHookContext,
+  ToolRegistrationHookContext,
   UserPromptContext,
 } from "@sentry/junior-plugin-api";
 import { getDb } from "@/chat/db";
@@ -118,24 +119,28 @@ function invocationPluginContext(
     state: createPluginState(plugin.manifest.name),
   };
   if (context.source.platform === "slack") {
+    if (context.destination.platform !== "slack") {
+      throw new TypeError(
+        "Slack plugin prompt context requires Slack destination",
+      );
+    }
     return {
       ...common,
+      destination: context.destination,
       requester:
         context.requester?.platform === "slack" ? context.requester : undefined,
-      destination:
-        context.destination?.platform === "slack"
-          ? context.destination
-          : undefined,
     };
+  }
+  if (context.destination.platform !== "local") {
+    throw new TypeError(
+      "Local plugin prompt context requires local destination",
+    );
   }
   return {
     ...common,
+    destination: context.destination,
     requester:
       context.requester?.platform === "local" ? context.requester : undefined,
-    destination:
-      context.destination?.platform === "local"
-        ? context.destination
-        : undefined,
   };
 }
 
@@ -372,7 +377,6 @@ export function getPluginTools(
     if (!hook) {
       continue;
     }
-    const destination = context.destination;
     const slackToolContext = getSlackToolContext(context);
     const credentialSubject = slackToolContext
       ? createSlackDirectCredentialSubject({
@@ -390,39 +394,49 @@ export function getPluginTools(
             ...(credentialSubject ? { credentialSubject } : {}),
           }
         : undefined;
-    const pluginContext =
-      context.source.platform === "slack"
-        ? {
-            ...basePluginContext(plugin),
-            requester:
-              context.requester?.platform === "slack"
-                ? context.requester
-                : undefined,
-            conversationId: context.conversationId,
-            destination:
-              destination?.platform === "slack" ? destination : undefined,
-            slack: slackContext!,
-            source: context.source,
-            userText: context.userText,
-            embedder: createPluginEmbedder(pluginName),
-            model: createPluginModel(pluginName),
-            state: createPluginState(pluginName),
-          }
-        : {
-            ...basePluginContext(plugin),
-            requester:
-              context.requester?.platform === "local"
-                ? context.requester
-                : undefined,
-            conversationId: context.conversationId,
-            destination:
-              destination?.platform === "local" ? destination : undefined,
-            source: context.source,
-            userText: context.userText,
-            embedder: createPluginEmbedder(pluginName),
-            model: createPluginModel(pluginName),
-            state: createPluginState(pluginName),
-          };
+    let pluginContext: ToolRegistrationHookContext;
+    if (context.source.platform === "slack") {
+      if (context.destination.platform !== "slack") {
+        throw new TypeError(
+          "Slack plugin tool context requires Slack destination",
+        );
+      }
+      pluginContext = {
+        ...basePluginContext(plugin),
+        requester:
+          context.requester?.platform === "slack"
+            ? context.requester
+            : undefined,
+        conversationId: context.conversationId,
+        destination: context.destination,
+        slack: slackContext!,
+        source: context.source,
+        userText: context.userText,
+        embedder: createPluginEmbedder(pluginName),
+        model: createPluginModel(pluginName, plugin.model),
+        state: createPluginState(pluginName),
+      };
+    } else {
+      if (context.destination.platform !== "local") {
+        throw new TypeError(
+          "Local plugin tool context requires local destination",
+        );
+      }
+      pluginContext = {
+        ...basePluginContext(plugin),
+        requester:
+          context.requester?.platform === "local"
+            ? context.requester
+            : undefined,
+        conversationId: context.conversationId,
+        destination: context.destination,
+        source: context.source,
+        userText: context.userText,
+        embedder: createPluginEmbedder(pluginName),
+        model: createPluginModel(pluginName, plugin.model),
+        state: createPluginState(pluginName),
+      };
+    }
     const pluginTools = hook(pluginContext);
     for (const [name, tool] of Object.entries(pluginTools)) {
       if (!PLUGIN_TOOL_NAME_RE.test(name)) {

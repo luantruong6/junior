@@ -3,6 +3,7 @@ import { z } from "zod";
 import { memoryRuntimeContextSchema } from "./types";
 
 const memoryTargetSchema = z.enum(["requester", "conversation"]);
+const memoryKindSchema = z.enum(["preference", "procedure", "fact"]);
 const memoryRejectReasonSchema = z.enum([
   "not_public_shareable",
   "secret_or_credential",
@@ -26,7 +27,50 @@ const createMemoryRequestSchema = z
       .optional(),
   })
   .strict();
+const extractSessionRequestSchema = z
+  .object({
+    existingMemories: z
+      .array(
+        z
+          .object({
+            content: z.string().min(1),
+          })
+          .strict(),
+      )
+      .max(10)
+      .default([]),
+    runtimeContext: memoryRuntimeContextSchema,
+    transcript: z
+      .array(
+        z.discriminatedUnion("type", [
+          z
+            .object({
+              type: z.literal("message"),
+              role: z.enum(["user", "assistant"]),
+              text: z.string().min(1),
+            })
+            .strict(),
+          z
+            .object({
+              type: z.literal("toolResult"),
+              toolName: z.string().min(1),
+              isError: z.boolean(),
+              text: z.string().min(1),
+            })
+            .strict(),
+        ]),
+      )
+      .min(1),
+  })
+  .strict();
 
+const expiresAtMsSchema = z
+  .number()
+  .finite()
+  .nullable()
+  .describe(
+    "Expiration timestamp when the fact should expire, otherwise null.",
+  );
 const memoryReviewDecisionSchema = z.discriminatedUnion("decision", [
   z
     .object({
@@ -43,43 +87,76 @@ const memoryReviewDecisionSchema = z.discriminatedUnion("decision", [
     })
     .strict(),
 ]);
-const memoryReviewResponseSchema = z
+const memoryReviewResponseSchema = z.discriminatedUnion("decision", [
+  z
+    .object({
+      decision: z.literal("store"),
+      kind: memoryKindSchema.describe(
+        "Use preference only for requester-owned personal preferences, opinions, habits, or workflows. Use procedure for reusable task or process instructions. Use fact for shared project, channel, operational, or runbook knowledge.",
+      ),
+      canonicalFact: z
+        .string()
+        .min(1)
+        .describe(
+          "Stored memory text. It must be self-contained and must not include requester names, requester/user labels, source labels, or first- or second-person wording.",
+        ),
+      expiresAtMs: expiresAtMsSchema,
+    })
+    .strict(),
+  z
+    .object({
+      decision: z.literal("reject"),
+      reason: memoryRejectReasonSchema,
+    })
+    .strict(),
+]);
+const extractedMemorySchema = z
   .object({
-    decision: z
-      .enum(["store", "reject"])
-      .describe("Whether this memory candidate should be stored or rejected."),
-    target: memoryTargetSchema
-      .nullable()
-      .describe("Memory target when decision is store, otherwise null."),
-    content: z
+    kind: memoryKindSchema.describe(
+      "Use preference only for requester-owned personal preferences, opinions, habits, or workflows. Use procedure for reusable task or process instructions. Use fact for shared project, channel, operational, or runbook knowledge.",
+    ),
+    canonicalFact: z
       .string()
       .min(1)
-      .nullable()
       .describe(
-        "Canonical perspective-neutral fact when decision is store, otherwise null. Do not include requester names, display names, 'the requester', 'the user', 'I', 'my', 'this thread', or channel/source labels. Good: 'Prefers terse PR summaries'. Good: 'Favorite CLI QA snack is mango chips'. Good: 'Deploy runbooks live in Notion'. Bad: 'The requester prefers terse PR summaries'. Bad: 'David prefers terse PR summaries'. Bad: 'This thread says deploy runbooks live in Notion'.",
+        "Stored memory text as one self-contained fact. It must not include requester names, requester/user labels, source labels, or first- or second-person wording.",
       ),
-    reason: memoryRejectReasonSchema
-      .nullable()
-      .describe("Reject reason when decision is reject, otherwise null."),
-    expiresAtMs: z
-      .number()
-      .finite()
-      .nullable()
+    expiresAtMs: expiresAtMsSchema,
+  })
+  .strict();
+const extractMemoriesResponseSchema = z
+  .object({
+    memories: z
+      .array(extractedMemorySchema)
+      .max(5)
       .describe(
-        "Requested expiration timestamp when decision is store and one was present, otherwise null.",
+        "Accepted public/shareable durable memories from the completed run. Return one object per distinct source assertion and classify it with kind.",
       ),
   })
   .strict();
 
 type MemoryReviewResponse = z.output<typeof memoryReviewResponseSchema>;
+type ExtractMemoriesResponse = z.output<typeof extractMemoriesResponseSchema>;
 
 export type MemoryTarget = z.output<typeof memoryTargetSchema>;
+type MemoryKind = z.output<typeof memoryKindSchema>;
 
 export type MemoryReview = z.output<typeof memoryReviewDecisionSchema>;
 
 export type CreateMemoryRequest = z.output<typeof createMemoryRequestSchema>;
+export type ExtractSessionRequest = z.output<
+  typeof extractSessionRequestSchema
+>;
+export interface ExtractedMemory {
+  content: string;
+  expiresAtMs: number | null;
+  target: MemoryTarget;
+}
 
 export interface MemoryAgent {
+  extractSessionMemories(
+    request: ExtractSessionRequest,
+  ): Promise<ExtractedMemory[]> | ExtractedMemory[];
   reviewCreateRequest(
     request: CreateMemoryRequest,
   ): Promise<MemoryReview> | MemoryReview;
@@ -87,16 +164,34 @@ export interface MemoryAgent {
 
 const MEMORY_REVIEW_SYSTEM = [
   "You are Junior's memory review agent.",
-  "Review one explicit createMemory candidate and return one structured review decision.",
+  "Review one memory candidate and return one structured review decision.",
   "Store only public/shareable, self-contained facts that are useful beyond this turn.",
-  "Reject secrets, credentials, private/sensitive personal details, gossip, speculative coworker claims, assistant/system implementation details, vague references, and low-durability chatter.",
-  "Personal/requester memories must be authored by the current requester as first-person facts about themselves, then stored as perspective-neutral canonical facts without names or requester/source wording.",
-  "The current user-authored text is source evidence. If it states a first-person fact about the requester, do not reject merely because the candidate rewrites it with the requester's name, 'the requester', or third-person wording.",
-  "Conversation memories must be shared operational or project knowledge about the active conversation, not another person's private profile.",
-  "Do not accept model/caller-provided actor ids, scope ids, aliases, or arbitrary subjects.",
-  "For accepted memories, rewrite content into one concise declarative fact that is understandable without the original conversation and does not bake in who said it or where it was said.",
-  "Return every response field. Use null for fields that do not apply to the decision.",
+  "Reject secrets, credentials, private or sensitive personal details, gossip, speculative claims about other people, assistant/system implementation details, vague references, and low-durability chatter.",
+  "Use the runtime context only for authority and scope; do not accept model-provided actor ids, scope ids, aliases, or arbitrary subjects.",
 ].join("\n");
+const MEMORY_EXTRACTION_SYSTEM = [
+  "You are Junior's passive memory extraction agent. Return only structured memories worth storing.",
+  "Use the completed run transcript as source evidence, including user-authored messages and tool results.",
+  "Assistant text is context for interpreting the run, not independent evidence for new facts.",
+  "Reject secrets, credentials, private or sensitive personal details, gossip, speculative claims about other people, assistant/system implementation details, vague references, and low-durability chatter.",
+  "If no public, durable, self-contained memory remains after rewriting, return an empty memories array.",
+].join("\n");
+const CANONICAL_CONTENT_RULES = [
+  "- Stored memory text must be a rewritten fact, not copied user wording or a sentence about who said it.",
+  "- Store the minimum useful assertion supported by source evidence; do not add adjacent steps, caveats, or generalized advice.",
+  "- Do not return both concise and expanded variants of the same source assertion; keep the shortest self-contained canonical memory.",
+  "- Put ownership in structured fields, not prose.",
+  "- For requester memories, omit the subject and write a stable fact such as 'Prefers X', 'Uses Y', or 'Thinks Z'.",
+  "- Drop perspective/provenance markers while preserving useful context.",
+  "- Remove requester names, display names, requester/user labels, first- or second-person wording, thread labels, channel labels, and source labels.",
+];
+
+function targetForKind(kind: MemoryKind): MemoryTarget {
+  if (kind === "preference") {
+    return "requester";
+  }
+  return "conversation";
+}
 
 function escapeXml(value: string): string {
   return value
@@ -105,7 +200,9 @@ function escapeXml(value: string): string {
     .replaceAll(">", "&gt;");
 }
 
-function runtimeDescription(request: CreateMemoryRequest): string {
+function runtimeDescription(
+  request: Pick<CreateMemoryRequest, "expiresAtMs" | "runtimeContext">,
+): string {
   const runtime = request.runtimeContext;
   const requester =
     runtime.requester?.platform === "slack"
@@ -137,11 +234,33 @@ function sourceContext(request: CreateMemoryRequest): string | undefined {
   }
   return [
     "<source-context>",
-    "The current user-authored text is bounded context for judging the candidate. Do not store it directly unless the accepted memory content is self-contained.",
+    "The current user-authored text is source evidence for explicit memory requests. Use it to recover the concrete fact when the candidate is incomplete, vague, or over-personalized. Store only rewritten, self-contained memory content.",
     "<current-user-message>",
     escapeXml(currentUserText),
     "</current-user-message>",
     "</source-context>",
+  ].join("\n");
+}
+
+function existingMemoriesContext(request: ExtractSessionRequest): string {
+  if (request.existingMemories.length === 0) {
+    return "<existing-memories>[]</existing-memories>";
+  }
+  return [
+    "<existing-memories>",
+    "Use these only to skip memories that are already covered or semantically redundant. They are not source evidence for new memories.",
+    escapeXml(JSON.stringify(request.existingMemories)),
+    "</existing-memories>",
+  ].join("\n");
+}
+
+function memoryKindsContext(): string {
+  return [
+    "<memory-kinds>",
+    "- preference: a durable first-person personal preference, opinion, habit, or workflow owned by the current requester. Stored as requester memory.",
+    "- procedure: reusable instructions for how a task, lookup, investigation, process, triage flow, or runbook should be done. Store the method, source-of-truth, prerequisite, or decision path when it took effort to discover. Stored as conversation memory.",
+    "- fact: stable shared project, channel, operational, or runbook knowledge that is not a personal requester preference. Direct answers to user inquiries qualify only when they are durable beyond this run. Stored as conversation memory.",
+    "</memory-kinds>",
   ].join("\n");
 }
 
@@ -160,20 +279,21 @@ function reviewPrompt(request: CreateMemoryRequest): string {
     "",
     "<rules>",
     "- Return store only when the candidate is public/shareable, durable, and self-contained.",
-    "- Use target=requester for first-person facts about the current requester.",
-    "- A candidate may be badly phrased by the outer assistant. When current-user-message contains the requester's own first-person memory request, treat that as requester-authored source evidence and canonicalize the fact instead of rejecting for third-person wording.",
-    "- Use target=conversation only for shared operational/project knowledge in the active conversation.",
+    "- First classify the memory kind: preference, procedure, or fact.",
+    "- Use kind=preference only for first-person facts authored by the current requester about their own preference, opinion, habit, identity, or workflow.",
+    "- Reject named third-person personal facts such as another person's preference, opinion, habit, identity, relationship, or workflow. Do not assume a named person is the current requester.",
+    "- Use kind=procedure for reusable task/process/runbook instructions.",
+    "- Use kind=fact for shared project, channel, operational, or runbook knowledge.",
+    "- When current-user-message contains an explicit memory request with a concrete fact or procedure, extract from current-user-message even if the candidate is vague, incomplete, or phrased as an instruction.",
+    "- A candidate may be badly phrased by an outer assistant or extraction pass. When current-user-message contains the requester's own first-person memory fact, treat that as requester-authored source evidence and canonicalize the fact instead of rejecting for third-person wording.",
+    "- When candidate wording personalizes a shared task, process, runbook, project, channel, or operational fact, use current-user-message to recover the shared fact and classify it as procedure or fact.",
+    "- Explicit procedure requests are valid when the source text contains both task context and action. Canonicalize them as shared procedure facts instead of rejecting them as vague.",
     "- Store content as person-less, source-less canonical knowledge. Ownership and source live in structured metadata, not prose.",
-    "- Remove phrases such as 'I', 'my', 'the requester', 'the user', user names, 'this thread', 'this channel', and Slack/source labels from stored content.",
-    "- Good stored content: 'Prefers terse PR summaries'. Bad stored content: 'The requester prefers terse PR summaries'.",
-    "- Good stored content: 'Favorite CLI QA snack is mango chips'. Bad stored content: 'My favorite CLI QA snack is mango chips'.",
-    "- Good stored content: 'Thinks types in Python are bad'. Bad stored content: 'David thinks types in Python are bad'.",
-    "- Good stored content: 'Deploy runbooks live in Notion'. Bad stored content: 'This thread says deploy runbooks live in Notion'.",
+    "- For requester memories, omit the subject and write the content as a stable fact such as 'Prefers X', 'Uses Y', or 'Thinks Z'.",
+    "- Remove requester names, display names, requester/user labels, first- or second-person wording, thread labels, channel labels, and source labels from stored content.",
     "- Reject third-party personal profile facts, even if they mention a name.",
-    "- Reject vague content such as 'remember this' unless the candidate itself contains the fact.",
+    "- Reject vague content such as 'remember this' unless the candidate or current-user-message contains the concrete fact.",
     "- Preserve the requested expiration when one exists; otherwise set expiresAtMs to null.",
-    "- For store, set reason to null.",
-    "- For reject, set target, content, and expiresAtMs to null.",
     "- If unsure, reject.",
     "</rules>",
     "</memory-review-input>",
@@ -181,9 +301,83 @@ function reviewPrompt(request: CreateMemoryRequest): string {
   return sections.join("\n");
 }
 
-/** Create the memory-owned agent that reviews candidates before storage. */
+function runTranscriptContext(request: ExtractSessionRequest): string {
+  return [
+    "<run-transcript>",
+    ...request.transcript.map((entry, index) => {
+      if (entry.type === "toolResult") {
+        return [
+          `<tool-result index="${index}" tool="${escapeXml(entry.toolName)}" is_error="${entry.isError ? "true" : "false"}">`,
+          escapeXml(entry.text),
+          "</tool-result>",
+        ].join("\n");
+      }
+      return [
+        `<message index="${index}" role="${entry.role}">`,
+        escapeXml(entry.text),
+        "</message>",
+      ].join("\n");
+    }),
+    "</run-transcript>",
+  ].join("\n");
+}
+
+function sessionExtractionPrompt(request: ExtractSessionRequest): string {
+  return [
+    "<memory-extraction-input>",
+    "Extract durable memories from this completed agent run using the runtime-owned context below.",
+    "",
+    runtimeDescription({
+      runtimeContext: request.runtimeContext,
+    }),
+    "",
+    existingMemoriesContext(request),
+    "",
+    memoryKindsContext(),
+    "",
+    runTranscriptContext(request),
+    "",
+    "<rules>",
+    "- Return at most five memories.",
+    "- Use user messages and successful tool results as source evidence for storable facts.",
+    "- Use failed tool results only when the failure reveals durable process knowledge, not transient errors.",
+    "- Use assistant messages only as context; do not store the assistant's claims unless supported by user messages or tool results.",
+    "- Return one memory per distinct fact.",
+    "- Prefer storing how to achieve a result: stable source-of-truth, query location, workflow, prerequisite, caveat, or reusable decision path that took effort to discover.",
+    "- Store direct answers to user inquiries only when they are stable operational/project knowledge, not values that naturally change over time.",
+    "- Do not store point-in-time analytics, search, issue, metric, incident, availability, or status answers just because a tool produced them.",
+    "- Do not store the fact that the user asked for advice, search, recall, planning, listing, inspection, or removal. Store only stable knowledge discovered in response, such as a reusable method or source-of-truth.",
+    "- A user question asking how, what, where, or whether to do something is not source evidence for the answer. Store the answer only when supported by a user-authored factual statement or a tool result.",
+    "- Set kind=procedure for reusable task/process/runbook instructions.",
+    "- Set kind=fact for shared team, project, channel, runbook, or operational knowledge.",
+    "- Set kind=preference only for clear durable first-person facts authored by the current requester about their own preference, opinion, habit, identity, or workflow.",
+    "- Reject named third-person personal facts such as another person's preference, opinion, habit, identity, relationship, or workflow. Do not assume a named person is the current requester.",
+    "- User-authored task instructions are procedures, not preferences, unless they explicitly describe the requester's personal preference or habit.",
+    "- Procedural statements such as 'for X, do Y', 'when X, do Y', and 'to accomplish X, do Y' belong in procedures.",
+    ...CANONICAL_CONTENT_RULES,
+    "- Skip a candidate when existing-memories already cover the same durable fact.",
+    "- Reject third-party personal profile facts, even if they mention a name.",
+    "- If unsure, return no memory for that candidate.",
+    "</rules>",
+    "</memory-extraction-input>",
+  ].join("\n");
+}
+
+/** Create the memory-owned agent that reviews and extracts memory candidates. */
 export function createMemoryAgent(model: PluginModel): MemoryAgent {
   return {
+    async extractSessionMemories(rawRequest) {
+      const request = extractSessionRequestSchema.parse(rawRequest);
+      const result = await model.completeObject({
+        schema: extractMemoriesResponseSchema,
+        system: MEMORY_EXTRACTION_SYSTEM,
+        prompt: sessionExtractionPrompt(request),
+        maxTokens: 1_000,
+      });
+      return extractedMemoriesFromResponse(
+        extractMemoriesResponseSchema.parse(result.object),
+      );
+    },
     async reviewCreateRequest(rawRequest) {
       const request = parseCreateMemoryRequest(rawRequest);
       const result = await model.completeObject({
@@ -204,8 +398,8 @@ function memoryReviewFromResponse(
   if (response.decision === "store") {
     return parseMemoryReview({
       decision: "store",
-      target: response.target,
-      content: response.content,
+      target: targetForKind(response.kind),
+      content: response.canonicalFact,
       ...(response.expiresAtMs !== null
         ? { expiresAtMs: response.expiresAtMs }
         : {}),
@@ -215,6 +409,19 @@ function memoryReviewFromResponse(
     decision: "reject",
     reason: response.reason,
   });
+}
+
+function extractedMemoriesFromResponse(
+  response: ExtractMemoriesResponse,
+): ExtractedMemory[] {
+  const toMemory = (
+    memory: z.output<typeof extractedMemorySchema>,
+  ): ExtractedMemory => ({
+    content: memory.canonicalFact,
+    expiresAtMs: memory.expiresAtMs,
+    target: targetForKind(memory.kind),
+  });
+  return response.memories.map(toMemory);
 }
 
 /** Parse the structured decision returned by the memory agent. */

@@ -3,7 +3,7 @@
 ## Metadata
 
 - Created: 2026-06-12
-- Last Edited: 2026-06-19
+- Last Edited: 2026-06-24
 
 ## Purpose
 
@@ -14,15 +14,15 @@ APIs.
 ## Implementation Status
 
 Plugin prompt hooks are implemented in Junior core and
-`@sentry/junior-plugin-api`. Plugin background tasks are specified separately
-in [Plugin Background Tasks Spec](./plugin-tasks.md).
+`@sentry/junior-plugin-api`. The previous post-run observation hook shape is
+superseded by the task surface defined in `./plugin-tasks.md`.
 
 ## Scope
 
 - Plugin-provided system prompt and user prompt contributions.
 - Prompt hook context.
 - Security and rendering boundaries for prompt contributions.
-- V1 memory plugin prompt-recall usage of these generic hooks.
+- V1 memory plugin usage of these generic hooks.
 
 ## Non-Goals
 
@@ -31,16 +31,20 @@ in [Plugin Background Tasks Spec](./plugin-tasks.md).
 - A general event bus for every runtime lifecycle transition.
 - Model-visible memory management as the only memory path.
 - Storage schema for long-lived memory records.
-- Exposing raw queue clients, queue topic names, callback routes, or worker
-  implementation details to plugins.
+- Plugin background task execution; see `./plugin-tasks.md`.
 
 ## Contracts
 
-### Hook Surface
+### Registration Surface
 
 Runtime hook plugins may provide prompt hooks:
 
 ```ts
+interface PluginRegistrationInput {
+  manifest: PluginManifest;
+  hooks?: PluginHooks;
+}
+
 interface PluginHooks {
   systemPrompt?(
     ctx: SystemPromptContext,
@@ -53,8 +57,8 @@ interface PluginHooks {
 ```
 
 These hooks are app-code plugin hooks registered through
-`defineJuniorPlugin({ manifest, hooks })`. Declarative `plugin.yaml` manifests
-must not register prompt hooks.
+`defineJuniorPlugin({ manifest, hooks, tasks })`. Declarative `plugin.yaml`
+manifests must not register prompt hooks or task handlers.
 
 ### Prompt Messages
 
@@ -136,7 +140,7 @@ Rules:
 interface UserPromptContext {
   conversationId?: string;
   db: unknown;
-  destination?: Destination;
+  destination: Destination;
   embedder: PluginEmbedder;
   log: PluginLogger;
   plugin: PluginMetadata;
@@ -146,6 +150,34 @@ interface UserPromptContext {
   text: string;
 }
 ```
+
+`Source` is a runtime-normalized origin for the current request or completed
+agent-run session. Slack sources use the same address fields as Slack
+destinations plus source visibility and inbound message metadata:
+
+```ts
+type SourceType = "pub" | "priv";
+
+type Source =
+  | {
+      platform: "slack";
+      type: SourceType;
+      teamId: string;
+      channelId: string;
+      messageTs?: string;
+      threadTs?: string;
+    }
+  | {
+      platform: "local";
+      type: "priv";
+      conversationId: string;
+    };
+```
+
+Plugins should use the public source helpers from `@sentry/junior-plugin-api`
+for common source decisions such as private-source checks and stable source key
+derivation. Plugin implementations must not scatter Slack channel-prefix checks
+or rebuild source keys from platform-specific fields.
 
 The context must not expose:
 
@@ -159,16 +191,14 @@ The context must not expose:
 
 ### Memory Plugin V1 Usage
 
-The memory plugin should use the generic prompt hooks as follows:
+The memory plugin should use the generic prompt hook surface as follows:
 
 1. `userPrompt(ctx)` retrieves memories visible to the current requester and
    source, then returns a concise memory block for the run's triggering prompt.
 2. `tools(ctx)` may expose explicit memory tools such as `createMemory`,
    `removeMemory`, `listMemories`, and `searchMemories`.
-3. Passive extraction uses plugin background tasks; see
-   [Plugin Background Tasks Spec](./plugin-tasks.md) and
-   [Memory Plugin Spec](./memory-plugin/index.md).
 
+Passive memory learning uses the task surface defined in `./plugin-tasks.md`.
 Memory retrieval must not depend on the model choosing a search tool for default
 recall. `searchMemories` remains the explicit model-visible recall path for
 targeted recall and follow-up memory management. Other tools are for explicit
@@ -194,7 +224,7 @@ V1 memory tools are context-bound:
 Core owns prompt rendering:
 
 1. Core calls plugins in deterministic plugin-name order.
-2. Core wraps user prompt contributions inside the existing turn-context/user
+2. Core wraps user prompt contributions inside the existing run-context/user
    prompt structure owned by `buildTurnContextPrompt(...)`.
 3. Core applies per-contribution and total prompt extension size limits.
 4. Core omits empty contributions.
@@ -261,7 +291,7 @@ Use evals for:
 - `./agent-prompt.md`
 - `./plugin.md`
 - `./plugin-runtime.md`
-- `./task-execution.md`
+- `./plugin-tasks.md`
 - `./memory-plugin/index.md`
 - `./plugin-heartbeat.md`
 - `./identity.md`

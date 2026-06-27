@@ -64,11 +64,18 @@ should call `createMemory` for those requests instead of asking the requester
 to rephrase them as safer memory text. The memory agent owns the semantic
 store-or-reject decision and canonical rewrite.
 
+The outer agent should not call `createMemory` for ordinary organic statements
+that merely reveal a durable task, process, project, channel, or operational
+fact. Those are passive-learning candidates handled by completed-session
+processing, not explicit memory-tool requests. Organic first-person personal
+facts should be stored passively only when they are clearly durable and useful
+beyond the active task.
+
 The explicit tool path uses runtime context for source and idempotency. It must
-run through the same memory agent review path as passive extraction. The
-memory agent decides store/reject, canonical perspective-neutral content,
-subject, and whether the memory targets the current requester, active
-conversation, or no valid V1 target.
+run through the memory agent's explicit-create review path. The memory agent
+decides store/reject, memory kind, and canonical perspective-neutral content.
+The plugin derives the storage target from the reviewed kind: requester for
+`preference`, conversation for `procedure` and `fact`.
 
 The model cannot provide arbitrary scope enums, subject ids, Slack user ids,
 display names, aliases, or subject classes.
@@ -103,7 +110,8 @@ removing multiple rows.
 
 `listMemories` lists only active memories visible in the current context. It
 may accept an optional limit, but it must not search across unrelated users or
-conversations. Current install policy must be applied before returning results.
+conversations. Future install policy must be applied before returning results
+when that policy surface exists.
 
 The tool may include ids or short ids because explicit removal workflows need a
 handle. Normal automatic memory injection should avoid ids.

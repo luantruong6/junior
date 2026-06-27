@@ -1,10 +1,10 @@
 import { Buffer } from "node:buffer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createSlackSource } from "@sentry/junior-plugin-api";
 import {
   getSlackContinuationMarker,
   getSlackInterruptionMarker,
 } from "@/chat/slack/output";
-import { createSlackSource } from "@sentry/junior-plugin-api";
 import { disconnectStateAdapter } from "@/chat/state/adapter";
 import {
   getCapturedSlackApiCalls,
@@ -38,7 +38,6 @@ function testSlackSource(threadTs: string) {
   return createSlackSource({
     teamId: TEST_SLACK_DESTINATION.teamId,
     channelId: TEST_SLACK_DESTINATION.channelId,
-    channelType: "channel",
     threadTs,
   });
 }
@@ -154,6 +153,7 @@ describe("oauth resume slack integration", () => {
       cumulativeUsage: {
         totalTokens: 1_000,
       },
+      source: testSlackSource("1700000000.007"),
     });
 
     await resumeAuthorizedRequest({

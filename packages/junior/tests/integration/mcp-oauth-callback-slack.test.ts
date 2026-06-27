@@ -1,6 +1,11 @@
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  createSlackSource,
+  type Requester,
+  type Source,
+} from "@sentry/junior-plugin-api";
+import {
   EVAL_MCP_AUTH_CODE,
   EVAL_MCP_AUTH_PROVIDER,
 } from "../msw/handlers/eval-mcp-auth";
@@ -13,7 +18,6 @@ import {
   createPluginAppFixture,
   type PluginAppFixture,
 } from "../fixtures/plugin-app";
-import { createSlackSource } from "@sentry/junior-plugin-api";
 
 const { generateAssistantReplyMock } = vi.hoisted(() => ({
   generateAssistantReplyMock: vi.fn(),
@@ -80,6 +84,7 @@ async function createPendingAuthSession(args: {
     userMessage: args.userMessage,
     channelId: args.channelId,
     threadTs: args.threadTs,
+    source: slackSource(args.threadTs),
   });
 
   const plugin = pluginRegistryModule.getPluginDefinition(
@@ -100,16 +105,10 @@ async function createPendingAuthSession(args: {
 
 async function createAwaitingMcpTurnRecord(args: {
   conversationId: string;
-  requester?: {
-    email?: string;
-    fullName?: string;
-    platform?: "slack";
-    slackUserId?: string;
-    slackUserName?: string;
-    teamId?: string;
-  };
+  requester?: Requester;
   includeSource?: boolean;
   sessionId: string;
+  source?: Source;
   text: string;
   threadTs: string;
 }) {
@@ -121,7 +120,7 @@ async function createAwaitingMcpTurnRecord(args: {
     destination: SLACK_DESTINATION,
     ...(args.includeSource === false
       ? {}
-      : { source: slackSource(args.threadTs) }),
+      : { source: args.source ?? slackSource(args.threadTs) }),
     piMessages: [
       {
         role: "user",
@@ -129,7 +128,12 @@ async function createAwaitingMcpTurnRecord(args: {
         timestamp: 1,
       },
     ],
-    ...(args.requester ? { requester: args.requester } : {}),
+    requester: args.requester ?? {
+      platform: "slack",
+      teamId: SLACK_DESTINATION.teamId,
+      userId: "U123",
+      userName: "dcramer",
+    },
     resumeReason: "auth",
     resumedFromSliceId: 1,
   });
@@ -184,6 +188,12 @@ describe("mcp oauth callback slack integration", () => {
   it("finalizes MCP OAuth and resumes the stored thread with persisted context", async () => {
     const threadId = "slack:C123:1700000000.001";
     const sessionId = "turn_user-1";
+    const storedSource = createSlackSource({
+      teamId: "T123",
+      channelId: "C123",
+      messageTs: "1700000000.mcp-source",
+      threadTs: "1700000000.001",
+    });
 
     await stateAdapterModule.getStateAdapter().set(`thread-state:${threadId}`, {
       conversation: {
@@ -248,12 +258,13 @@ describe("mcp oauth callback slack integration", () => {
       requester: {
         platform: "slack",
         teamId: "T123",
-        slackUserId: "U123",
-        slackUserName: "stored-user",
+        userId: "U123",
+        userName: "stored-user",
         fullName: "Stored User",
         email: "stored@example.com",
       },
       sessionId,
+      source: storedSource,
       text: "what did i say about the budget?",
       threadTs: "1700000000.001",
     });
@@ -267,6 +278,7 @@ describe("mcp oauth callback slack integration", () => {
       userMessage: "what did i say about the budget?",
       channelId: "C123",
       threadTs: "1700000000.001",
+      source: storedSource,
       toolChannelId: "C999",
       configuration: {
         region: "us",
@@ -303,6 +315,7 @@ describe("mcp oauth callback slack integration", () => {
       userMessage: "what did i say about the budget?",
       channelId: "C123",
       threadTs: "1700000000.001",
+      source: storedSource,
       toolChannelId: "C999",
       configuration: {
         region: "us",
@@ -352,6 +365,7 @@ describe("mcp oauth callback slack integration", () => {
           userName: "stored-user",
         }),
         destination: SLACK_DESTINATION,
+        source: storedSource,
         toolChannelId: "C999",
         inboundAttachmentCount: 1,
         omittedImageAttachmentCount: 1,
@@ -368,6 +382,7 @@ describe("mcp oauth callback slack integration", () => {
     const resumeContext = generateAssistantReplyMock.mock.calls[0]?.[1] as {
       conversationContext?: string;
       configuration?: Record<string, unknown>;
+      source?: unknown;
     };
     expect(resumeContext.conversationContext).not.toContain(
       "what did i say about the budget?",
@@ -464,9 +479,10 @@ describe("mcp oauth callback slack integration", () => {
       requester: {
         platform: "slack",
         teamId: "T999",
-        slackUserId: "U123",
+        userId: "U123",
       },
       sessionId,
+      source: slackSource("1700000000.006"),
       text: "what did i say about the budget?",
       threadTs: "1700000000.006",
     });
@@ -593,8 +609,8 @@ describe("mcp oauth callback slack integration", () => {
     });
     await createAwaitingMcpTurnRecord({
       conversationId: threadId,
-      includeSource: false,
       sessionId,
+      source: slackSource("1700000000.005"),
       text: "what did i say about the budget?",
       threadTs: "1700000000.005",
     });
@@ -640,10 +656,7 @@ describe("mcp oauth callback slack integration", () => {
       conversationContext?: string;
       source?: unknown;
     };
-    expect(resumeContext.source).toEqual({
-      ...slackSource("1700000000.005"),
-      messageTs: "1700000000.0052",
-    });
+    expect(resumeContext.source).toEqual(slackSource("1700000000.005"));
     expect(resumeContext.conversationContext).not.toContain(
       "Old MCP context that should not be used.",
     );
@@ -833,10 +846,13 @@ describe("mcp oauth callback slack integration", () => {
     await createAwaitingMcpTurnRecord({
       conversationId: "conversation-mismatched-requester",
       requester: {
-        slackUserId: "U999",
-        slackUserName: "wrong-user",
+        platform: "slack",
+        teamId: "T123",
+        userId: "U999",
+        userName: "wrong-user",
       },
       sessionId,
+      source: slackSource("1700000000.007"),
       text: "list mcp data",
       threadTs: "1700000000.007",
     });
@@ -921,6 +937,7 @@ describe("mcp oauth callback slack integration", () => {
     await createAwaitingMcpTurnRecord({
       conversationId: "conversation-2",
       sessionId: "turn_msg_2",
+      source: slackSource("1700000000.002"),
       text: "/demo upload",
       threadTs: "1700000000.002",
     });
@@ -1006,6 +1023,7 @@ describe("mcp oauth callback slack integration", () => {
     await createAwaitingMcpTurnRecord({
       conversationId: "conversation-3",
       sessionId: "turn_msg_3",
+      source: slackSource("1700000000.003"),
       text: "/demo upload",
       threadTs: "1700000000.003",
     });

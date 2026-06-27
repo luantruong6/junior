@@ -1,18 +1,35 @@
 import { defineJuniorPlugin } from "@sentry/junior-plugin-api";
-import { createMemoryAgent, type MemoryAgent } from "./agent";
+import { createMemoryAgent } from "./agent";
 import { createMemoryCliCommand } from "./cli";
 import {
   createMemoryCreateTool,
   createMemoryListTool,
   createMemoryRemoveTool,
   createMemorySearchTool,
+  type MemoryReviewer,
   type MemoryToolContext,
 } from "./tools";
+import { processMemorySession } from "./process-session";
 import { createMemoryPromptMessages } from "./recall";
 import type { MemoryDb } from "./store";
 
+const MEMORY_MODEL_ENV = "AI_MEMORY_MODEL";
+
+export interface MemoryPluginOptions {
+  modelId?: string;
+}
+
+function memoryModelId(options: MemoryPluginOptions): string | undefined {
+  const explicitModelId = options.modelId?.trim();
+  if (explicitModelId) {
+    return explicitModelId;
+  }
+  const envModelId = process.env[MEMORY_MODEL_ENV]?.trim();
+  return envModelId || undefined;
+}
+
 function memoryToolContext(ctx: {
-  agent: MemoryAgent;
+  agent: MemoryReviewer;
   conversationId?: string;
   db: MemoryToolContext["db"];
   embedder?: MemoryToolContext["embedder"];
@@ -32,16 +49,27 @@ function memoryToolContext(ctx: {
 }
 
 /** Create Junior's long-term memory plugin registration. */
-export function createMemoryPlugin() {
+export function createMemoryPlugin(options: MemoryPluginOptions = {}) {
+  const modelId = memoryModelId(options);
   return defineJuniorPlugin({
     manifest: {
       name: "memory",
       displayName: "Memory",
       description: "Long-term Junior memory storage and recall",
     },
+    model: modelId
+      ? { structuredModelId: modelId }
+      : { structuredModel: "default" },
     packageName: "@sentry/junior-memory",
     cli: {
       commands: [createMemoryCliCommand()],
+    },
+    tasks: {
+      processSession: {
+        async run(ctx) {
+          await processMemorySession(ctx);
+        },
+      },
     },
     hooks: {
       tools(ctx) {

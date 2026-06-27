@@ -3,7 +3,7 @@
 ## Metadata
 
 - Created: 2026-06-13
-- Last Edited: 2026-06-20
+- Last Edited: 2026-06-22
 
 ## Purpose
 
@@ -54,7 +54,7 @@ Required conceptual fields:
 - subject type
 - runtime-derived subject key when the subject is a user or conversation
 - runtime-derived source attribution
-- observation or tool idempotency marker
+- completed-session or tool idempotency marker
 - observed timestamp
 - created timestamp
 - optional expiration timestamp
@@ -74,11 +74,11 @@ Examples:
 
 - Good: `Prefers terse PR summaries`
 - Good: `Favorite CLI QA snack is mango chips`
-- Good: `Deploy runbooks live in Notion`
+- Good: `Deploy runbooks require staging checks first`
 - Bad: `The requester prefers terse PR summaries`
 - Bad: `David prefers terse PR summaries`
 - Bad: `My favorite CLI QA snack is mango chips`
-- Bad: `This thread says deploy runbooks live in Notion`
+- Bad: `This thread says deploy runbooks require staging checks first`
 
 Prompt rendering may add perspective at recall time. Storage must not.
 
@@ -121,17 +121,16 @@ The store must be able to filter active visible records by:
 
 - scope
 - plugin-derived subject type
-- current install policy
+- future install policy, when that policy surface exists
 - archive state
 - supersession state
 - expiration
 
 ### Idempotency And Duplicates
 
-Passive extraction must be idempotent across repeated observations, queue
-redelivery, and task retry. The store needs a stable source marker for a
-completed observation and the extracted fact's position or stable fact id inside
-that observation.
+Passive extraction must be idempotent across repeated completed-session task
+scheduling, queue redelivery, and task retry. The store needs a stable source
+marker for a completed session and each extracted fact.
 
 Semantic duplicate suppression needs extractor and retrieval context. It runs
 before insertion in memory creation paths that have memory agent review, but V1
@@ -261,8 +260,8 @@ If embedding generation fails, the memory remains active and can be found
 through lexical/list retrieval. A later embedding repair task may repair missing
 or stale embeddings.
 
-If install policy disables embeddings or a provider for a scope, the write path
-must skip vector generation without failing the memory write.
+If future install policy disables embeddings or a provider for a scope, the
+write path must skip vector generation without failing the memory write.
 
 ### Repair And Rebuild
 

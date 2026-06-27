@@ -52,12 +52,8 @@ import { isRetryableTurnError, markTurnFailed } from "@/chat/runtime/turn";
 import { scheduleAgentContinue } from "@/chat/services/agent-continue";
 import { htmlCallbackResponse } from "@/handlers/oauth-html";
 import type { WaitUntilFn } from "@/handlers/types";
-import {
-  createRequesterFromStoredSlackRequester,
-  type Requester,
-} from "@/chat/requester";
+import { createSlackResumeRequester, type Requester } from "@/chat/requester";
 import { requireSlackDestination } from "@/chat/destination";
-import { createSlackSource } from "@sentry/junior-plugin-api";
 
 const CALLBACK_PAGES = {
   missing_state: {
@@ -310,7 +306,7 @@ async function resumeAuthorizedMcpTurn(args: {
       );
       let requester: Requester;
       try {
-        requester = createRequesterFromStoredSlackRequester({
+        requester = createSlackResumeRequester({
           requester: lockedSessionRecord.requester,
           teamId: destination.teamId,
           userId: authSession.userId,
@@ -322,6 +318,15 @@ async function resumeAuthorizedMcpTurn(args: {
           sessionId: lockedSessionId,
           errorMessage:
             "Stored Slack requester identity did not match OAuth requester",
+        });
+        return false;
+      }
+      if (!lockedSessionRecord.source) {
+        await failAgentTurnSessionRecord({
+          conversationId: authSession.conversationId,
+          expectedVersion: lockedSessionRecord.version,
+          sessionId: lockedSessionId,
+          errorMessage: "Stored Slack source missing for MCP OAuth resume",
         });
         return false;
       }
@@ -348,14 +353,7 @@ async function resumeAuthorizedMcpTurn(args: {
           },
           requester,
           destination,
-          source:
-            lockedSessionRecord.source ??
-            createSlackSource({
-              teamId: destination.teamId,
-              channelId: authSession.channelId!,
-              threadTs: authSession.threadTs!,
-              ...(lockedMessageTs ? { messageTs: lockedMessageTs } : {}),
-            }),
+          source: lockedSessionRecord.source,
           correlation: {
             conversationId: authSession.conversationId,
             turnId: lockedSessionId,

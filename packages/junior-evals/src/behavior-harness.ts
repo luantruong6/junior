@@ -4,6 +4,7 @@ import { generateKeyPairSync } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { fileURLToPath } from "node:url";
 import { vi } from "vitest";
+import type { SlackAdapter } from "@chat-adapter/slack";
 import type { Message } from "chat";
 import type { Destination } from "@sentry/junior-plugin-api";
 import {
@@ -37,7 +38,14 @@ import {
   getPluginOAuthConfig,
   setPluginCatalogConfig,
 } from "@/chat/plugins/registry";
+import {
+  processPluginTask,
+  scheduleSessionCompletedPluginTasks,
+} from "@/chat/plugins/task-runner";
+import type { PluginTaskQueueMessage } from "@/chat/plugins/task-message";
 import { generateAssistantReply } from "@/chat/respond";
+import { resumeAwaitingSlackContinuation } from "@/chat/runtime/agent-continue-runner";
+import { scheduleAgentContinue } from "@/chat/services/agent-continue";
 import {
   createSchedulerSqlStore,
   schedulerPlugin,
@@ -65,6 +73,10 @@ import {
   type TestThread,
 } from "@junior-tests/fixtures/slack-harness";
 import {
+  createConversationWorkQueueTestAdapter,
+  type ConversationWorkQueueTestAdapter,
+} from "@junior-tests/fixtures/conversation-work";
+import {
   EVAL_OAUTH_CODE,
   EVAL_OAUTH_PROVIDER,
 } from "@junior-tests/msw/handlers/eval-oauth";
@@ -79,14 +91,76 @@ import {
   type CapturedSlackApiCall,
 } from "@junior-tests/msw/captured-slack-api-calls";
 import { createSlackDestination } from "@/chat/destination";
+import { createSlackConversationWorker } from "@/chat/task-execution/slack-work";
+import { processConversationQueueMessage } from "@/chat/task-execution/vercel-callback";
 import { ALL as sandboxEgressProxyALL } from "@/handlers/sandbox-egress-proxy";
 import { createMockImageGenerateDeps } from "./fixtures/image-generate";
+
+const EVAL_PLUGIN_TASK_DRAIN_TIMEOUT_MS = 5_000;
+
+interface PendingEvalPluginTask {
+  abort(): void;
+  promise: Promise<void>;
+}
+
+const pendingEvalPluginTasks = new Set<PendingEvalPluginTask>();
+
+async function processEvalPluginTask(
+  message: PluginTaskQueueMessage,
+): Promise<void> {
+  const controller = new AbortController();
+  let task!: PendingEvalPluginTask;
+  const promise = processPluginTask(message, {
+    signal: controller.signal,
+  }).finally(() => {
+    pendingEvalPluginTasks.delete(task);
+  });
+  task = {
+    abort() {
+      controller.abort(new Error("Eval plugin task cleanup aborted task"));
+    },
+    promise,
+  };
+  pendingEvalPluginTasks.add(task);
+  await promise;
+}
+
+/** Drain plugin tasks started by the eval harness before shared state cleanup. */
+export async function drainPendingEvalPluginTasks(): Promise<void> {
+  if (pendingEvalPluginTasks.size === 0) {
+    return;
+  }
+  const tasks = [...pendingEvalPluginTasks];
+  for (const task of tasks) {
+    task.abort();
+  }
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      Promise.allSettled(tasks.map((task) => task.promise)),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => {
+          reject(
+            new Error(
+              `Timed out waiting for ${tasks.length} eval plugin task(s) to settle`,
+            ),
+          );
+        }, EVAL_PLUGIN_TASK_DRAIN_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
 interface EvalEventThreadFixture {
+  channel_type?: "channel" | "group" | "im" | "mpim";
   channel_id?: string;
   id: string;
   run_id?: string;
@@ -996,6 +1070,9 @@ function toIncomingMessage(event: MentionEvent | SubscribedMessageEvent) {
     runId: event.thread.run_id,
     raw: {
       channel: event.thread.channel_id,
+      ...(event.thread.channel_type
+        ? { channel_type: event.thread.channel_type }
+        : {}),
       team_id: EVAL_SLACK_TEAM_ID,
       ts: messageTs,
       thread_ts: event.thread.thread_ts,
@@ -1362,6 +1439,7 @@ function buildRuntimeServices(
   env: HarnessEnvironment,
   threadRecordsById: Map<string, EvalThreadRecord>,
   observations: RuntimeObservations,
+  conversationWorkQueue: ConversationWorkQueueTestAdapter,
 ): JuniorRuntimeServiceOverrides {
   const replyResults = scenario.overrides?.reply_results ?? [];
   const replyTexts = scenario.overrides?.reply_texts ?? [];
@@ -1491,41 +1569,43 @@ function buildRuntimeServices(
           delete process.env.AI_GATEWAY_API_KEY;
           delete process.env.VERCEL_OIDC_TOKEN;
         }
-        let reply: Awaited<ReturnType<typeof generateAssistantReply>>;
         try {
-          reply = await Promise.race([
-            generateAssistantReply(text, {
-              ...context,
-              onToolInvocation: (invocation) => {
-                observations.toolInvocations.push(
-                  toEvalToolInvocation(invocation),
-                );
-              },
-              ...(env.configuredSkillDirs.length > 0
-                ? { skillDirs: env.configuredSkillDirs }
-                : {}),
-              toolOverrides,
-            }),
-            new Promise<never>((_, reject) =>
-              setTimeout(
-                () =>
-                  reject(
-                    new Error(
-                      `generateAssistantReply timed out after ${replyTimeoutMs}ms`,
-                    ),
-                  ),
-                replyTimeoutMs,
-              ),
+          const reply = await generateAssistantReply(text, {
+            ...context,
+            turnDeadlineAtMs: Math.min(
+              context?.turnDeadlineAtMs ?? Number.POSITIVE_INFINITY,
+              Date.now() + replyTimeoutMs,
             ),
-          ]);
+            onToolInvocation: (invocation) => {
+              observations.toolInvocations.push(
+                toEvalToolInvocation(invocation),
+              );
+            },
+            ...(env.configuredSkillDirs.length > 0
+              ? { skillDirs: env.configuredSkillDirs }
+              : {}),
+            toolOverrides,
+          });
+          replyState.successfulCount += 1;
+          return reply;
         } finally {
           if (scenario.overrides?.unset_gateway_api_key) {
             gatewaySnapshot.restore();
           }
         }
-
-        replyState.successfulCount += 1;
-        return reply;
+      },
+      scheduleAgentContinue: async (request) => {
+        await scheduleAgentContinue(request, {
+          queue: conversationWorkQueue,
+          state: env.stateAdapter,
+        });
+      },
+      scheduleSessionCompletedPluginTasks: async (params) => {
+        await scheduleSessionCompletedPluginTasks(params, {
+          send: async (message) => {
+            await processEvalPluginTask(message);
+          },
+        });
       },
     },
     visionContext: {
@@ -1548,7 +1628,6 @@ function buildRuntimeServices(
       },
     },
   };
-
   return services;
 }
 
@@ -1560,6 +1639,8 @@ async function processEvents(args: {
   scenario: EvalScenario;
   env: HarnessEnvironment;
   generateAssistantReply: typeof generateAssistantReply;
+  getSlackAdapter: () => FakeSlackAdapter;
+  conversationWorkQueue: ConversationWorkQueueTestAdapter;
   slackRuntime: ReturnType<typeof createSlackRuntime>;
   getThreadRecord: (fixture: EvalEventThreadFixture) => EvalThreadRecord;
   readyQueueDeliveries: QueueDelivery[];
@@ -1568,6 +1649,8 @@ async function processEvents(args: {
     scenario,
     env,
     generateAssistantReply,
+    getSlackAdapter,
+    conversationWorkQueue,
     slackRuntime,
     getThreadRecord,
     readyQueueDeliveries,
@@ -1614,6 +1697,46 @@ async function processEvents(args: {
       );
     }
     return true;
+  };
+
+  const drainQueuedConversationWork = async (): Promise<void> => {
+    let processed = 0;
+    while (conversationWorkQueue.hasQueuedMessages()) {
+      processed += 1;
+      if (processed > 10) {
+        throw new Error("Eval conversation work queue did not drain");
+      }
+      await processConversationQueueMessage(
+        conversationWorkQueue.takeMessage(),
+        {
+          queue: conversationWorkQueue,
+          run: createSlackConversationWorker({
+            getSlackAdapter: () => getSlackAdapter() as unknown as SlackAdapter,
+            resumeAwaitingContinuation: async (conversationId) =>
+              await resumeAwaitingSlackContinuation(conversationId, {
+                generateReply: generateAssistantReply,
+                scheduleAgentContinue: async (request) => {
+                  await scheduleAgentContinue(request, {
+                    queue: conversationWorkQueue,
+                    state: env.stateAdapter,
+                  });
+                },
+                scheduleSessionCompletedPluginTasks: async (params) => {
+                  await scheduleSessionCompletedPluginTasks(params, {
+                    send: async (message) => {
+                      await processEvalPluginTask(message);
+                    },
+                  });
+                },
+              }),
+            runtime: slackRuntime,
+            state: env.stateAdapter,
+          }),
+          state: env.stateAdapter,
+        },
+      );
+      await maybeAutoCompleteAuth();
+    }
   };
 
   const enqueueEvent = (event: MentionEvent | SubscribedMessageEvent): void => {
@@ -1762,6 +1885,7 @@ async function processEvents(args: {
     await maybeAutoCompleteAuth();
     if (await processNextDelivery()) {
       await maybeAutoCompleteAuth();
+      await drainQueuedConversationWork();
     }
   }
 
@@ -1771,6 +1895,7 @@ async function processEvents(args: {
       break;
     }
     await maybeAutoCompleteAuth();
+    await drainQueuedConversationWork();
   }
 }
 
@@ -1892,11 +2017,13 @@ export async function runEvalScenario(
       return record;
     };
 
+    const conversationWorkQueue = createConversationWorkQueueTestAdapter();
     const services = buildRuntimeServices(
       scenario,
       env,
       threadRecordsById,
       observations,
+      conversationWorkQueue,
     );
     const generateEvalAssistantReply =
       services.replyExecutor?.generateAssistantReply;
@@ -1913,6 +2040,8 @@ export async function runEvalScenario(
       scenario,
       env,
       generateAssistantReply: generateEvalAssistantReply,
+      getSlackAdapter: () => slackAdapter,
+      conversationWorkQueue,
       slackRuntime,
       getThreadRecord,
       readyQueueDeliveries,

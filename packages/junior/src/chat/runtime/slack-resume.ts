@@ -114,7 +114,7 @@ interface ResumeSlackTurnArgs {
   channelId: string;
   threadTs: string;
   messageTs?: string;
-  replyContext?: AssistantReplyRequestContext;
+  replyContext?: ResumeReplyContext;
   lockKey?: string;
   initialText?: string;
   generateReply?: typeof generateAssistantReply;
@@ -512,7 +512,7 @@ export async function resumeAuthorizedRequest(args: {
   threadTs: string;
   messageTs?: string;
   connectedText: string;
-  replyContext?: AssistantReplyRequestContext;
+  replyContext?: ResumeReplyContext;
   lockKey?: string;
   generateReply?: typeof generateAssistantReply;
   onSuccess?: (reply: AssistantReply) => Promise<void>;

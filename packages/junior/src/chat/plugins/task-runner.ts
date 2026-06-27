@@ -2,25 +2,26 @@
  * Plugin background-task orchestration.
  *
  * Core schedules tasks from completed sessions and exposes plugins only a
- * bounded session projection rather than live runtime internals or queue
+ * bounded run projection rather than live runtime internals or queue
  * payloads.
  */
 import type {
   PluginRegistration,
-  PluginSessionContext,
-  PluginSessionMessage,
+  PluginRunContext,
+  PluginRunTranscriptEntry,
   PluginTaskContext,
-  Requester,
 } from "@sentry/junior-plugin-api";
-import { pluginSessionContextSchema } from "@sentry/junior-plugin-api";
+import { pluginRunContextSchema } from "@sentry/junior-plugin-api";
 import { getDb } from "@/chat/db";
 import { createPluginLogger } from "@/chat/plugins/logging";
+import { createPluginEmbedder, createPluginModel } from "@/chat/plugins/model";
 import { createPluginState } from "@/chat/plugins/state";
-import { createRequesterFromStoredSlackRequester } from "@/chat/requester";
 import type { PiMessage } from "@/chat/pi/messages";
 import {
   getPiMessageRole,
-  getSuccessfulToolCalls,
+  isToolResultError,
+  isToolResultMessage,
+  normalizeToolNameFromResult,
   stripRuntimeTurnContext,
 } from "@/chat/respond-helpers";
 import { getAgentTurnSessionRecord } from "@/chat/state/turn-session";
@@ -39,6 +40,10 @@ const PLUGIN_TASK_LOCK_TTL_MS = 5 * 60 * 1000;
 
 export interface ScheduleSessionCompletedPluginTasksOptions {
   send?: (message: PluginTaskQueueMessage) => Promise<void>;
+}
+
+interface ProcessPluginTaskOptions {
+  signal?: AbortSignal;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -67,6 +72,21 @@ function messageText(message: PiMessage): string {
   return sanitizeText(content.map(textPart).filter(Boolean).join("\n"));
 }
 
+function toolResultText(message: PiMessage): string {
+  const record = message as unknown as Record<string, unknown>;
+  const parts = [
+    messageText(message),
+    record.output,
+    record.result,
+    record.stdout,
+    record.stderr,
+    record.toolResult,
+  ].filter(
+    (value): value is string => typeof value === "string" && value.length > 0,
+  );
+  return sanitizeText(parts.join("\n"));
+}
+
 function sanitizeText(text: string): string {
   return text
     .replace(
@@ -81,29 +101,32 @@ function sanitizeText(text: string): string {
     .trim();
 }
 
-function sessionMessage(message: PiMessage): PluginSessionMessage | undefined {
+function runTranscriptEntry(
+  message: PiMessage,
+): PluginRunTranscriptEntry | undefined {
   const role = getPiMessageRole(message);
-  if (role !== "user" && role !== "assistant") {
-    return undefined;
+  if (role === "user" || role === "assistant") {
+    const text = messageText(message);
+    if (!text) {
+      return undefined;
+    }
+    return { type: "message", role, text };
   }
-  const text = messageText(message);
-  if (!text) {
-    return undefined;
-  }
-  return { role, text };
-}
 
-function requesterForSession(
-  record: Awaited<ReturnType<typeof getAgentTurnSessionRecord>>,
-): Requester | undefined {
-  if (!record?.requester?.teamId || !record.requester.slackUserId) {
+  if (!isToolResultMessage(message)) {
     return undefined;
   }
-  return createRequesterFromStoredSlackRequester({
-    requester: record.requester,
-    teamId: record.requester.teamId,
-    userId: record.requester.slackUserId,
-  });
+  const toolName = normalizeToolNameFromResult(message);
+  if (!toolName) {
+    return undefined;
+  }
+  const text = toolResultText(message);
+  return {
+    type: "toolResult",
+    toolName,
+    isError: isToolResultError(message),
+    ...(text ? { text } : {}),
+  };
 }
 
 async function withPluginTaskLock<T>(
@@ -127,10 +150,10 @@ async function withPluginTaskLock<T>(
   }
 }
 
-/** Load the bounded completed-session projection exposed to plugin tasks. */
-async function loadPluginSession(
+/** Load the bounded completed-run projection exposed to plugin tasks. */
+async function loadPluginRun(
   params: PluginTaskParams,
-): Promise<PluginSessionContext> {
+): Promise<PluginRunContext> {
   const record = await getAgentTurnSessionRecord(
     params.conversationId,
     params.sessionId,
@@ -146,21 +169,19 @@ async function loadPluginSession(
       "Completed plugin task session record is missing source or destination",
     );
   }
-  const requester = requesterForSession(record);
   const sessionMessages = stripRuntimeTurnContext(
     record.piMessages.slice(record.turnStartMessageIndex ?? 0),
   );
-  return pluginSessionContextSchema.parse({
+  return pluginRunContextSchema.parse({
     completedAtMs: record.updatedAtMs,
     conversationId: record.conversationId,
     destination: record.destination,
-    messages: sessionMessages
-      .map(sessionMessage)
-      .filter((message): message is PluginSessionMessage => Boolean(message)),
-    ...(requester ? { requester } : {}),
-    sessionId: record.sessionId,
+    ...(record.requester ? { requester: record.requester } : {}),
+    runId: record.sessionId,
     source: record.source,
-    toolCalls: getSuccessfulToolCalls(sessionMessages),
+    transcript: sessionMessages
+      .map(runTranscriptEntry)
+      .filter((entry): entry is PluginRunTranscriptEntry => Boolean(entry)),
   });
 }
 
@@ -168,18 +189,25 @@ async function loadPluginSession(
 function taskPluginContext(
   plugin: PluginRegistration,
   message: PluginTaskQueueMessage,
+  options: ProcessPluginTaskOptions = {},
 ): PluginTaskContext {
   const pluginName = plugin.manifest.name;
   const sessionParams = pluginTaskParamsSchema.parse(message.params);
   return {
     db: getDb(),
+    embedder: createPluginEmbedder(pluginName, {
+      signal: options.signal,
+    }),
     id: pluginTaskId(message),
     log: createPluginLogger(pluginName),
+    model: createPluginModel(pluginName, plugin.model, {
+      signal: options.signal,
+    }),
     name: message.name,
     plugin: { name: pluginName },
-    session: {
+    run: {
       async load() {
-        return await loadPluginSession(sessionParams);
+        return await loadPluginRun(sessionParams);
       },
     },
     state: createPluginState(pluginName),
@@ -209,6 +237,13 @@ export async function scheduleSessionCompletedPluginTasks(
   if (taskRegistrations.length === 0) {
     return;
   }
+  const record = await getAgentTurnSessionRecord(
+    coreParams.conversationId,
+    coreParams.sessionId,
+  );
+  if (!record || record.state !== "completed") {
+    throw new Error("Completed plugin task session record is not ready");
+  }
   const send = options.send ?? sendVercelPluginTask;
   const messages = taskRegistrations.map(({ name, plugin }) => ({
     name,
@@ -225,6 +260,7 @@ export async function scheduleSessionCompletedPluginTasks(
 /** Execute one parsed plugin task request. */
 export async function processPluginTask(
   message: PluginTaskQueueMessage,
+  options: ProcessPluginTaskOptions = {},
 ): Promise<void> {
   await withPluginTaskLock(pluginTaskId(message), async () => {
     const resolved = findPluginTask(message);
@@ -233,6 +269,8 @@ export async function processPluginTask(
         `Plugin task "${message.plugin}.${message.name}" is not registered`,
       );
     }
-    await resolved.task.run(taskPluginContext(resolved.plugin, message));
+    await resolved.task.run(
+      taskPluginContext(resolved.plugin, message, options),
+    );
   });
 }

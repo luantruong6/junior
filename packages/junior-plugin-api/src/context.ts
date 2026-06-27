@@ -18,7 +18,6 @@ export type Source = z.output<typeof sourceSchema>;
 export type SlackSource = Extract<Source, { platform: "slack" }>;
 export type LocalSource = Extract<Source, { platform: "local" }>;
 export type SourceType = Source["type"];
-export type SlackChannelType = "channel" | "group" | "im" | "mpim";
 
 export type Destination = z.output<typeof destinationSchema>;
 
@@ -72,16 +71,16 @@ interface BaseInvocationContext {
 }
 
 export interface SlackInvocationContext extends BaseInvocationContext {
-  /** Runtime-owned default outbound destination for this invocation, if any. */
-  destination?: SlackDestination;
+  /** Runtime-owned default outbound destination for this invocation. */
+  destination: SlackDestination;
   requester?: SlackRequester;
   /** Runtime-owned source where the invocation came from. */
   source: SlackSource;
 }
 
 export interface LocalInvocationContext extends BaseInvocationContext {
-  /** Runtime-owned default outbound destination for this invocation, if any. */
-  destination?: LocalDestination;
+  /** Runtime-owned default outbound destination for this invocation. */
+  destination: LocalDestination;
   requester?: LocalRequester;
   /** Runtime-owned source where the invocation came from. */
   source: LocalSource;
@@ -92,14 +91,13 @@ export type InvocationContext = LocalInvocationContext | SlackInvocationContext;
 /** Build a normalized Slack source from runtime-owned Slack coordinates. */
 export function createSlackSource(input: {
   channelId: string;
-  channelType?: SlackChannelType;
   messageTs?: string;
   teamId: string;
   threadTs?: string;
 }): SlackSource {
   return {
     platform: "slack",
-    type: slackSourceType(input),
+    type: slackSourceType(input.channelId),
     teamId: input.teamId,
     channelId: input.channelId,
     ...(input.messageTs ? { messageTs: input.messageTs } : {}),
@@ -107,25 +105,11 @@ export function createSlackSource(input: {
   };
 }
 
-function slackSourceType(input: {
-  channelId: string;
-  channelType?: SlackChannelType;
-}): SourceType {
-  if (input.channelType === "channel") return "pub";
-  if (
-    input.channelType === "group" ||
-    input.channelType === "im" ||
-    input.channelType === "mpim"
-  ) {
-    return "priv";
-  }
-  if (input.channelId.startsWith("D") || input.channelId.startsWith("G")) {
-    return "priv";
-  }
-  if (input.channelId.startsWith("C")) {
-    return "pub";
-  }
-  throw new Error(`Unsupported Slack channel ID prefix: ${input.channelId}`);
+/** Classify Slack's documented C/D/G channel id prefixes into source visibility. */
+function slackSourceType(channelId: string): SourceType {
+  if (channelId.startsWith("C")) return "pub";
+  if (channelId.startsWith("D") || channelId.startsWith("G")) return "priv";
+  throw new Error(`Unsupported Slack channel ID prefix: ${channelId}`);
 }
 
 /** Build a normalized local source from a local conversation id. */
@@ -140,6 +124,18 @@ export function createLocalSource(conversationId: string): LocalSource {
 /** Return whether a source is private to a person or restricted group. */
 export function isPrivateSource(source: Source): boolean {
   return source.type === "priv";
+}
+
+/** Return the stable source identity used for idempotency and attribution. */
+export function getSourceKey(source: Source): string | undefined {
+  if (source.platform === "local") {
+    return source.conversationId;
+  }
+  const messageKey = source.threadTs ?? source.messageTs;
+  if (!messageKey) {
+    return undefined;
+  }
+  return `slack:${source.teamId}:${source.channelId}:${messageKey}`;
 }
 
 /** Narrow a runtime destination to the Slack-specific address shape. */

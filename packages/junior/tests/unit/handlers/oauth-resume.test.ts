@@ -1,13 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createSlackSource } from "@sentry/junior-plugin-api";
 import { RetryableTurnError } from "@/chat/runtime/turn";
 import { disconnectStateAdapter, getStateAdapter } from "@/chat/state/adapter";
-import { createSlackSource } from "@sentry/junior-plugin-api";
+import { setPlugins } from "@/chat/plugins/agent-hooks";
 
-const { logExceptionMock, postMessageMock, setStatusMock } = vi.hoisted(() => ({
-  logExceptionMock: vi.fn(),
-  postMessageMock: vi.fn(),
-  setStatusMock: vi.fn(),
-}));
+const { postMessageMock, setStatusMock, uploadFilesToThreadMock } = vi.hoisted(
+  () => ({
+    postMessageMock: vi.fn(),
+    setStatusMock: vi.fn(),
+    uploadFilesToThreadMock: vi.fn(),
+  }),
+);
 
 vi.mock("@/chat/config", async (importOriginal) => {
   const original = await importOriginal<typeof import("@/chat/config")>();
@@ -46,13 +49,21 @@ vi.mock("@/chat/slack/client", () => ({
   }),
 }));
 
-vi.mock("@/chat/logging", async (importOriginal) => {
-  const original = await importOriginal<typeof import("@/chat/logging")>();
-  return {
-    ...original,
-    logException: logExceptionMock,
-  };
-});
+vi.mock("@/chat/slack/outbound", () => ({
+  postSlackMessage: async (input: {
+    blocks?: unknown[];
+    channelId: string;
+    text: string;
+    threadTs?: string;
+  }) =>
+    await postMessageMock({
+      channel: input.channelId,
+      text: input.text,
+      ...(input.threadTs ? { thread_ts: input.threadTs } : {}),
+      ...(input.blocks ? { blocks: input.blocks } : {}),
+    }),
+  uploadFilesToThread: uploadFilesToThreadMock,
+}));
 
 import {
   resumeAuthorizedRequest,
@@ -69,7 +80,6 @@ function testSlackSource(threadTs: string) {
   return createSlackSource({
     teamId: TEST_SLACK_DESTINATION.teamId,
     channelId: TEST_SLACK_DESTINATION.channelId,
-    channelType: "channel",
     threadTs,
   });
 }
@@ -77,21 +87,22 @@ function testSlackSource(threadTs: string) {
 describe("resumeAuthorizedRequest", () => {
   beforeEach(async () => {
     vi.useFakeTimers();
-    logExceptionMock.mockReset();
-    logExceptionMock.mockReturnValue("evt_test");
     postMessageMock.mockReset();
     setStatusMock.mockReset();
+    uploadFilesToThreadMock.mockReset();
     postMessageMock.mockResolvedValue({ ts: "1700000000.100" });
     setStatusMock.mockResolvedValue(undefined);
+    uploadFilesToThreadMock.mockResolvedValue(undefined);
     await disconnectStateAdapter();
   });
 
   afterEach(async () => {
     vi.useRealTimers();
+    setPlugins([]);
     await disconnectStateAdapter();
   });
 
-  it("fails fast when resumed reply generation exceeds the configured timeout", async () => {
+  it("runs failure handling when resumed reply generation exceeds the configured timeout", async () => {
     const onFailure = vi.fn(async () => undefined);
 
     const resumePromise = resumeAuthorizedRequest({
@@ -116,6 +127,13 @@ describe("resumeAuthorizedRequest", () => {
     await resumePromise;
 
     expect(onFailure).toHaveBeenCalledTimes(1);
+    expect(postMessageMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        channel: "C-test",
+        thread_ts: "1700000000.0001",
+        text: "connected",
+      }),
+    );
     expect(postMessageMock).toHaveBeenLastCalledWith(
       expect.objectContaining({
         channel: "C-test",
@@ -127,35 +145,29 @@ describe("resumeAuthorizedRequest", () => {
     );
   });
 
-  it("persists failure state before requiring a Sentry event ID", async () => {
+  it("persists failure state before posting the failure reply", async () => {
     const onFailure = vi.fn(async () => undefined);
-    logExceptionMock.mockReturnValueOnce(undefined);
 
-    await expect(
-      resumeAuthorizedRequest({
-        messageText: "tell me the saved deadline",
-        channelId: "C-test",
-        threadTs: "1700000000.0004",
-        connectedText: "connected",
-        replyContext: {
-          credentialContext: {
-            actor: { type: "user", userId: "U-test" },
-          },
-          destination: TEST_SLACK_DESTINATION,
-          source: testSlackSource("1700000000.0004"),
-          requester: { platform: "slack", teamId: "T-test", userId: "U-test" },
+    await resumeAuthorizedRequest({
+      messageText: "tell me the saved deadline",
+      channelId: "C-test",
+      threadTs: "1700000000.0004",
+      connectedText: "connected",
+      replyContext: {
+        credentialContext: {
+          actor: { type: "user", userId: "U-test" },
         },
-        generateReply: async () => {
-          throw new Error("resume failed");
-        },
-        onFailure,
-      }),
-    ).rejects.toThrow(
-      "Sentry did not return an event ID for slack_resume_turn_failed",
-    );
+        destination: TEST_SLACK_DESTINATION,
+        source: testSlackSource("1700000000.0004"),
+        requester: { platform: "slack", teamId: "T-test", userId: "U-test" },
+      },
+      generateReply: async () => {
+        throw new Error("resume failed");
+      },
+      onFailure,
+    });
 
     expect(onFailure).toHaveBeenCalledTimes(1);
-    expect(postMessageMock).toHaveBeenCalledTimes(1);
     expect(postMessageMock).toHaveBeenCalledWith(
       expect.objectContaining({
         channel: "C-test",
@@ -163,11 +175,13 @@ describe("resumeAuthorizedRequest", () => {
         text: "connected",
       }),
     );
-    expect(postMessageMock).not.toHaveBeenCalledWith(
+    expect(postMessageMock).toHaveBeenLastCalledWith(
       expect.objectContaining({
         channel: "C-test",
         thread_ts: "1700000000.0004",
-        text: expect.stringContaining("event_id=unknown"),
+        text: expect.stringContaining(
+          "I ran into an internal error while processing that. Reference: `event_id=",
+        ),
       }),
     );
   });
@@ -307,7 +321,7 @@ describe("resumeAuthorizedRequest", () => {
     expect(postMessageMock).not.toHaveBeenCalled();
   });
 
-  it("posts the canonical failure response when timeout pause handling throws", async () => {
+  it("runs failure handling when timeout pause handling throws", async () => {
     const onFailure = vi.fn(async () => undefined);
 
     await resumeSlackTurn({

@@ -8,12 +8,7 @@
  * should stay outside this file.
  */
 import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
-import {
-  createLocalSource,
-  createSlackSource,
-  type Destination,
-  type Source,
-} from "@sentry/junior-plugin-api";
+import type { Destination, Source } from "@sentry/junior-plugin-api";
 import { THREAD_STATE_TTL_MS, type FileUpload } from "chat";
 import { botConfig } from "@/chat/config";
 import {
@@ -149,12 +144,7 @@ import type { CredentialContext } from "@/chat/credentials/context";
 import { parseSlackThreadId } from "@/chat/slack/context";
 import { createMcpAuthOrchestration } from "@/chat/services/mcp-auth-orchestration";
 import { createPluginAuthOrchestration } from "@/chat/services/plugin-auth-orchestration";
-import {
-  createRequester,
-  toStoredSlackRequester,
-  type Requester,
-  type StoredSlackRequester,
-} from "@/chat/requester";
+import { createRequester, type Requester } from "@/chat/requester";
 import {
   AuthorizationFlowDisabledError,
   AuthorizationPauseError,
@@ -213,7 +203,7 @@ export interface ReplyRequestContext {
   skillDirs?: string[];
   credentialContext?: CredentialContext;
   requester?: Requester;
-  source?: Source;
+  source: Source;
   slackConversation?: SlackConversationContext;
   destination: Destination;
   surface?: AgentTurnSurface;
@@ -342,11 +332,8 @@ function extractSliceUsage(
 
 function requesterFromContext(
   context: ReplyRequestContext,
-): StoredSlackRequester | undefined {
-  const identity = actorRequesterFromContext(context);
-  return identity?.platform === "slack"
-    ? toStoredSlackRequester(identity)
-    : undefined;
+): Requester | undefined {
+  return actorRequesterFromContext(context);
 }
 
 /** Reject requester identities that do not belong to the active destination. */
@@ -399,9 +386,9 @@ function actorRequesterFromContext(
   return createRequester(context.requester, {
     platform:
       context.requester?.platform ??
-      (context.destination?.platform === "slack" ? "slack" : undefined),
+      (context.destination.platform === "slack" ? "slack" : undefined),
     teamId:
-      (context.destination?.platform === "slack"
+      (context.destination.platform === "slack"
         ? context.destination.teamId
         : undefined) ??
       context.correlation?.teamId ??
@@ -409,25 +396,6 @@ function actorRequesterFromContext(
         ? context.requester.teamId
         : undefined),
     userId: context.correlation?.requesterId,
-  });
-}
-
-function toolInvocationSource(context: ReplyRequestContext): Source {
-  if (context.source) {
-    return context.source;
-  }
-  if (context.destination.platform !== "slack") {
-    return createLocalSource(context.destination.conversationId);
-  }
-  return createSlackSource({
-    teamId: context.destination.teamId,
-    channelId: context.destination.channelId,
-    ...(context.correlation?.messageTs
-      ? { messageTs: context.correlation.messageTs }
-      : {}),
-    ...(context.correlation?.threadTs
-      ? { threadTs: context.correlation.threadTs }
-      : {}),
   });
 }
 
@@ -647,7 +615,7 @@ export async function generateAssistantReply(
   const requester = requesterFromContext(context);
   const actorRequester = actorRequesterFromContext(context);
   const surface = surfaceFromContext(context);
-  const runSource = toolInvocationSource(context);
+  const runSource = context.source;
   const credentialActor = context.credentialContext?.actor;
   const credentialActorLogContext = credentialActor
     ? {
@@ -1014,6 +982,7 @@ export async function generateAssistantReply(
       requesterId: authRequesterId,
       channelId: slackChannelId,
       destination: context.destination,
+      source: runSource,
       threadTs: context.correlation?.threadTs,
       toolChannelId: context.toolChannelId,
       userMessage: userInput,
@@ -1032,6 +1001,7 @@ export async function generateAssistantReply(
       requesterId: authRequesterId,
       channelId: slackChannelId,
       destination: context.destination,
+      source: runSource,
       threadTs: context.correlation?.threadTs,
       userMessage: userInput,
       channelConfiguration: context.channelConfiguration,
@@ -1086,21 +1056,23 @@ export async function generateAssistantReply(
     const toolDestination = toolInvocationDestination(context);
     let toolRuntimeContext: ToolRuntimeContext;
     if (toolSource.platform === "slack") {
+      if (toolDestination.platform !== "slack") {
+        throw new TypeError("Slack tool runtime requires a Slack destination");
+      }
       toolRuntimeContext = {
         ...commonToolRuntimeContext,
-        ...(toolDestination.platform === "slack"
-          ? { destination: toolDestination }
-          : {}),
+        destination: toolDestination,
         requester:
           actorRequester?.platform === "slack" ? actorRequester : undefined,
         source: toolSource,
       };
     } else {
+      if (toolDestination.platform !== "local") {
+        throw new TypeError("Local tool runtime requires a local destination");
+      }
       toolRuntimeContext = {
         ...commonToolRuntimeContext,
-        ...(toolDestination.platform === "local"
-          ? { destination: toolDestination }
-          : {}),
+        destination: toolDestination,
         requester:
           actorRequester?.platform === "local" ? actorRequester : undefined,
         source: toolSource,
@@ -1454,9 +1426,9 @@ export async function generateAssistantReply(
       throw cooperativeYieldError;
     };
 
-    const hasGatewayCredential = Boolean(getPiGatewayApiKey());
+    const apiKeyOverride = getPiGatewayApiKey();
     agent = new Agent({
-      ...(hasGatewayCredential ? { getApiKey: getPiGatewayApiKey } : {}),
+      ...(apiKeyOverride ? { getApiKey: () => apiKeyOverride } : {}),
       streamFn: createTracedStreamFn({ conversationPrivacy }),
       steeringMode: "all",
       prepareNextTurn: async () => {

@@ -3,10 +3,18 @@ import type { PluginHooks } from "./hooks";
 import type { PluginManifest } from "./manifest";
 import type { PluginTasks } from "./tasks";
 
+export interface PluginModelConfig {
+  /** Host model family used when no explicit structured model id is configured. */
+  structuredModel?: "default" | "fast";
+  /** Host model id used for this plugin's structured model calls. */
+  structuredModelId?: string;
+}
+
 export type PluginRegistrationInput = {
   cli?: PluginCliDefinition;
   hooks?: PluginHooks;
   manifest: PluginManifest;
+  model?: PluginModelConfig;
   packageName?: string;
   tasks?: PluginTasks;
 };

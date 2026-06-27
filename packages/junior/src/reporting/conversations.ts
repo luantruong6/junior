@@ -16,12 +16,7 @@ import type {
   PluginConversationStatus,
   PluginConversations,
   PluginConversationSummary,
-  Destination,
   Source,
-} from "@sentry/junior-plugin-api";
-import {
-  createLocalSource,
-  createSlackSource,
 } from "@sentry/junior-plugin-api";
 import {
   buildSentryConversationUrl,
@@ -42,7 +37,11 @@ import {
   listAgentTurnSessionSummariesForConversation,
   type AgentTurnSessionSummary,
 } from "@/chat/state/turn-session";
-import type { StoredSlackRequester } from "@/chat/requester";
+import {
+  toStoredSlackRequester,
+  type Requester,
+  type StoredSlackRequester,
+} from "@/chat/requester";
 import type { AgentTurnUsage } from "@/chat/usage";
 import { getConversationStore } from "@/chat/db";
 import type {
@@ -278,6 +277,14 @@ function requesterIdentityReport(
   return Object.keys(identity).length > 0 ? identity : undefined;
 }
 
+function sessionRequesterIdentityReport(
+  requester: Requester | undefined,
+): RequesterIdentity | undefined {
+  return requester?.platform === "slack"
+    ? requesterIdentityReport(toStoredSlackRequester(requester))
+    : undefined;
+}
+
 function usageReport(
   usage: AgentTurnUsage | undefined,
 ): ConversationUsage | undefined {
@@ -334,14 +341,15 @@ function sessionReportFromSummary(
       channelName: effectiveChannelName,
     }) ??
     surfaceFallbackLabel(effectiveSurface);
-  const effectiveRequester = details?.originRequester ?? summary.requester;
+  const requesterIdentity =
+    requesterIdentityReport(details?.originRequester) ??
+    sessionRequesterIdentityReport(summary.requester);
   const sentryConversationUrl = buildSentryConversationUrl(
     summary.conversationId,
   );
   const sentryTraceUrl = summary.traceId
     ? buildSentryTraceUrl(summary.traceId)
     : undefined;
-  const requesterIdentity = requesterIdentityReport(effectiveRequester);
   const cumulativeUsage = usageReport(summary.cumulativeUsage);
   return {
     conversationId: summary.conversationId,
@@ -1095,26 +1103,16 @@ function countConversationMessages(transcript: TranscriptMessage[]): number {
   return transcript.filter(isConversationMessage).length;
 }
 
-function systemPromptMessage(destination: Destination): TranscriptMessage {
+function systemPromptMessage(source: Source): TranscriptMessage {
   return {
     role: "system",
     parts: [
       {
         type: "text",
-        text: buildSystemPrompt({ source: sourceFromDestination(destination) }),
+        text: buildSystemPrompt({ source }),
       },
     ],
   };
-}
-
-function sourceFromDestination(destination: Destination): Source {
-  if (destination.platform === "local") {
-    return createLocalSource(destination.conversationId);
-  }
-  return createSlackSource({
-    teamId: destination.teamId,
-    channelId: destination.channelId,
-  });
 }
 
 interface ScopedTurnMessages {
@@ -1379,8 +1377,8 @@ export async function readConversationReport(
         ? [
             ...(scopedMessages.startsAtRunBoundary &&
             normalizedTranscript.length > 0 &&
-            sessionRecord?.destination
-              ? [systemPromptMessage(sessionRecord.destination)]
+            sessionRecord?.source
+              ? [systemPromptMessage(sessionRecord.source)]
               : []),
             ...normalizedTranscript,
           ]

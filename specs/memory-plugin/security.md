@@ -3,7 +3,7 @@
 ## Metadata
 
 - Created: 2026-06-13
-- Last Edited: 2026-06-20
+- Last Edited: 2026-06-22
 
 ## Purpose
 
@@ -13,8 +13,8 @@ model calls, embeddings, logging, and multi-user visibility.
 ## Security Invariants
 
 1. Runtime context, not model text, determines memory visibility.
-2. Install-level policy determines which public/shareable categories, scopes,
-   subjects, and model providers are allowed.
+2. Default V1 policy guidance determines which public/shareable categories,
+   scopes, subjects, and model providers are allowed.
 3. Secrets are rejected, not stored with a special classification.
 4. Memory content may be model-visible only inside the stored scope and current
    policy.
@@ -22,8 +22,8 @@ model calls, embeddings, logging, and multi-user visibility.
 6. Embeddings and lexical indexes are derived data and cannot grant visibility.
 7. Provider credentials never enter plugin storage, prompt contributions, tool
    schemas, task payloads, logs, or model-visible content.
-8. Observation/task payloads use stable references and bounded safe metadata,
-   not raw private transcript text.
+8. Passive extraction tasks use bounded completed-run projections and do
+   not store raw transcript text.
 9. Every write path uses the same policy, validation, and secret rejection
    layer.
 
@@ -36,7 +36,7 @@ The store must derive authority-bearing fields from Junior runtime context:
 - tenant/workspace/org boundary when available
 - destination or conversation identity
 - source actor
-- source event or observation id
+- source event or completed-session id
 
 The model may request memory operations, but it cannot choose authority fields.
 Tool arguments can express content, query text, limit, or expiration. They
@@ -62,12 +62,11 @@ Conversation memory is visible only in the same conversation identity. V1 does
 not recall conversation memory across related channels, Slack workspaces,
 threads, projects, or rooms.
 
-V1 passive extraction is limited to conversations classified as `public` by
-Junior's existing conversation privacy/destination visibility contracts, and it
-stores conversation-scoped workplace knowledge by default. Direct, private,
-unknown, local CLI, and unsupported sources may still use explicit memory tools
-when policy allows them, but they must not feed passive extraction. Visibility
-classification must fail closed.
+V1 passive extraction stores public/shareable memories only and prefers
+conversation-scoped workplace knowledge by default. Local CLI is a supported
+passive-learning source for development and QA. Direct, private, unknown, or
+unsupported network sources need an explicit privacy contract before passive
+learning is enabled there.
 
 Personal-scoped `user` subject memories may be created only by the current
 author/requester and must contain public/shareable first-person content. An
@@ -101,8 +100,8 @@ reported, exported, retained, or exposed under weaker rules than memory content.
 
 ## Task Payloads
 
-Plugin background task payloads must contain stable references and bounded safe
-metadata only.
+Plugin background task params and queue payloads must contain stable references
+and bounded safe metadata only.
 
 They must not contain:
 
@@ -116,8 +115,9 @@ They must not contain:
 - memory content unless the task exists specifically to repair a memory id that
   can be reloaded from storage
 
-Completed-session tasks should reload bounded task projections through
-`ctx.session.load()`.
+Passive processing tasks should reload bounded completed-run projections
+through the core-provided run helper rather than carrying raw messages in task
+params or queue payloads.
 
 ## Logging And Reporting
 

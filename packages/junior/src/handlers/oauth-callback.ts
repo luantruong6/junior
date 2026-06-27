@@ -43,10 +43,7 @@ import {
 import { isRetryableTurnError, markTurnFailed } from "@/chat/runtime/turn";
 import { publishAppHomeView } from "@/chat/slack/app-home";
 import { getSlackClient } from "@/chat/slack/client";
-import {
-  createRequesterFromStoredSlackRequester,
-  type Requester,
-} from "@/chat/requester";
+import { createSlackResumeRequester, type Requester } from "@/chat/requester";
 import { lookupSlackRequester } from "@/chat/slack/user";
 import { getStateAdapter } from "@/chat/state/adapter";
 import { coerceThreadArtifactsState } from "@/chat/state/artifacts";
@@ -67,7 +64,6 @@ import type { WaitUntilFn } from "@/handlers/types";
 import { scheduleAgentContinue } from "@/chat/services/agent-continue";
 import type { AssistantReply, generateAssistantReply } from "@/chat/respond";
 import { requireSlackDestination } from "@/chat/destination";
-import { createSlackSource } from "@sentry/junior-plugin-api";
 
 interface OAuthCallbackOptions {
   generateReply?: typeof generateAssistantReply;
@@ -182,6 +178,7 @@ async function resumeOAuthSessionRecordTurn(
     !stored.resumeSessionId ||
     !stored.channelId ||
     !stored.destination ||
+    !stored.source ||
     !stored.threadTs
   ) {
     return false;
@@ -335,7 +332,7 @@ async function resumeOAuthSessionRecordTurn(
       );
       let requester: Requester;
       try {
-        requester = createRequesterFromStoredSlackRequester({
+        requester = createSlackResumeRequester({
           requester: lockedSessionRecord.requester,
           teamId: destination.teamId,
           userId: lockedUserMessage.author.userId,
@@ -347,6 +344,15 @@ async function resumeOAuthSessionRecordTurn(
           sessionId: lockedSessionId,
           errorMessage:
             "Stored Slack requester identity did not match OAuth requester",
+        });
+        return false;
+      }
+      if (!lockedSessionRecord.source) {
+        await failAgentTurnSessionRecord({
+          conversationId: stored.resumeConversationId!,
+          expectedVersion: lockedSessionRecord.version,
+          sessionId: lockedSessionId,
+          errorMessage: "Stored Slack source missing for OAuth resume",
         });
         return false;
       }
@@ -378,14 +384,7 @@ async function resumeOAuthSessionRecordTurn(
           },
           requester,
           destination,
-          source:
-            lockedSessionRecord.source ??
-            createSlackSource({
-              teamId: destination.teamId,
-              channelId: stored.channelId!,
-              threadTs: stored.threadTs!,
-              ...(lockedMessageTs ? { messageTs: lockedMessageTs } : {}),
-            }),
+          source: lockedSessionRecord.source,
           correlation: {
             conversationId: stored.resumeConversationId!,
             turnId: lockedSessionId,
@@ -480,10 +479,12 @@ async function resumePendingOAuthMessage(
   stored: OAuthStatePayload,
   options: OAuthCallbackOptions,
 ): Promise<void> {
+  const source = stored.source;
   if (
     !stored.pendingMessage ||
     !stored.channelId ||
     !stored.destination ||
+    !source ||
     !stored.threadTs
   ) {
     return;
@@ -521,12 +522,7 @@ async function resumePendingOAuthMessage(
       },
       requester,
       destination: stored.destination,
-      source: createSlackSource({
-        teamId: destination.teamId,
-        channelId: stored.channelId,
-        threadTs: stored.threadTs,
-        ...(messageTs ? { messageTs } : {}),
-      }),
+      source,
       correlation: {
         conversationId: threadId,
         channelId: stored.channelId,

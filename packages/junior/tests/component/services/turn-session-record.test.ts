@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Destination } from "@sentry/junior-plugin-api";
+import {
+  createSlackSource,
+  type Destination,
+  type Source,
+} from "@sentry/junior-plugin-api";
 import type { ConversationStore } from "@/chat/conversations/store";
 import type { PiMessage } from "@/chat/pi/messages";
 
@@ -9,6 +13,11 @@ const SLACK_DESTINATION = {
   teamId: "T123",
   channelId: "C123",
 } as const satisfies Destination;
+const SLACK_SOURCE = createSlackSource({
+  teamId: "T123",
+  channelId: "C123",
+  threadTs: "1700000000.001",
+}) satisfies Source;
 
 function userMessage(text: string): PiMessage {
   return {
@@ -89,6 +98,7 @@ describe("persistAuthPauseSessionRecord", () => {
       sessionId: "turn-1",
       sliceId: 1,
       state: "awaiting_resume",
+      source: SLACK_SOURCE,
       piMessages: priorMessages,
       resumeReason: "auth",
       errorMessage: "initial auth pause",
@@ -117,6 +127,7 @@ describe("persistAuthPauseSessionRecord", () => {
       resumedFromSliceId: 1,
       resumeReason: "auth",
       errorMessage: "plugin auth pause",
+      source: SLACK_SOURCE,
       piMessages: [priorMessages[0]],
     });
   });
@@ -313,8 +324,10 @@ describe("persistAuthPauseSessionRecord", () => {
       state: "awaiting_resume",
       piMessages: [userMessage],
       requester: {
-        slackUserId: "U123",
-        slackUserName: "alice",
+        platform: "slack",
+        teamId: "T123",
+        userId: "U123",
+        userName: "alice",
         fullName: "Alice Example",
         email: "alice@sentry.io",
       },
@@ -328,8 +341,10 @@ describe("persistAuthPauseSessionRecord", () => {
       ),
     ).resolves.toMatchObject({
       requester: {
-        slackUserId: "U123",
-        slackUserName: "alice",
+        platform: "slack",
+        teamId: "T123",
+        userId: "U123",
+        userName: "alice",
         fullName: "Alice Example",
         email: "alice@sentry.io",
       },
@@ -364,8 +379,10 @@ describe("persistAuthPauseSessionRecord", () => {
       state: "running",
       piMessages: [previousQuestion, currentQuestion],
       requester: {
-        slackUserId: "U123",
-        slackUserName: "alice",
+        platform: "slack",
+        teamId: "T123",
+        userId: "U123",
+        userName: "alice",
       },
       turnStartMessageIndex: 1,
     });
@@ -381,8 +398,10 @@ describe("persistAuthPauseSessionRecord", () => {
       getAgentTurnSessionRecord("conversation-turn-scope", "turn-scope"),
     ).resolves.toMatchObject({
       requester: {
-        slackUserId: "U123",
-        slackUserName: "alice",
+        platform: "slack",
+        teamId: "T123",
+        userId: "U123",
+        userName: "alice",
       },
       turnStartMessageIndex: 1,
       piMessages: [previousQuestion, currentQuestion],
