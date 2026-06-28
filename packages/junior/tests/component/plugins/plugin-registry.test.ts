@@ -33,17 +33,19 @@ describe("plugin registry", () => {
       normalizePluginPackageNames: (names: string[] | undefined) => names,
     }));
 
-    const registry = await import("@/chat/plugins/registry");
+    const registry = (
+      await import("@/chat/plugins/registry")
+    ).createPluginCatalogRuntime();
 
-    expect(registry.getPluginProviders()).toEqual([]);
-    expect(registry.getPluginCapabilityProviders()).toEqual([]);
-    expect(registry.getPluginSkillRoots()).toEqual([]);
-    expect(registry.getPluginOAuthConfig("unknown")).toBeUndefined();
-    expect(registry.isPluginProvider("sentry")).toBe(false);
-    expect(registry.isPluginCapability("sentry.api")).toBe(false);
-    expect(registry.isPluginConfigKey("sentry.org")).toBe(false);
+    expect(registry.getProviders()).toEqual([]);
+    expect(registry.getCapabilityProviders()).toEqual([]);
+    expect(registry.getSkillRoots()).toEqual([]);
+    expect(registry.getOAuthConfig("unknown")).toBeUndefined();
+    expect(registry.isProvider("sentry")).toBe(false);
+    expect(registry.isCapability("sentry.api")).toBe(false);
+    expect(registry.isConfigKey("sentry.org")).toBe(false);
     expect(() =>
-      registry.createPluginBroker("sentry", {
+      registry.createBroker("sentry", {
         userTokenStore: {
           get: async () => undefined,
           set: async () => {},
@@ -76,8 +78,10 @@ describe("plugin registry", () => {
       normalizePluginPackageNames: (names: string[] | undefined) => names,
     }));
 
-    const registry = await import("@/chat/plugins/registry");
-    expect(registry.getPluginProviders()).toEqual([]);
+    const registry = (
+      await import("@/chat/plugins/registry")
+    ).createPluginCatalogRuntime();
+    expect(registry.getProviders()).toEqual([]);
 
     const tempRoot = await fs.mkdtemp(
       path.join(os.tmpdir(), "junior-plugin-reload-"),
@@ -97,10 +101,66 @@ describe("plugin registry", () => {
     packagedContent.manifestRoots = [pluginRoot];
     packagedContent.skillRoots = [skillsRoot];
 
-    expect(registry.getPluginProviders()).toHaveLength(1);
-    expect(registry.getPluginProviders()[0]?.manifest.name).toBe("demo");
-    expect(registry.getPluginSkillRoots()).toContain(skillsRoot);
-    expect(registry.isPluginProvider("demo")).toBe(true);
+    expect(registry.getProviders()).toHaveLength(1);
+    expect(registry.getProviders()[0]?.manifest.name).toBe("demo");
+    expect(registry.getSkillRoots()).toContain(skillsRoot);
+    expect(registry.isProvider("demo")).toBe(true);
+  });
+
+  it("creates isolated catalog runtimes", async () => {
+    vi.doMock("@/chat/discovery", () => ({
+      pluginRoots: () => [],
+    }));
+    vi.doMock("@/chat/plugins/package-discovery", () => ({
+      discoverInstalledPluginPackageContent: () => ({
+        packageNames: [],
+        packages: [],
+        manifestRoots: [],
+        skillRoots: [],
+        tracingIncludes: [],
+      }),
+      normalizePluginPackageNames: (names: string[] | undefined) => names,
+    }));
+
+    const { createPluginCatalogRuntime } =
+      await import("@/chat/plugins/registry");
+    const first = createPluginCatalogRuntime();
+    const second = createPluginCatalogRuntime();
+
+    first.setConfig({
+      inlineManifests: [
+        {
+          manifest: {
+            name: "first",
+            displayName: "First",
+            description: "First plugin",
+            capabilities: [],
+            configKeys: [],
+          },
+        },
+      ],
+    });
+    second.setConfig({
+      inlineManifests: [
+        {
+          manifest: {
+            name: "second",
+            displayName: "Second",
+            description: "Second plugin",
+            capabilities: [],
+            configKeys: [],
+          },
+        },
+      ],
+    });
+
+    expect(first.getProviders().map((plugin) => plugin.manifest.name)).toEqual([
+      "first",
+    ]);
+    expect(second.getProviders().map((plugin) => plugin.manifest.name)).toEqual(
+      ["second"],
+    );
+    expect(createPluginCatalogRuntime().getProviders()).toEqual([]);
   });
 
   it("does not register migrations from plugin yaml packages", async () => {
@@ -144,11 +204,13 @@ describe("plugin registry", () => {
       normalizePluginPackageNames: (names: string[] | undefined) => names,
     }));
 
-    const registry = await import("@/chat/plugins/registry");
+    const registry = (
+      await import("@/chat/plugins/registry")
+    ).createPluginCatalogRuntime();
 
-    expect(registry.getPluginProviders()).toHaveLength(1);
-    expect(registry.getPluginProviders()[0]?.manifest.name).toBe("demo");
-    expect(registry.getPluginMigrationRoots()).toEqual([]);
+    expect(registry.getProviders()).toHaveLength(1);
+    expect(registry.getProviders()[0]?.manifest.name).toBe("demo");
+    expect(registry.getMigrationRoots()).toEqual([]);
   });
 
   it("ignores package migrations without inline code registrations", async () => {
@@ -179,12 +241,14 @@ describe("plugin registry", () => {
       normalizePluginPackageNames: (names: string[] | undefined) => names,
     }));
 
-    const registry = await import("@/chat/plugins/registry");
-    registry.setPluginCatalogConfig({
+    const registry = (
+      await import("@/chat/plugins/registry")
+    ).createPluginCatalogRuntime();
+    registry.setConfig({
       packages: ["@acme/code-plugin"],
     });
 
-    expect(registry.getPluginMigrationRoots()).toEqual([]);
+    expect(registry.getMigrationRoots()).toEqual([]);
   });
 
   it("registers named migrations from inline code plugin packages", async () => {
@@ -221,8 +285,10 @@ describe("plugin registry", () => {
       normalizePluginPackageNames: (names: string[] | undefined) => names,
     }));
 
-    const registry = await import("@/chat/plugins/registry");
-    registry.setPluginCatalogConfig({
+    const registry = (
+      await import("@/chat/plugins/registry")
+    ).createPluginCatalogRuntime();
+    registry.setConfig({
       packages: ["@acme/code-plugin"],
       inlineManifests: [
         {
@@ -238,7 +304,7 @@ describe("plugin registry", () => {
       ],
     });
 
-    expect(registry.getPluginMigrationRoots()).toEqual([
+    expect(registry.getMigrationRoots()).toEqual([
       { pluginName: "code-plugin", dir: migrationsRoot },
     ]);
   });
@@ -274,8 +340,10 @@ describe("plugin registry", () => {
       normalizePluginPackageNames: (names: string[] | undefined) => names,
     }));
 
-    const registry = await import("@/chat/plugins/registry");
-    registry.setPluginCatalogConfig({
+    const registry = (
+      await import("@/chat/plugins/registry")
+    ).createPluginCatalogRuntime();
+    registry.setConfig({
       packages: ["@acme/code-plugin"],
       inlineManifests: [
         {
@@ -291,12 +359,12 @@ describe("plugin registry", () => {
       ],
     });
 
-    expect(registry.getPluginMigrationRoots()).toEqual([]);
+    expect(registry.getMigrationRoots()).toEqual([]);
 
     await fs.mkdir(migrationsRoot);
     packagedContent.packages[0]!.hasMigrationsDir = true;
 
-    expect(registry.getPluginMigrationRoots()).toEqual([
+    expect(registry.getMigrationRoots()).toEqual([
       { pluginName: "code-plugin", dir: migrationsRoot },
     ]);
   });
@@ -329,8 +397,10 @@ describe("plugin registry", () => {
       normalizePluginPackageNames: (names: string[] | undefined) => names,
     }));
 
-    const registry = await import("@/chat/plugins/registry");
-    registry.setPluginCatalogConfig({
+    const registry = (
+      await import("@/chat/plugins/registry")
+    ).createPluginCatalogRuntime();
+    registry.setConfig({
       packages: ["@acme/code-plugin"],
       inlineManifests: [
         {
@@ -356,7 +426,7 @@ describe("plugin registry", () => {
       ],
     });
 
-    expect(() => registry.getPluginMigrationRoots()).toThrow(
+    expect(() => registry.getMigrationRoots()).toThrow(
       'Plugin "other-plugin" cannot share migrations directory with plugin "code-plugin"',
     );
   });
@@ -392,13 +462,13 @@ describe("plugin registry", () => {
       normalizePluginPackageNames: (names: string[] | undefined) => names,
     }));
 
-    const registry = await import("@/chat/plugins/registry");
+    const registry = (
+      await import("@/chat/plugins/registry")
+    ).createPluginCatalogRuntime();
 
-    expect(registry.getPluginProviders()).toHaveLength(1);
-    expect(registry.getPluginProviders()[0]?.manifest.name).toBe(
-      "rust-toolchain",
-    );
+    expect(registry.getProviders()).toHaveLength(1);
+    expect(registry.getProviders()[0]?.manifest.name).toBe("rust-toolchain");
     // No skills directory exists, so the plugin must not contribute a skill root
-    expect(registry.getPluginSkillRoots()).toEqual([]);
+    expect(registry.getSkillRoots()).toEqual([]);
   });
 });
