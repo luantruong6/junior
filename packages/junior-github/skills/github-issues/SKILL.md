@@ -67,6 +67,7 @@ Follow [references/research-rules.md](references/research-rules.md) for cross-ty
 - Attach screenshots from the thread as image links when present.
 - Include code snippets, related issues, and related PRs only when they materially improve the issue.
 
+
 ### 4. Verify draft
 
 Before running the `gh` create/edit command, check each gate. If any fails, revise and re-check before executing:
