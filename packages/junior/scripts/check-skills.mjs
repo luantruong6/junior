@@ -12,6 +12,29 @@ function unique(values) {
   return [...new Set(values)];
 }
 
+async function uniqueRealPaths(values) {
+  const seen = new Set();
+  const result = [];
+
+  for (const value of values) {
+    let key;
+    try {
+      key = await fs.realpath(value);
+    } catch {
+      key = value;
+    }
+
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    result.push(value);
+  }
+
+  return result;
+}
+
 function resolveContentRoots(subdir) {
   const canonical = path.resolve(process.cwd(), "app", subdir);
   const legacy = path.resolve(process.cwd(), subdir);
@@ -119,6 +142,57 @@ async function resolvePackagedPluginSkillRoots() {
   return unique(roots);
 }
 
+async function resolveWorkspaceRoot(cwd) {
+  let current = cwd;
+
+  while (true) {
+    if (await pathIsFile(path.join(current, "pnpm-workspace.yaml"))) {
+      return current;
+    }
+
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return null;
+    }
+
+    current = parent;
+  }
+}
+
+async function resolveWorkspacePackageSkillRoots() {
+  const workspaceRoot = await resolveWorkspaceRoot(process.cwd());
+  if (!workspaceRoot) {
+    return [];
+  }
+
+  const packagesRoot = path.join(workspaceRoot, "packages");
+  let packageEntries;
+  try {
+    packageEntries = await fs.readdir(packagesRoot, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const roots = [];
+  for (const entry of packageEntries) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+
+    const packageDir = path.join(packagesRoot, entry.name);
+    if (packageDir === process.cwd()) {
+      continue;
+    }
+
+    const skillsDir = path.join(packageDir, "skills");
+    if (await pathIsDirectory(skillsDir)) {
+      roots.push(skillsDir);
+    }
+  }
+
+  return unique(roots);
+}
+
 async function resolvePluginSkillRoots() {
   const localRoots = [];
   for (const pluginsRoot of resolveContentRoots("plugins")) {
@@ -141,7 +215,12 @@ async function resolvePluginSkillRoots() {
   }
 
   const packagedRoots = await resolvePackagedPluginSkillRoots();
-  return unique([...localRoots, ...packagedRoots]);
+  const workspacePackageRoots = await resolveWorkspacePackageSkillRoots();
+  return uniqueRealPaths([
+    ...localRoots,
+    ...packagedRoots,
+    ...workspacePackageRoots,
+  ]);
 }
 
 function resolveSkillRoots() {
